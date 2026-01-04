@@ -1,0 +1,29 @@
+# Build artifacts
+*.zip
+*.tar.gz
+*.exe
+*.msi
+dist/
+build/
+
+# Temporary files
+*.tmp
+*.temp
+*.log
+.DS_Store
+Thumbs.db
+
+# Node modules (if applicable)
+node_modules/
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
