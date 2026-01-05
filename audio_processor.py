@@ -33,14 +33,8 @@ class AudioProcessor:
         self.sliced_words_dir = self.src_dir / 'sliced_words'
         self.word_labels_file = self.src_dir / 'word_labels.json'
 
-        # Seed labels DB from shipped assets on first run (if present)
-        if not self.word_labels_file.exists():
-            default_labels = asset_path('src/word_labels.json')
-            if default_labels.exists():
-                try:
-                    shutil.copy(default_labels, self.word_labels_file)
-                except Exception:
-                    pass
+        # Note: experiments store labels inside the exported experiment ZIP JSON.
+        # A local word_labels.json is optional and not required for running experiments.
         
     def log(self, message):
         """Print message only if verbose is True"""

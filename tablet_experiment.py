@@ -649,77 +649,60 @@ class ExperimentCanvas(QWidget):
         self.setMouseTracking(True)
         
     def load_words(self):
-        """Load words from config or legacy file"""
+        """Load words from the experiment configuration JSON."""
         import random
         
         self.words = []
         
-        if self.config:
-            # Load from config object
-            words_data = self.config.get('words', {})
-            base_dir = os.path.dirname(self.config.get('__file_path__', '.'))
-            audio_dir = os.path.join(base_dir, 'audio')
-            repetitions = self.config.get('properties', {}).get('repetitions', {})
-            order = self.config.get('properties', {}).get('order', 'random')
+        if not self.config:
+            print("✗ No experiment configuration provided.")
+            return
+
+        # Load from config object
+        words_data = self.config.get('words', {})
+        base_dir = os.path.dirname(self.config.get('__file_path__', '.'))
+        audio_dir = os.path.join(base_dir, 'audio')
+        repetitions = self.config.get('properties', {}).get('repetitions', {})
+        order = self.config.get('properties', {}).get('order', 'random')
             
-            # First, load all unique words
-            unique_words = []
-            for group_name, word_list in words_data.items():
-                for word_entry in word_list:
-                    # Audio file path relative to config location
-                    word_file = os.path.join(audio_dir, word_entry['file'])
-                    unique_words.append({
-                        'file': word_file,
-                        'word': word_entry['word'],
-                        'group': group_name
-                    })
+        # First, load all unique words
+        unique_words = []
+        for group_name, word_list in words_data.items():
+            for word_entry in word_list:
+                # Audio file path relative to config location
+                word_file = os.path.join(audio_dir, word_entry['file'])
+                unique_words.append({
+                    'file': word_file,
+                    'word': word_entry['word'],
+                    'group': group_name
+                })
             
-            # Handle repetitions
-            if order == 'random':
-                # Random order: repeat each word X times based on group, then shuffle with spacing
-                word_pool = []
+        # Handle repetitions
+        if order == 'random':
+            # Random order: repeat each word X times based on group, then shuffle with spacing
+            word_pool = []
+            for word_data in unique_words:
+                group_name = word_data['group']
+                repeat_count = repetitions.get(group_name, 1)
+                # Add this word multiple times
+                for rep in range(repeat_count):
+                    word_pool.append(word_data.copy())
+
+            # Shuffle with spacing constraint: same words should be spaced apart
+            self.words = self._shuffle_with_spacing(word_pool)
+
+        else:
+            # Ordinal order: play all groups in order, then repeat entire sequence
+            # Use maximum repetition count
+            max_repeats = max(repetitions.values()) if repetitions else 1
+
+            for rep in range(max_repeats):
                 for word_data in unique_words:
                     group_name = word_data['group']
-                    repeat_count = repetitions.get(group_name, 1)
-                    # Add this word multiple times
-                    for rep in range(repeat_count):
-                        word_pool.append(word_data.copy())
-                
-                # Shuffle with spacing constraint: same words should be spaced apart
-                self.words = self._shuffle_with_spacing(word_pool)
-                
-            else:
-                # Ordinal order: play all groups in order, then repeat entire sequence
-                # Use maximum repetition count
-                max_repeats = max(repetitions.values()) if repetitions else 1
-                
-                for rep in range(max_repeats):
-                    for word_data in unique_words:
-                        group_name = word_data['group']
-                        group_repeats = repetitions.get(group_name, 1)
-                        # Only add if this repetition is within the group's repeat count
-                        if rep < group_repeats:
-                            self.words.append(word_data.copy())
-            
-        else:
-            # Legacy loading
-            json_path = os.path.join('src', 'word_labels.json')
-            if not os.path.exists(json_path):
-                print("✗ word_labels.json not found!")
-                return
-            
-            with open(json_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            
-            for recording_name, word_list in data.items():
-                for word_entry in word_list:
-                    word_file = os.path.join('src', 'sliced_words', word_entry['file'])
-                    self.words.append({
-                        'file': word_file,
-                        'word': word_entry['word'],
-                        'group': recording_name
-                    })
-            random.shuffle(self.words)
+                    group_repeats = repetitions.get(group_name, 1)
+                    # Only add if this repetition is within the group's repeat count
+                    if rep < group_repeats:
+                        self.words.append(word_data.copy())
         
         # Note: We do NOT limit to grid size anymore, as we support multiple pages
         # self.words = self.words[:self.total_cells] 
@@ -1359,18 +1342,21 @@ class ExperimentWindow(QMainWindow):
 def main():
     """Main entry point"""
     parser = argparse.ArgumentParser()
-    parser.add_argument("config_path", nargs="?", help="Path to experiment configuration JSON")
+    parser.add_argument("config_path", help="Path to experiment configuration JSON (from an exported experiment ZIP)")
     args = parser.parse_args()
     
-    config = None
-    if args.config_path and os.path.exists(args.config_path):
-        try:
-            with open(args.config_path, 'r', encoding='utf-8') as f:
-                config = json.load(f)
-            config['__file_path__'] = os.path.abspath(args.config_path)
-            print(f"✓ Loaded configuration from {args.config_path}")
-        except Exception as e:
-            print(f"✗ Failed to load config: {e}")
+    if not os.path.exists(args.config_path):
+        print(f"✗ Config file not found: {args.config_path}")
+        sys.exit(2)
+
+    try:
+        with open(args.config_path, 'r', encoding='utf-8') as f:
+            config = json.load(f)
+        config['__file_path__'] = os.path.abspath(args.config_path)
+        print(f"✓ Loaded configuration from {args.config_path}")
+    except Exception as e:
+        print(f"✗ Failed to load config: {e}")
+        sys.exit(2)
     
     from qt_bootstrap import ensure_qt_platform_plugin_path
     ensure_qt_platform_plugin_path()

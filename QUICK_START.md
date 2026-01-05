@@ -58,12 +58,9 @@ pip install -r requirements.txt
    ├── false_yod_gramm.mp3
    └── other_recording.wav
 
-2. Run: python audio_processor.py
-   → Automatically slices words
-   → Prompts for Hebrew labels
-   → Converts to WAV format
+2. Use the GUI “Create a New Experiment” to slice + label and export a ZIP.
 
-3. Result: an experiment ZIP (contains `audio/*.wav`) + config JSON
+3. Result: an experiment ZIP (contains `audio/*.wav`) + config JSON at ZIP root
 ```
 
 ### Step 2: Collect Data 📝

@@ -33,6 +33,7 @@ tessdata/
 src/recordings/
 src/sliced_words/
 src/training data/
+src/word_labels.json
 
 # Temp
 temp*.wav
