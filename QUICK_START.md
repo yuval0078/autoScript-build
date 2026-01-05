@@ -19,20 +19,18 @@ The app’s “Check for Updates” reads:
 
 ## 🛠️ Installation
 
-```
-1. Double-click: INSTALL.bat
-   → Creates virtual environment
-   → Installs all dependencies
-   → Creates launcher scripts
+Create a venv and install dependencies:
 
-2. Done! Use any of the launcher .bat files
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
 ```
 
 ## 🖥️ GUI Mode (Recommended)
 
 ```
-1. Double-click: START_GUI.bat
-   Or run: python main_interface.py
+1. Run: python main_interface.py
 
 2. Choose from:
    ┌────────────────────────────────┐
