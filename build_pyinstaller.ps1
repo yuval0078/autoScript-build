@@ -97,6 +97,7 @@ $rootFiles = @(
     'main_interface.py',
     'gui_menu.py',
     'exp_initializer.py',
+    'updater.py',
     'audio_processor.py',
     'convert_audio.py',
     'analyzer_refactored.py',

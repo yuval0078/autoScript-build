@@ -10,6 +10,7 @@ import stat
 import urllib.request
 from pathlib import Path
 from app_paths import ensure_dir, user_data_dir, asset_path
+import updater
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton, 
                              QLabel, QFileDialog, QMessageBox, QApplication)
 from PyQt5.QtCore import Qt
@@ -188,7 +189,7 @@ class MainMenu(QWidget):
             QMessageBox.critical(self, "Error", f"Failed to launch analyzer: {e}")
 
     def check_updates(self):
-        """Lightweight update check using update_config/version files."""
+        """Update check + optional in-app update (portable ZIP install)."""
         try:
             cfg_path = asset_path("update_config.json")
             local_ver_path = asset_path("version.json")
@@ -224,12 +225,73 @@ class MainMenu(QWidget):
             remote_version = str(remote_info.get("version", "0"))
             remote_channel = remote_info.get("channel", channel)
 
-            if remote_version == local_version:
-                QMessageBox.information(self, "Update", f"You are up to date (v{local_version}, channel {channel}).")
+            if not updater.is_remote_newer(remote_version, local_version):
+                QMessageBox.information(self, "Update", f"You are up to date ({local_version}, channel {channel}).")
                 return
 
-            msg = f"Update available on channel '{remote_channel}':\nCurrent: {local_version}\nRemote: {remote_version}\n\nDownload from Releases and replace your folder, or run the packaged updater when available."
-            QMessageBox.information(self, "Update", msg)
+            asset_url_tmpl = channel_cfg.get("asset_url")
+            checksum_url = channel_cfg.get("checksum_url")
+            if not asset_url_tmpl or not checksum_url:
+                QMessageBox.information(
+                    self,
+                    "Update",
+                    f"Update available on '{remote_channel}':\nCurrent: {local_version}\nRemote: {remote_version}\n\n"
+                    f"But asset_url/checksum_url are missing in update_config.json, so auto-update can't run.",
+                )
+                return
+
+            if not getattr(sys, "frozen", False):
+                QMessageBox.information(
+                    self,
+                    "Update",
+                    f"Update available on '{remote_channel}':\nCurrent: {local_version}\nRemote: {remote_version}\n\n"
+                    "You are running from source (python). Update via git pull / reinstall requirements.\n"
+                    "Auto-update is supported for the packaged EXE build.",
+                )
+                return
+
+            download_url = asset_url_tmpl.replace("{version}", remote_version)
+            prompt = QMessageBox(self)
+            prompt.setWindowTitle("Update")
+            prompt.setIcon(QMessageBox.Information)
+            prompt.setText(
+                f"Update available on '{remote_channel}':\n"
+                f"Current: {local_version}\nRemote: {remote_version}\n\n"
+                "Download and install now? (The new version will open in a new folder and this one will close.)"
+            )
+            btn_update = prompt.addButton("Update Now", QMessageBox.AcceptRole)
+            prompt.addButton("Later", QMessageBox.RejectRole)
+            prompt.exec_()
+            if prompt.clickedButton() != btn_update:
+                return
+
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            try:
+                zip_path, extract_dir = updater.get_update_paths(remote_version)
+                updater.download_to(download_url, zip_path)
+
+                expected = updater.fetch_checksum_sha256(checksum_url)
+                actual = updater.sha256_file(zip_path)
+                if actual != expected:
+                    raise ValueError(
+                        "Downloaded update failed SHA256 verification. "
+                        "(This usually means the Release ZIP and version.sha256 are out of sync.)"
+                    )
+
+                updater.extract_zip(zip_path, extract_dir)
+                exe_path = updater.find_app_executable(extract_dir)
+                updater.launch_detached(exe_path)
+
+            finally:
+                QApplication.restoreOverrideCursor()
+
+            QMessageBox.information(
+                self,
+                "Update",
+                "Update installed and launched. This window will now close.\n\n"
+                "If everything looks good, you can delete the old folder manually.",
+            )
+            QApplication.quit()
 
         except Exception as e:
             QMessageBox.critical(self, "Update", f"Unexpected error during update check: {e}")

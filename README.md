@@ -5,58 +5,40 @@
 
 This is a complete toolkit for conducting tablet/touchpad writing experiments with Hebrew words. The system records pen movements, pressure, and timing data while participants write words they hear through audio playback.
 
-## 🚀 Quick Installation
+# TouchpadExperimentManager
 
-1. **Double-click `INSTALL.bat`** to set up everything automatically
-2. The installer will:
-   - Create a virtual environment
-  # TouchpadExperimentManager
+Tablet/touchpad writing experiment manager + analyzer (PyQt5).
 
-  Tablet/touchpad writing experiment manager + analyzer (PyQt5).
+## Core workflow
 
-  Core workflow:
-  - Create a new experiment (slice audio, label words, configure, export ZIP)
-  - Run an exported experiment ZIP (uses the ZIP’s `audio/*.wav`)
-  - Analyze results and export CSV
+- **Create a new experiment** in the GUI: select recordings from anywhere on the PC, label words, configure settings, export an experiment ZIP.
+- **Run an experiment** by selecting the exported ZIP: the app extracts it and runs the experiment using the ZIP’s `audio/*.wav` and the config JSON.
+- **Analyze results** using the built-in analyzer.
 
-  This repository intentionally does NOT include large datasets (recordings, generated slices, training PDFs, results, etc.).
+This repository intentionally does **not** include large datasets (recordings, generated slices, training data, debug assets, results, etc.).
 
-  ## Run from source
+## Run from source (developer)
 
-  ```powershell
-  python -m venv .venv
-  .\.venv\Scripts\Activate.ps1
-  pip install -r requirements.txt
-  python main_interface.py
-  ```
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+python main_interface.py
+```
 
-  ## Notes about audio and labels
+## Install on another PC (end user)
 
-  - When creating a new experiment, you select audio files from **any folder** on the PC.
-  - When running an experiment, audio slices and labels are loaded from the exported experiment ZIP:
-    - config JSON at ZIP root
-    - `audio/` folder containing per-word WAV files
+- Download the latest `TouchpadExperimentManager-portable.zip` from GitHub Releases.
+- Unzip anywhere (avoid very long paths).
+- Run `TouchpadExperimentManager.exe`.
 
-  ## Releases / auto-update metadata
+## Updates (stable/beta channels)
 
-  See `update_config.json`, `version.json`, and `releases/<channel>/version.json`.
-  For the release workflow, see QUICK_START.md.
+The packaged app’s **Check for Updates** button uses:
 
-- All sliced words are **converted to WAV** format (pygame requirement)
-- Original recordings remain unchanged in `src/recordings/`
-- Participant data is **never overwritten** (unique timestamps)
-- Target letter marks are **session-specific** (not saved to file)
-- Hebrew text is fully supported with UTF-8 encoding
+- `update_config.json` (where to check)
+- `version.json` (current version/channel inside the app)
+- `releases/<channel>/version.json` and `releases/<channel>/version.sha256` (remote metadata)
 
-## 🎓 Citation
+Release/publishing instructions are in QUICK_START.md.
 
-If using this toolkit for research, please cite appropriately and ensure IRB approval for human subjects research.
-
----
-
-**Version:** 2.0  
-**Author:** Research Assistant  
-**Last Updated:** December 30, 2025
-=======
-# autoScript-build
->>>>>>> origin/main
