@@ -1,0 +1,15 @@
+{
+  "default_channel": "stable",
+  "channels": {
+    "stable": {
+      "version_url": "https://raw.githubusercontent.com/yuval0078/autoScript-build/main/releases/stable/version.json",
+      "asset_url": "https://github.com/yuval0078/autoScript-build/releases/download/{version}/TouchpadExperimentManager-portable.zip",
+      "checksum_url": "https://raw.githubusercontent.com/yuval0078/autoScript-build/main/releases/stable/version.sha256"
+    },
+    "beta": {
+      "version_url": "https://raw.githubusercontent.com/yuval0078/autoScript-build/main/releases/beta/version.json",
+      "asset_url": "https://github.com/yuval0078/autoScript-build/releases/download/{version}/TouchpadExperimentManager-portable.zip",
+      "checksum_url": "https://raw.githubusercontent.com/yuval0078/autoScript-build/main/releases/beta/version.sha256"
+    }
+  }
+}

@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.pyo
+.venv/
+
+# PyInstaller outputs
+build/
+dist/
+
+# Local artifacts / big files
+*.zip
+*.wav
+*.mp3
+*.m4a
+*.mp4
+*.avi
+*.mov
+*.pdf
+*.xlsx
+
+# App runtime data
+results/
+
+# Not part of the app repo
+MLM/
+debug_rois/
+rotated_tables/
+tessdata/
+
+# Source data that should not be tracked
+src/recordings/
+src/sliced_words/
+src/training data/
+
+# Temp
+temp*.wav
+trash_*/
