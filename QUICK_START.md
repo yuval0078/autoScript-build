@@ -53,7 +53,7 @@ pip install -r requirements.txt
 ### Step 1: Prepare Audio 🎵
 
 ```
-1. Place audio files in: src/recordings/
+1. Prepare your audio files anywhere on the PC:
    ├── true_yod_f.m4a
    ├── false_yod_gramm.mp3
    └── other_recording.wav
@@ -63,7 +63,7 @@ pip install -r requirements.txt
    → Prompts for Hebrew labels
    → Converts to WAV format
 
-3. Result: src/sliced_words/ + word_labels.json
+3. Result: an experiment ZIP (contains `audio/*.wav`) + config JSON
 ```
 
 ### Step 2: Collect Data 📝

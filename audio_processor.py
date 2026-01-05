@@ -25,9 +25,12 @@ class AudioProcessor:
         self.ffprobe_path = self.find_ffprobe()
         self._configure_pydub()
         self.data_dir = user_data_dir()
+        # Keep a small user-writable workspace for labels/temp.
+        # Note: GUI flows select audio from arbitrary locations and export/run from ZIPs,
+        # so we do not require persistent recordings/sliced_words folders.
         self.src_dir = ensure_dir(self.data_dir / 'src')
-        self.recordings_dir = ensure_dir(self.src_dir / 'recordings')
-        self.sliced_words_dir = ensure_dir(self.src_dir / 'sliced_words')
+        self.recordings_dir = self.src_dir / 'recordings'
+        self.sliced_words_dir = self.src_dir / 'sliced_words'
         self.word_labels_file = self.src_dir / 'word_labels.json'
 
         # Seed labels DB from shipped assets on first run (if present)
@@ -362,11 +365,8 @@ class AudioProcessor:
         if not file_path.exists():
             raise FileNotFoundError(f"File not found: {file_path}")
             
-        return self.slice_audio_file(
-            str(file_path), 
-            str(self.sliced_words_dir),
-            file_path.stem
-        )
+        # Detect word segments; does not require writing slices to disk.
+        return self.slice_audio_file(str(file_path), output_dir=None, base_name=file_path.stem)
 
     def load_or_create_labels(self):
         """Load existing word labels or create new database"""

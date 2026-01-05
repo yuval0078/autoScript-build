@@ -76,9 +76,9 @@ python main_interface.py
 
   ## Audio input folders (local)
 
-  - Put raw recordings under `src/recordings/` (ignored by git)
-  - Generated word slices go to `src/sliced_words/` (ignored by git)
-  - The word database is `src/word_labels.json` (committed)
+  - For **Create a New Experiment**, you select audio files from **any folder** on the PC.
+  - For **Run Experiment**, the app uses the per-word WAV files packaged inside the experiment ZIP under `audio/`.
+  - The word database template is `src/word_labels.json` (committed).
 
   ## Releases / auto-update metadata
 
