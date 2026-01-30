@@ -1,23 +1,21 @@
 # Build directories
 build/
 dist/
-portable build/
 
 # Python cache
 __pycache__/
 *.pyc
 *.pyo
-*.pyd
 
 # Virtual environment
 .venv/
 venv/
 ENV/
 
-# Large binary files
-*.exe
-*.zip
-*.dll
+# Large binary files (over 100MB)
+portable build/TouchpadExperiment/assets/bin/ffmpeg.exe
+portable build/TouchpadExperiment/assets/bin/ffprobe.exe
+portable build/TouchpadExperiment_Portable_*.zip
 
 # OS files
 .DS_Store
