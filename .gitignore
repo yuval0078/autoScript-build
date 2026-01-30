@@ -1,0 +1,24 @@
+# Build directories
+build/
+dist/
+portable build/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environment
+.venv/
+venv/
+ENV/
+
+# Large binary files
+*.exe
+*.zip
+*.dll
+
+# OS files
+.DS_Store
+Thumbs.db

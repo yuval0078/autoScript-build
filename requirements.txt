@@ -1,0 +1,15 @@
+# Core GUI framework
+PyQt5>=5.15.9
+PyQt5-Qt5>=5.15.2
+PyQt5-sip>=12.11.0
+
+# Audio processing
+pydub>=0.25.1
+pygame>=2.6.0
+numpy>=1.24.0
+
+# Packaging
+pyinstaller>=6.0.0
+
+# Python 3.13+ compatibility
+setuptools>=65.0.0
