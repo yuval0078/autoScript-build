@@ -1,0 +1,11 @@
+{
+  "typeCheckingMode": "basic",
+  "reportIncompatibleMethodOverride": false,
+  "reportAttributeAccessIssue": "warning",
+  "reportUnknownMemberType": "none",
+  "reportUnknownArgumentType": "none",
+  "reportUnknownVariableType": "none",
+  "reportOptionalMemberAccess": "warning",
+  "pythonVersion": "3.13",
+  "pythonPlatform": "Windows"
+}

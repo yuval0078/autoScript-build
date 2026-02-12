@@ -391,7 +391,8 @@ class AudioEditorWindow(QDialog):
         
         # Update list item text
         item = self.word_list.item(idx)
-        item.setText(f"Word {idx+1}: {start}ms - {end}ms")
+        if item:  # type guard
+            item.setText(f"Word {idx+1}: {start}ms - {end}ms")
 
     def save_changes(self):
         """Explicitly save changes (with user confirmation)"""
@@ -533,7 +534,7 @@ class NewExperimentWizard(QWidget):
         # Header
         header = QHBoxLayout()
         btn_back = QPushButton("← Back")
-        btn_back.clicked.connect(self.parent.show_main_menu)
+        btn_back.clicked.connect(self.parent.show_main_menu)  # type: ignore
         header.addWidget(btn_back)
         header.addStretch()
         title = QLabel("New Experiment Setup")
@@ -933,6 +934,7 @@ class NewExperimentWizard(QWidget):
             'start': 0,
             'end': 0,
             'duration': 0,
+            'file_path': group_data['file_path'],
             'index': len(group_data['segments']) + 1
         }
         
@@ -1084,7 +1086,7 @@ class NewExperimentWizard(QWidget):
                     os.remove(temp_file)
                 except:
                     pass
-        self.parent.show_experiment_properties(self.audio_groups, self.loaded_properties)
+        self.parent.show_experiment_properties(self.audio_groups, self.loaded_properties)  # type: ignore
 
     def delete_selected_words(self):
         """Delete selected words from the current group"""
@@ -1132,7 +1134,7 @@ class ExperimentPropertiesPage(QWidget):
         # Header
         header = QHBoxLayout()
         btn_back = QPushButton("← Back")
-        btn_back.clicked.connect(self.parent.show_new_experiment)
+        btn_back.clicked.connect(self.parent.show_new_experiment)  # type: ignore
         header.addWidget(btn_back)
         header.addStretch()
         title = QLabel("Experiment Properties")
@@ -1420,7 +1422,11 @@ class ExperimentPropertiesPage(QWidget):
             QApplication.setOverrideCursor(Qt.WaitCursor)
             
             # Get processor for audio extraction
-            processor = self.parent.new_experiment.processor
+            processor = self.parent.new_experiment.processor  # type: ignore
+            if not processor:
+                QApplication.restoreOverrideCursor()
+                QMessageBox.critical(self, "Error", "AudioProcessor not initialized. Cannot export package.")
+                return
             
             # Create temporary directory for audio files
             temp_dir = tempfile.mkdtemp()
