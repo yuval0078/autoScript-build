@@ -15,6 +15,17 @@ ENV/
 # Large binary files (over 100MB)
 portable build/TouchpadExperiment/assets/bin/ffmpeg.exe
 portable build/TouchpadExperiment/assets/bin/ffprobe.exe
+assets/bin/ffmpeg.exe
+assets/bin/ffprobe.exe
+
+# Generated export/data artifacts
+*.zip
+*.csv
+*_data*.json
+*trainable*.json
+*analysis*.json
+*analysis*.csv
+1_*/
 
 # OS files
 .DS_Store

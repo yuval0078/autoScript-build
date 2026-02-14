@@ -1,6 +1,31 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+import shutil
+from pathlib import Path
+
 block_cipher = None
+
+
+def _ffmpeg_binaries():
+    binaries = []
+
+    bundled = Path("assets/bin/ffmpeg.exe")
+    if bundled.exists():
+        ffmpeg_path = bundled
+    else:
+        ffmpeg_from_path = shutil.which("ffmpeg")
+        ffmpeg_path = Path(ffmpeg_from_path) if ffmpeg_from_path else None
+
+    if ffmpeg_path and ffmpeg_path.exists():
+        binaries.append((str(ffmpeg_path), "assets/bin"))
+        ffprobe_path = ffmpeg_path.with_name("ffprobe.exe")
+        if ffprobe_path.exists():
+            binaries.append((str(ffprobe_path), "assets/bin"))
+
+    return binaries
+
+
+common_binaries = _ffmpeg_binaries()
 
 # Define common source files to bundle
 common_sources = [
@@ -18,7 +43,7 @@ common_sources = [
 a_main = Analysis(
     ['main_interface.py'],
     pathex=[],
-    binaries=[],
+    binaries=common_binaries,
     datas=common_sources,
     hiddenimports=[
         'PyQt5.QtCore',
@@ -51,7 +76,7 @@ a_main = Analysis(
 a_analyzer = Analysis(
     ['launch_analyzer.py'],
     pathex=[],
-    binaries=[],
+    binaries=common_binaries,
     datas=common_sources,
     hiddenimports=[
         'PyQt5.QtCore',
@@ -74,7 +99,7 @@ a_analyzer = Analysis(
 a_experiment = Analysis(
     ['launch_experiment.py'],
     pathex=[],
-    binaries=[],
+    binaries=common_binaries,
     datas=common_sources,
     hiddenimports=[
         'PyQt5.QtCore',

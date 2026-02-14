@@ -1,8 +1,7 @@
 import sys
 from qt_bootstrap import ensure_qt_platform_plugin_path
 
-
-from PyQt5.QtWidgets import QApplication, QMainWindow, QStackedWidget
+from PyQt5.QtWidgets import QApplication, QMainWindow, QStackedWidget, QLabel
 
 # Import the modularized components
 from gui_menu import MainMenu
@@ -14,6 +13,10 @@ class MainInterface(QMainWindow):
     
     def __init__(self):
         super().__init__()
+        # Status Bar
+        self.status_msg = QLabel("Ready")
+        self.statusBar().addWidget(self.status_msg)
+
         self.setWindowTitle("Touchpad Experiment Manager")
         self.resize(1200, 800)
         

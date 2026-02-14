@@ -24,7 +24,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QMessageBox, QComboBox, QTreeWidgetItemIterator, QInputDialog,
                              QDialog, QLineEdit, QDialogButtonBox, QFormLayout)
 from PyQt5.QtCore import Qt, QTimer, QPointF
-from PyQt5.QtGui import QPainter, QPen, QColor, QBrush, QFont
+from PyQt5.QtGui import QPainter, QPen, QColor, QBrush, QFont, QImage
 
 # =============================================================================
 # CONSTANTS
@@ -72,11 +72,54 @@ def calculate_bounds(pen_events: List[dict]) -> Tuple[float, float, float, float
     ys = [e["y"] for e in pen_events]
     return min(xs), min(ys), max(xs), max(ys)
 
-def find_stroke_indices(pen_events: List[dict]) -> Tuple[List[int], List[int]]:
-    """Returns (stroke_starts, stroke_ends)"""
+def find_stroke_indices(pen_events: List[dict], slice_points: Optional[List[int]] = None) -> Tuple[List[int], List[int]]:
+    """Returns (stroke_starts, stroke_ends), with optional virtual split points.
+
+    split point i means: current stroke ends at i, next starts at i+1.
+    """
+    if not pen_events:
+        return [], []
+
     starts = [i for i, e in enumerate(pen_events) if e["type"] == "press"]
-    ends = [i for i, e in enumerate(pen_events) if e["type"] == "release"]
+
+    if slice_points:
+        extra_starts = []
+        for idx in slice_points:
+            try:
+                split_idx = int(idx)
+            except Exception:
+                continue
+            next_idx = split_idx + 1
+            if 0 < next_idx < len(pen_events):
+                extra_starts.append(next_idx)
+        starts = sorted(set(starts + extra_starts))
+
+    if not starts:
+        starts = [0]
+
+    ends: List[int] = []
+    for i, start_idx in enumerate(starts):
+        if i + 1 < len(starts):
+            ends.append(starts[i + 1] - 1)
+        else:
+            ends.append(len(pen_events) - 1)
+
     return starts, ends
+
+
+def get_stroke_slice_points(word_data: Dict[str, Any]) -> List[int]:
+    """Get sanitized stroke split points for a word."""
+    raw = word_data.get("stroke_slices", [])
+    if not isinstance(raw, list):
+        return []
+
+    points: List[int] = []
+    for value in raw:
+        try:
+            points.append(int(value))
+        except Exception:
+            continue
+    return sorted(set(points))
 
 def get_sorted_letter_indices(assigned_letters: Dict[str, str]) -> List[int]:
     """Get sorted integer indices from assigned_letters dict"""
@@ -326,9 +369,9 @@ class ParticipantData:
     timestamp: str
     words: List[dict]
     calibration: Any = None
-    group: str = None
+    group: Optional[str] = None
     age: Any = None
-    gender: str = None
+    gender: Optional[str] = None
     
     # Cached computations per word
     _stroke_cache: Dict[int, Tuple[List[int], List[int]]] = field(default_factory=dict, repr=False)
@@ -363,8 +406,10 @@ class ParticipantData:
     def get_stroke_indices(self, word_idx: int) -> Tuple[List[int], List[int]]:
         """Get cached stroke start/end indices for a word"""
         if word_idx not in self._stroke_cache:
-            pen_events = self.words[word_idx].get('pen_events', [])
-            self._stroke_cache[word_idx] = find_stroke_indices(pen_events)
+            word_data = self.words[word_idx]
+            pen_events = word_data.get('pen_events', [])
+            slice_points = get_stroke_slice_points(word_data)
+            self._stroke_cache[word_idx] = find_stroke_indices(pen_events, slice_points)
         return self._stroke_cache[word_idx]
     
     def get_bounds(self, word_idx: int) -> Tuple[float, float, float, float]:
@@ -413,7 +458,8 @@ class AnimationCanvas(QWidget):
         self.pen_events = word_data.get("pen_events", [])
         
         # Calculate stroke indices
-        self.stroke_starts, self.stroke_ends = find_stroke_indices(self.pen_events)
+        slice_points = get_stroke_slice_points(word_data)
+        self.stroke_starts, self.stroke_ends = find_stroke_indices(self.pen_events, slice_points)
         
         # Load letters (new format) or convert from legacy assigned_letters
         if "letters" in word_data:
@@ -545,8 +591,7 @@ class AnimationCanvas(QWidget):
         current_stroke_idx = 0
         
         for i, event in enumerate(self.pen_events):
-            if event["type"] == "press":
-                current_stroke_idx = self.get_stroke_for_event(i)
+            current_stroke_idx = self.get_stroke_for_event(i)
             
             if event["type"] in ("press", "move"):
                 dist = math.sqrt((click_x - event["x"])**2 + (click_y - event["y"])**2)
@@ -622,8 +667,9 @@ class AnimationCanvas(QWidget):
         stroke_idx = self.get_stroke_from_point(event.pos())
         if stroke_idx is not None:
             # Check modifiers for group selection
-            add_to_selection = (event.modifiers() & Qt.ShiftModifier) or \
-                              (self.parent_player and self.parent_player.group_select_mode)
+            add_to_selection = bool(event.modifiers() & Qt.ShiftModifier) or bool(
+                self.parent_player and self.parent_player.group_select_mode
+            )
             self.select_stroke(stroke_idx, add_to_selection)
                     
     def mouseDoubleClickEvent(self, event):
@@ -680,15 +726,18 @@ class AnimationCanvas(QWidget):
         # Draw strokes with selection highlighting
         last_point = None
         current_stroke_idx = 0
+        stroke_start_set = set(self.stroke_starts)
         
         for i, event_data in enumerate(self.pen_events):
             screen_x, screen_y = self.transform_point(event_data["x"], event_data["y"])
             point = QPointF(screen_x, screen_y)
             pen_width = max(1, int(event_data["pressure"] * 5))
             
-            # Track current stroke
-            if event_data["type"] == "press":
+            # Track current stroke, including virtual starts from slicing
+            if i in stroke_start_set:
                 current_stroke_idx = self.get_stroke_for_event(i)
+                if i != 0:
+                    last_point = None
             
             # Determine color based on selection and timeline
             is_selected = current_stroke_idx in self.selected_strokes
@@ -704,13 +753,15 @@ class AnimationCanvas(QWidget):
             
             if event_data["type"] == "press":
                 last_point = point
-            elif event_data["type"] == "move" and last_point:
-                painter.setPen(QPen(color, pen_width, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
-                painter.drawLine(last_point, point)
+            elif event_data["type"] == "move":
+                if last_point is not None:
+                    painter.setPen(QPen(color, pen_width, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+                    painter.drawLine(last_point, point)
                 last_point = point
-            elif event_data["type"] == "release" and last_point:
-                painter.setPen(QPen(color, pen_width, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
-                painter.drawLine(last_point, point)
+            elif event_data["type"] == "release":
+                if last_point is not None:
+                    painter.setPen(QPen(color, pen_width, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+                    painter.drawLine(last_point, point)
                 last_point = None
         
         # Draw current position indicator
@@ -1373,8 +1424,10 @@ class PenDataPlayer(QMainWindow):
     def _get_current_stroke_starts(self) -> List[int]:
         if self.current_word_index < 0 or self.current_word_index >= len(self.pen_data):
             return []
-        pen_events = self.pen_data[self.current_word_index].get("pen_events", [])
-        return find_stroke_indices(pen_events)[0]
+        word_data = self.pen_data[self.current_word_index]
+        pen_events = word_data.get("pen_events", [])
+        slice_points = get_stroke_slice_points(word_data)
+        return find_stroke_indices(pen_events, slice_points)[0]
     
     def slider_changed(self, value: int):
         self.current_event_index = value
@@ -1458,7 +1511,8 @@ class PenDataPlayer(QMainWindow):
             return
         
         # Check we're not at first or last event of stroke
-        stroke_starts, stroke_ends = find_stroke_indices(pen_events)
+        slice_points = get_stroke_slice_points(word_data)
+        stroke_starts, stroke_ends = find_stroke_indices(pen_events, slice_points)
         
         # Find which stroke we're in
         current_stroke_idx = None
@@ -1480,18 +1534,16 @@ class PenDataPlayer(QMainWindow):
             QMessageBox.warning(self, "Cannot Slice", 
                               "Cannot slice at the first or last event of a stroke.")
             return
-        
-        # To split a stroke, we just change the type of the current event to "release"
-        # and the next event to "press", keeping all other move events as-is
-        # This creates two separate strokes at the slice point
+
+        # Non-destructive split: keep original event types and store split metadata
         slice_event = self.current_event_index
-        
-        # The current move event becomes a release (end of first stroke)
-        pen_events[slice_event]["type"] = "release"
-        
-        # The next event becomes a press (start of second stroke)
-        if slice_event + 1 < len(pen_events):
-            pen_events[slice_event + 1]["type"] = "press"
+        if "stroke_slices" not in word_data or not isinstance(word_data["stroke_slices"], list):
+            word_data["stroke_slices"] = []
+        if slice_event in word_data["stroke_slices"]:
+            QMessageBox.information(self, "Already Sliced", f"Stroke already sliced at event {slice_event}.")
+            return
+        word_data["stroke_slices"].append(slice_event)
+        word_data["stroke_slices"] = sorted(set(int(x) for x in word_data["stroke_slices"]))
         
         # No need to shift assigned_letters indices since we're not inserting events
         # But we do need to update letters' stroke_ids
@@ -1511,7 +1563,7 @@ class PenDataPlayer(QMainWindow):
         
         # Reload the word to refresh everything
         self.load_word(self.current_word_index)
-        self.event_slider.setValue(slice_event + 1)  # Move to new press event
+        self.event_slider.setValue(slice_event + 1)  # Move to start of newly split stroke
         
         QMessageBox.information(self, "Stroke Sliced", 
                                f"Stroke sliced at event {slice_event}. You can now assign letters to each part.")
@@ -1523,26 +1575,116 @@ class PenDataPlayer(QMainWindow):
     def _get_data_source(self) -> List[ParticipantData]:
         """Get participants for export"""
         return self.participants
+
+    def _sanitize_filename(self, text: str, max_len: int = 40) -> str:
+        """Create a filesystem-safe file name fragment."""
+        if text is None:
+            return "word"
+        safe = ''.join(ch if ch.isalnum() or ch in (' ', '_', '-') else '_' for ch in str(text))
+        safe = '_'.join(safe.split())
+        safe = safe.strip('._-')
+        if not safe:
+            safe = "word"
+        return safe[:max_len]
+
+    def _render_clean_word_image(self, pen_events: List[dict], width: int = 1400, height: int = 1000, padding: int = 80) -> QImage:
+        """Render a clean white canvas with only the written strokes (no overlays/UI)."""
+        image = QImage(width, height, QImage.Format_ARGB32)
+        image.fill(Qt.white)
+
+        if not pen_events:
+            return image
+
+        min_x, min_y, max_x, max_y = calculate_bounds(pen_events)
+        data_width = max_x - min_x
+        data_height = max_y - min_y
+
+        avail_w = max(1, width - 2 * padding)
+        avail_h = max(1, height - 2 * padding)
+
+        if data_width > 0 and data_height > 0:
+            scale = min(avail_w / data_width, avail_h / data_height)
+        elif data_width > 0:
+            scale = avail_w / data_width
+        elif data_height > 0:
+            scale = avail_h / data_height
+        else:
+            scale = 1.0
+
+        painter = QPainter(image)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        last_point = None
+        for event_data in pen_events:
+            x = (event_data.get("x", 0) - min_x) * scale + padding
+            y = (event_data.get("y", 0) - min_y) * scale + padding
+            point = QPointF(x, y)
+
+            pressure = float(event_data.get("pressure", 0.5) or 0.5)
+            pen_width = max(1, int(pressure * 5))
+            painter.setPen(QPen(Qt.black, pen_width, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+
+            event_type = event_data.get("type")
+            if event_type == "press":
+                last_point = point
+            elif event_type == "move":
+                if last_point is not None:
+                    painter.drawLine(last_point, point)
+                last_point = point
+            elif event_type == "release":
+                if last_point is not None:
+                    painter.drawLine(last_point, point)
+                last_point = None
+
+        painter.end()
+        return image
     
     def export_to_csv(self):
         if not self.participants and not self.pen_data:
             QMessageBox.warning(self, "No Data", "No data loaded to export.")
             return
+
+        save_screenshots = QMessageBox.question(
+            self,
+            "Save Screenshots",
+            "Save clean screenshots for each word canvas?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        ) == QMessageBox.Yes
         
         default_name = "combined_analysis.csv" if len(self.participants) > 1 else f"participant_analysis.csv"
         file_path, _ = QFileDialog.getSaveFileName(self, "Save Analysis Data", default_name, "CSV Files (*.csv)")
         
         if not file_path:
             return
+
+        first_participant = self.participants[0] if self.participants else None
+        date_part = "unknown_date"
+        participant_part = "unknown"
+        if first_participant:
+            participant_part = str(first_participant.participant_number)
+            ts = str(first_participant.timestamp or "")
+            date_part = ts.split('_')[0] if ts else "unknown_date"
+
+        export_folder_name = f"{participant_part}_{date_part}"
+        export_root_dir = os.path.join(os.path.dirname(file_path), export_folder_name)
+        os.makedirs(export_root_dir, exist_ok=True)
+
+        csv_output_path = os.path.join(export_root_dir, os.path.basename(file_path))
+        screenshots_dir = os.path.join(export_root_dir, "screenshots")
+        if save_screenshots:
+            os.makedirs(screenshots_dir, exist_ok=True)
         
         try:
-            with open(file_path, 'w', newline='', encoding='utf-8-sig') as csvfile:
+            screenshot_count = 0
+
+            with open(csv_output_path, 'w', newline='', encoding='utf-8-sig') as csvfile:
                 writer = csv.writer(csvfile)
                 
                 header = [
                     'Exp Step', 'Participant', 'Age', 'Gender', 'Word', 'Correct', 'Written Word',
                     'Reading End', 'Writing Start', 'Writing End', 'Strokes', 'Avg Interval (ms)',
-                    'Letters'
+                    'Letters', 'Screenshot File'
                 ]
                 writer.writerow(header)
                 
@@ -1555,12 +1697,23 @@ class PenDataPlayer(QMainWindow):
                         if not pen_events:
                             flat_idx += 1
                             continue
+
+                        screenshot_name = ""
+
+                        if save_screenshots:
+                            word_text = self._sanitize_filename(word_data.get("word", "word"))
+                            screenshot_name = f"p{participant.participant_number}_{word_idx + 1:03d}_{word_text}.png"
+                            screenshot_path = os.path.join(screenshots_dir, screenshot_name)
+                            image = self._render_clean_word_image(pen_events)
+                            image.save(screenshot_path, "PNG")
+                            screenshot_count += 1
                         
                         total_words += 1
                         audio_start = word_data.get("audio_start_time") or pen_events[0]["absolute_time"]
                         audio_end = word_data.get("audio_end_time")
-                        
-                        stroke_starts, stroke_ends = find_stroke_indices(pen_events)
+
+                        slice_points = get_stroke_slice_points(word_data)
+                        stroke_starts, stroke_ends = find_stroke_indices(pen_events, slice_points)
                         
                         # First stroke time as reference for Letters column
                         first_stroke_time = pen_events[stroke_starts[0]]["absolute_time"] if stroke_starts else audio_start
@@ -1641,14 +1794,25 @@ class PenDataPlayer(QMainWindow):
                             format_time(writing_end),
                             len(stroke_starts),
                             f"{avg_interval:.1f}",
-                            letters_str
+                            letters_str,
+                            screenshot_name
                         ]
                         
                         writer.writerow(row)
                         flat_idx += 1
             
-            QMessageBox.information(self, "Export Complete", f"Exported {total_words} words to:\n{file_path}")
-            print(f"✓ Exported CSV: {file_path}")
+            if save_screenshots:
+                QMessageBox.information(
+                    self,
+                    "Export Complete",
+                    f"Exported {total_words} words to:\n{csv_output_path}\n\n"
+                    f"Saved {screenshot_count} screenshots to:\n{screenshots_dir}"
+                )
+                print(f"✓ Exported CSV: {csv_output_path}")
+                print(f"✓ Saved screenshots: {screenshots_dir} ({screenshot_count})")
+            else:
+                QMessageBox.information(self, "Export Complete", f"Exported {total_words} words to:\n{csv_output_path}")
+                print(f"✓ Exported CSV: {csv_output_path}")
             
         except Exception as e:
             QMessageBox.critical(self, "Export Error", f"Failed to export:\n{str(e)}")
@@ -1708,7 +1872,8 @@ class PenDataPlayer(QMainWindow):
                     pen_events = word_data.get('pen_events', [])
                     
                     # Reorganize pen_events into strokes with downsampling
-                    stroke_starts, stroke_ends = find_stroke_indices(pen_events)
+                    slice_points = get_stroke_slice_points(word_data)
+                    stroke_starts, stroke_ends = find_stroke_indices(pen_events, slice_points)
                     strokes = []
                     total_original = 0
                     total_downsampled = 0

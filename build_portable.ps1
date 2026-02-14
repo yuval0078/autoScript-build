@@ -18,8 +18,8 @@ catch {
 # Step 2: Install dependencies
 Write-Host ""
 Write-Host "Step 2: Installing dependencies..." -ForegroundColor Yellow
-Write-Host "  Upgrading pip and setuptools..." -ForegroundColor Gray
-python -m pip install --upgrade pip setuptools wheel
+Write-Host "  Upgrading pip and pinning setuptools for PyInstaller compatibility..." -ForegroundColor Gray
+python -m pip install --upgrade pip wheel "setuptools==80.10.1"
 
 Write-Host "  Installing packages from requirements.txt (using pre-built wheels only)..." -ForegroundColor Gray
 python -m pip install --only-binary :all: -r requirements.txt 2>$null
@@ -39,6 +39,32 @@ Write-Host "  [OK] Dependencies installed successfully" -ForegroundColor Green
 Write-Host ""
 Write-Host "Step 3: Building executable with PyInstaller..." -ForegroundColor Yellow
 Write-Host "  This may take a few minutes..." -ForegroundColor Gray
+
+# Pre-step: Stage ffmpeg/ffprobe into assets/bin if available
+Write-Host "" 
+Write-Host "Pre-step: Staging ffmpeg into assets/bin (if available)..." -ForegroundColor Yellow
+$assetsBin = "assets\bin"
+New-Item -ItemType Directory -Force -Path $assetsBin | Out-Null
+
+$ffmpegPath = $null
+try {
+    $ffmpegPath = (Get-Command ffmpeg -ErrorAction Stop).Source
+}
+catch {
+    $ffmpegPath = $null
+}
+
+if ($ffmpegPath -and (Test-Path $ffmpegPath)) {
+    Copy-Item $ffmpegPath "$assetsBin\ffmpeg.exe" -Force -ErrorAction SilentlyContinue
+    $ffprobePath = "$(Split-Path $ffmpegPath -Parent)\ffprobe.exe"
+    if (Test-Path $ffprobePath) {
+        Copy-Item $ffprobePath "$assetsBin\ffprobe.exe" -Force -ErrorAction SilentlyContinue
+    }
+    Write-Host "  [OK] Staged ffmpeg/ffprobe into assets/bin" -ForegroundColor Green
+}
+else {
+    Write-Host "  [WARNING] ffmpeg not found; MP3/M4A support will be missing" -ForegroundColor Yellow
+}
 
 # Clean previous builds
 if (Test-Path "build") {

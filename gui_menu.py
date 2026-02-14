@@ -14,10 +14,6 @@ from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QFont
 
-# Import analyzer and experiment runner for direct launching
-import analyzer_refactored
-import tablet_experiment
-
 
 class MainMenu(QWidget):
     """Main menu widget for the Touchpad Experiment Manager"""
@@ -116,35 +112,61 @@ class MainMenu(QWidget):
             try:
                 with open(config_file, 'r', encoding='utf-8') as f:
                     config = json.load(f)
-                
-                props = config.get('properties', {})
-                grid = props.get('grid', {})
-                rows = grid.get('rows', 5)
-                cols = grid.get('cols', 5)
-                grid_size = rows * cols
-                
-                words_data = config.get('words', {})
-                repetitions = props.get('repetitions', {})
-                order = props.get('order', 'random')
-                
-                # Calculate total words including repetitions
-                if order == 'random':
-                    # Random: each word repeated X times based on group
-                    total_words = 0
-                    for group_name, word_list in words_data.items():
-                        repeat_count = repetitions.get(group_name, 1)
-                        total_words += len(word_list) * repeat_count
+
+                # Support both new schema (grid/order/groups/repetitions/sequence)
+                # and legacy schema (properties/words).
+                if 'groups' in config and isinstance(config.get('groups'), list):
+                    grid = config.get('grid', {})
+                    rows = grid.get('rows', 5)
+                    cols = grid.get('cols', 5)
+                    grid_size = rows * cols
+
+                    order = config.get('order', 'random')
+                    repetitions = config.get('repetitions', {}) or {}
+
+                    if order == 'stiff':
+                        sequence = config.get('sequence', []) or []
+                        total_words = len(sequence)
+                    else:
+                        total_words = 0
+                        for group in config.get('groups', []):
+                            group_name = group.get('name', '')
+                            group_words = group.get('words', []) or []
+                            repeat_count = repetitions.get(group_name, 1)
+                            try:
+                                repeat_count = int(repeat_count)
+                            except Exception:
+                                repeat_count = 1
+                            repeat_count = max(0, repeat_count)
+                            total_words += len(group_words) * repeat_count
                 else:
-                    # Ordinal: all groups played, then repeat entire sequence
-                    max_repeats = max(repetitions.values()) if repetitions else 1
-                    total_words = 0
-                    unique_word_count = sum(len(word_list) for word_list in words_data.values())
-                    
-                    for rep in range(max_repeats):
+                    props = config.get('properties', {})
+                    grid = props.get('grid', {})
+                    rows = grid.get('rows', 5)
+                    cols = grid.get('cols', 5)
+                    grid_size = rows * cols
+
+                    words_data = config.get('words', {})
+                    repetitions = props.get('repetitions', {})
+                    order = props.get('order', 'random')
+
+                    # Calculate total words including repetitions
+                    if order == 'random':
+                        # Random: each word repeated X times based on group
+                        total_words = 0
                         for group_name, word_list in words_data.items():
-                            group_repeats = repetitions.get(group_name, 1)
-                            if rep < group_repeats:
-                                total_words += len(word_list)
+                            repeat_count = repetitions.get(group_name, 1)
+                            total_words += len(word_list) * repeat_count
+                    else:
+                        # Ordinal: all groups played, then repeat entire sequence
+                        max_repeats = max(repetitions.values()) if repetitions else 1
+                        total_words = 0
+
+                        for rep in range(max_repeats):
+                            for group_name, word_list in words_data.items():
+                                group_repeats = repetitions.get(group_name, 1)
+                                if rep < group_repeats:
+                                    total_words += len(word_list)
                 
                 pages = math.ceil(total_words / grid_size)
                 refreshes = max(0, pages - 1)

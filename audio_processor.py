@@ -9,7 +9,6 @@ import sys
 import subprocess
 import numpy as np
 import json
-import glob
 import shutil
 from pathlib import Path
 
@@ -100,7 +99,6 @@ class AudioProcessor:
         if input_path.suffix.lower() == '.wav':
             self.log(f"  ℹ Already WAV format: {input_path.name}")
             if str(input_path) != str(output_wav):
-                import shutil
                 shutil.copy(input_path, output_wav)
             return output_wav
 
@@ -181,6 +179,79 @@ class AudioProcessor:
             self.log(f"Error extracting segment: {e}")
             return None
 
+    def detect_segments(self, input_file, silence_thresh=-30, min_silence_len=200, keep_silence=100, min_word_len=300):
+        """
+        Detect potential word segments in an audio file without writing separate files.
+        """
+        # Ensure configuration is active
+        self._configure_pydub()
+
+        temp_dir = ensure_dir(self.data_dir / 'temp')
+        
+        # Convert to temp wav if needed (pydub works best with wav)
+        temp_wav = str(temp_dir / f"temp_analysis_{Path(input_file).stem}.wav")
+        self.convert_to_wav(input_file, temp_wav)
+        
+        try:
+            # Fix for Python 3.13 where audioop is removed
+            if sys.version_info >= (3, 13):
+                try:
+                    import audioop  # noqa: F401
+                except ImportError:
+                    pass
+
+            from pydub import AudioSegment
+            from pydub.silence import detect_nonsilent
+
+            # Configure pydub
+            if self.ffmpeg_path:
+                probe_candidate = Path(self.ffmpeg_path).with_name("ffprobe.exe")
+                if probe_candidate.exists():
+                    AudioSegment.ffprobe = str(probe_candidate)  # type: ignore
+
+            # Load audio
+            sound = AudioSegment.from_wav(temp_wav)
+            total_duration = len(sound)
+            
+            # Use detect_nonsilent
+            ranges = detect_nonsilent(
+                sound, 
+                min_silence_len=min_silence_len,
+                silence_thresh=silence_thresh
+            )
+            
+            # Apply keep_silence (expand ranges)
+            segments = []
+            
+            # Apply expansion first
+            expanded_ranges = []
+            for start, end in ranges:
+                start = max(0, start - keep_silence)
+                end = min(len(sound), end + keep_silence)
+                duration = end - start 
+                if duration >= min_word_len:
+                    segments.append({
+                        'start': start,
+                        'end': end,
+                        'duration': duration,
+                        'index': len(segments) + 1
+                    })
+            
+            # Clean up temp wav if we created a specific one for analysis
+            if os.path.exists(temp_wav) and temp_wav != input_file:
+                try:
+                    os.remove(temp_wav)
+                except:
+                    pass
+            
+            return segments, total_duration
+
+        except Exception as e:
+            self.log(f"Error checking segments: {e}")
+            import traceback
+            traceback.print_exc()
+            return [], 0
+
     def detect_nonsilent(self, audio_data, sample_rate, silence_thresh=0.01, min_silence_len=300, min_word_len=100):
         """
         Detect non-silent regions in audio data.
@@ -255,7 +326,6 @@ class AudioProcessor:
         
         try:
             # Fix for Python 3.13 where audioop is removed
-            import sys
             if sys.version_info >= (3, 13):
                 try:
                     import audioop  # noqa: F401

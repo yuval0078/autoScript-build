@@ -1,13 +1,19 @@
 """
 Convert all m4a audio files to wav format for pygame compatibility
 """
-import os
 import sys
 import subprocess
 from pathlib import Path
 
+from app_paths import asset_path
+
 def find_ffmpeg():
     """Find ffmpeg executable in common locations"""
+    # Prefer a bundled ffmpeg (works on other PCs with no installs)
+    bundled = asset_path('assets/bin/ffmpeg.exe')
+    if bundled.exists():
+        return str(bundled)
+
     # Try PsychoPy installation first
     psychopy_ffmpeg = Path(r"C:\Program Files\PsychoPy\share\ffpyplayer\ffmpeg\bin\ffmpeg.exe")
     if psychopy_ffmpeg.exists():

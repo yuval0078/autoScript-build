@@ -12,11 +12,19 @@ import winsound
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QLabel, QPushButton, QMessageBox, QInputDialog)
 from PyQt5.QtCore import Qt, QTimer, QPointF, QEvent
-from PyQt5.QtGui import QPainter, QPen, QColor, QTabletEvent, QFont, QBrush
+from PyQt5.QtGui import QPainter, QPen, QColor, QTabletEvent, QFont, QBrush, QKeySequence
 from datetime import datetime
 import time
 import json
 import uuid
+
+# Import AudioProcessor for segment playback
+try:
+    from audio_processor import AudioProcessor
+    HAVE_AUDIO_PROCESSOR = True
+except ImportError:
+    HAVE_AUDIO_PROCESSOR = False
+    print("Warning: AudioProcessor not found (using full files only)")
 
 
 def _is_manifest(config: dict) -> bool:
@@ -697,6 +705,13 @@ class ExperimentCanvas(QWidget):
         self.is_drawing = False
         self.current_stroke = []
         
+        # Audio slicing support
+        self.processor = AudioProcessor(verbose=False) if HAVE_AUDIO_PROCESSOR else None
+        
+        # Special State: Waiting for Key definition
+        self.waiting_for_proceed_key = (self.proceed_mode == 'key')
+        self.proceed_key_name = "Space" # Default display name
+        
         # Pen data recorder
         self.pen_recorder = PenDataRecorder()
         
@@ -716,70 +731,165 @@ class ExperimentCanvas(QWidget):
         self.setMouseTracking(True)
         
     def load_words(self):
-        """Load words from the experiment configuration JSON."""
-        import random
-        
+        """Load words from all supported config formats."""
         self.words = []
-        
         if not self.config:
             print("✗ No experiment configuration provided.")
             return
 
-        # Load from config object
-        words_data = self.config.get('words', {})
         base_dir = os.path.dirname(self.config.get('__file_path__', '.'))
-        audio_dir = os.path.join(base_dir, 'audio')
-        repetitions = self.config.get('properties', {}).get('repetitions', {})
-        order = self.config.get('properties', {}).get('order', 'random')
-            
-        # First, load all unique words
-        unique_words = []
-        for group_name, word_list in words_data.items():
-            for word_entry in word_list:
-                # Resolve audio reference: URL, absolute, or relative to extracted audio dir
-                file_ref = word_entry.get('file', '')
-                if file_ref.startswith(('http://', 'https://')):
-                    word_file = file_ref
-                elif os.path.isabs(file_ref):
-                    word_file = file_ref
-                else:
-                    word_file = os.path.join(audio_dir, file_ref)
-                unique_words.append({
-                    'file': word_file,
-                    'word': word_entry['word'],
-                    'group': group_name
-                })
-            
-        # Handle repetitions
-        if order == 'random':
-            # Random order: repeat each word X times based on group, then shuffle with spacing
-            word_pool = []
-            for word_data in unique_words:
-                group_name = word_data['group']
-                repeat_count = repetitions.get(group_name, 1)
-                # Add this word multiple times
-                for rep in range(repeat_count):
-                    word_pool.append(word_data.copy())
 
-            # Shuffle with spacing constraint: same words should be spaced apart
-            self.words = self._shuffle_with_spacing(word_pool)
+        # --- A. DETECT NEW JSON FORMAT ---
+        if 'groups' in self.config and isinstance(self.config['groups'], list):
+            # Parse Properties
+            self.exp_name = self.config.get('name', 'My Experiment')
+            
+            grid = self.config.get('grid', {})
+            self.grid_rows = grid.get('rows', 5)
+            self.grid_cols = grid.get('cols', 5)
+            
+            # Note: Active proceeding condition logic will be handled outside load_words
+            proceed = self.config.get('proceed_condition', {})
+            self.proceed_mode = proceed.get('type', 'key')
+            self.proceed_delay = proceed.get('delay_ms', 2000)
 
+            beeps = self.config.get('beeps', {})
+            self.beep_before = beeps.get('before', {}).get('enabled', False)
+            self.beep_before_delay = beeps.get('before', {}).get('delay_ms', 100)
+            self.beep_after = beeps.get('after', {}).get('enabled', False)
+            self.beep_after_delay = beeps.get('after', {}).get('delay_ms', 100)
+            
+            # 1. Build File Map
+            # Map "file_name" or "original_name" or just path -> Absolute Path
+            file_map = {} # filename -> abs_path
+            for f_entry in self.config.get('files', []):
+                fname = f_entry.get('file_name', '')
+                rel_path = f_entry.get('path', '')
+                abs_path = os.path.join(base_dir, rel_path)
+                if fname:
+                    file_map[fname] = abs_path
+                # Fallback mapping
+                orig = f_entry.get('original_name', '')
+                if orig: 
+                     file_map[orig] = abs_path
+                file_map[rel_path] = abs_path
+
+            # 2. Build Word Lookup Map (ID -> Object)
+            word_lookup = {}
+            for grp in self.config.get('groups', []):
+                grp_name = grp.get('name', 'Default')
+                for w in grp.get('words', []):
+                    # Resolve audio file
+                    src_ref = w.get('source_file')
+                    active_file = file_map.get(src_ref)
+                    if not active_file and src_ref and os.path.exists(os.path.join(base_dir, 'media', src_ref)):
+                        active_file = os.path.join(base_dir, 'media', src_ref)
+
+                    w_obj = {
+                        'id': w.get('id'),
+                        'word': w.get('text', ''),
+                        'group': grp_name,
+                        'file': active_file,
+                        'start_ms': w.get('start_ms'),
+                        'end_ms': w.get('end_ms')
+                    }
+                    word_lookup[w.get('id')] = w_obj
+
+            # 3. Determine Execution Sequence
+            order_type = self.config.get('order', 'random')
+            
+            if order_type == 'stiff':
+                # Use explicit sequence of IDs
+                seq_ids = self.config.get('sequence', [])
+                for wid in seq_ids:
+                    if wid in word_lookup:
+                        self.words.append(word_lookup[wid].copy())
+                    else:
+                        print(f"Warning: Sequence ID {wid} not found in groups.")
+
+            elif order_type == 'random':
+                # Use Groups + Repetitions
+                repetitions = self.config.get('repetitions', {})
+                pool = []
+                
+                # Iterate groups to find words
+                for grp in self.config.get('groups', []):
+                    grp_name = grp.get('name', 'Default')
+                    count = repetitions.get(grp_name, 1)
+                    
+                    grp_words = []
+                    for w in grp.get('words', []):
+                         if w.get('id') in word_lookup:
+                             grp_words.append(word_lookup[w.get('id')])
+                    
+                    # Add this group's words 'count' times
+                    for _ in range(count):
+                        for w_obj in grp_words:
+                            pool.append(w_obj.copy())
+                            
+                # Shuffle with spacing
+                self.words = self._shuffle_with_spacing(pool)
+
+
+        # --- B. LEGACY FORMAT FALLBACK ---
         else:
-            # Ordinal order: play all groups in order, then repeat entire sequence
-            # Use maximum repetition count
-            max_repeats = max(repetitions.values()) if repetitions else 1
-
-            for rep in range(max_repeats):
+            # Load from config object
+            words_data = self.config.get('words', {})
+            audio_dir = os.path.join(base_dir, 'audio')
+            repetitions = self.config.get('properties', {}).get('repetitions', {})
+            order = self.config.get('properties', {}).get('order', 'random')
+            
+            # First, load all unique words
+            unique_words = []
+            for group_name, word_list in words_data.items():
+                for word_entry in word_list:
+                    # Resolve audio reference: URL, absolute, or relative to extracted audio dir
+                    file_ref = word_entry.get('file', '')
+                    if file_ref.startswith(('http://', 'https://')):
+                        word_file = file_ref
+                    elif os.path.isabs(file_ref):
+                        word_file = file_ref
+                    else:
+                        word_file = os.path.join(audio_dir, file_ref)
+                    unique_words.append({
+                        'file': word_file,
+                        'word': word_entry['word'],
+                        'group': group_name
+                    })
+                
+            # Handle repetitions
+            if order == 'random':
+                # Random order: repeat each word X times based on group, then shuffle with spacing
+                word_pool = []
                 for word_data in unique_words:
                     group_name = word_data['group']
-                    group_repeats = repetitions.get(group_name, 1)
-                    # Only add if this repetition is within the group's repeat count
-                    if rep < group_repeats:
-                        self.words.append(word_data.copy())
+                    repeat_count = repetitions.get(group_name, 1)
+                    # Add this word multiple times
+                    for rep in range(repeat_count):
+                        word_pool.append(word_data.copy())
+
+                # Shuffle with spacing constraint: same words should be spaced apart
+                self.words = self._shuffle_with_spacing(word_pool)
+
+            else:
+                # Ordinal order: play all groups in order, then repeat entire sequence
+                # Use maximum repetition count
+                max_repeats = max(repetitions.values()) if repetitions else 1
+
+                for rep in range(max_repeats):
+                    for word_data in unique_words:
+                        group_name = word_data['group']
+                        group_repeats = repetitions.get(group_name, 1)
+                        # Only add if this repetition is within the group's repeat count
+                        if rep < group_repeats:
+                            self.words.append(word_data.copy())
+            
+        # Common Finalization
+        self.grid_size = self.grid_rows # For compatibility with some methods, though we should use rows/cols
+        self.total_cells = self.grid_rows * self.grid_cols
         
-        # Note: We do NOT limit to grid size anymore, as we support multiple pages
-        # self.words = self.words[:self.total_cells] 
         print(f"✓ Loaded {len(self.words)} words for experiment")
+    
     
     def _shuffle_with_spacing(self, word_pool):
         """
@@ -921,14 +1031,36 @@ class ExperimentCanvas(QWidget):
                 # Initialize with higher frequency for better quality
                 pygame.mixer.init(frequency=44100, size=-16, channels=2, buffer=512)
             
-            # Load and play the sound
-            pygame.mixer.music.load(abs_audio_file)
-            pygame.mixer.music.play()
+            # --- START SEGMENT LOGIC ---
+            start_ms = word_data.get('start_ms')
+            end_ms = word_data.get('end_ms')
+            
+            if start_ms is not None and end_ms is not None and self.processor:
+                # Use AudioProcessor to create a temp file for this segment
+                # This works for both WAV and M4A source files
+                segment_context = f"exp_playback_{self.current_cell}_{int(start_ms)}_{int(end_ms)}"
+                temp_file = self.processor.get_temp_segment_file(
+                    abs_audio_file, start_ms, end_ms, context=segment_context
+                )
+                if temp_file:
+                    pygame.mixer.music.load(temp_file)
+                    pygame.mixer.music.play()
+                    print(f"♪ Playing segment {self.current_cell + 1}: '{word_data['word']}' ({start_ms}-{end_ms}ms)")
+                else:
+                    print(f"⚠ Failed to create segment, falling back to full file: {abs_audio_file}")
+                    pygame.mixer.music.load(abs_audio_file)
+                    pygame.mixer.music.play()
+                    print(f"♪ Playing full file {self.current_cell + 1}: '{word_data['word']}'")
+            else:
+                # Fallback: Play full file
+                pygame.mixer.music.load(abs_audio_file)
+                pygame.mixer.music.play()
+                print(f"♪ Playing full file {self.current_cell + 1}: '{word_data['word']}'")
+            # --- END SEGMENT LOGIC ---
             
             # Start monitoring for audio completion
             self.audio_monitor_timer.start()
             
-            print(f"♪ Playing word {self.current_cell + 1}: '{word_data['word']}' ({os.path.basename(audio_file)})")
         except Exception as e:
             print(f"✗ Error playing with pygame: {e}")
             # Fallback to opening in external player
@@ -1249,8 +1381,34 @@ class ExperimentCanvas(QWidget):
         
         event.accept()
     
+    def mousePressEvent(self, event):
+        """Handle mouse events for proceed trigger"""
+        # Mouse logic removed to restore stability
+        pass
+            
     def keyPressEvent(self, event):
         """Handle keyboard events"""
+        # --- NEW: Handle Proceed Key Definition ---
+        if self.waiting_for_proceed_key:
+            key_val = event.key()
+            # Ignore modifiers alone
+            if key_val in (Qt.Key_Control, Qt.Key_Shift, Qt.Key_Alt, Qt.Key_Meta):
+                return
+            
+            # Store the key
+            self.proceed_key = key_val
+            key_text = QKeySequence(key_val).toString()
+            print(f"✓ Proceed key defined as: {key_text} (ID: {key_val})")
+            
+            # Clear state and start
+            self.waiting_for_proceed_key = False
+            main_window = self.window()
+            if isinstance(main_window, QMainWindow):
+                main_window.statusBar().showMessage(f"Proceed Key: {key_text}")
+            self.play_current_word()
+            self.update()
+            return
+
         # Handle Ctrl+R for recalibration
         if event.key() == Qt.Key_R and event.modifiers() == Qt.ControlModifier:
             print("\n⚠ Ctrl+R pressed - initiating recalibration...")
@@ -1310,6 +1468,14 @@ class ExperimentCanvas(QWidget):
         # Fill background
         painter.fillRect(self.rect(), Qt.white)
         
+        # Draw "Waiting for Key" Overlay
+        if self.waiting_for_proceed_key:
+            painter.setPen(QPen(Qt.black))
+            painter.setFont(QFont("Arial", 24, QFont.Bold))
+            text = "Press ANY KEY to define it separately\nas the 'Next Word' trigger."
+            painter.drawText(self.rect(), Qt.AlignCenter, text)
+            return
+
         # Draw quadrilateral using ACTUAL calibrated corners (original points)
         # This matches where the user actually touched the paper corners
         from PyQt5.QtGui import QPolygon
@@ -1404,8 +1570,9 @@ class ExperimentWindow(QMainWindow):
         print("✓ Experiment stage started")
         print("  Press ESC to exit, Ctrl+R to recalibrate")
         
-        # Play first word
-        self.canvas.play_current_word()
+        # Play first word ONLY if not waiting for key definition
+        if not self.canvas.waiting_for_proceed_key:
+            self.canvas.play_current_word()
     
     def start_recalibration(self):
         """Start recalibration process"""
