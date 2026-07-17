@@ -1,5 +1,6 @@
 import sys
 from qt_bootstrap import ensure_qt_platform_plugin_path
+from project_version import APP_VERSION_LABEL, APP_NAME
 
 from PyQt5.QtWidgets import QApplication, QMainWindow, QStackedWidget, QLabel
 
@@ -16,8 +17,11 @@ class MainInterface(QMainWindow):
         # Status Bar
         self.status_msg = QLabel("Ready")
         self.statusBar().addWidget(self.status_msg)
+        self.version_label = QLabel(APP_VERSION_LABEL)
+        self.version_label.setStyleSheet("color: #6f7d8c; font-size: 11px; padding-left: 12px;")
+        self.statusBar().addPermanentWidget(self.version_label)
 
-        self.setWindowTitle("Touchpad Experiment Manager")
+        self.setWindowTitle(APP_NAME)
         self.resize(1200, 800)
         
         self.stack = QStackedWidget()

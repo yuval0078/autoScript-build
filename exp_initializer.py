@@ -7,7 +7,10 @@ import shutil
 import numpy as np
 import math
 import traceback
+import uuid
 from pathlib import Path
+from app_paths import ensure_dir, user_data_dir
+from project_version import APP_VERSION
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton, 
                              QLabel, QFileDialog, QListWidget, QListWidgetItem, 
                              QTextEdit, QMessageBox, QGroupBox, QSplitter, 
@@ -25,6 +28,71 @@ try:
 except ImportError:
     # Handle case where audio_processor might be missing or has issues
     AudioProcessor = None
+
+
+def canonicalize_audio_path(file_path):
+    return os.path.normcase(os.path.abspath(str(file_path)))
+
+
+def create_segment_id(file_path):
+    return f"{Path(file_path).stem}_{uuid.uuid4().hex}"
+
+
+def normalize_segments(file_path, segments):
+    normalized_segments = []
+    sorted_segments = sorted(
+        (dict(segment) for segment in segments),
+        key=lambda segment: (
+            segment.get('start', 0),
+            segment.get('end', 0),
+            segment.get('segment_id', ''),
+        ),
+    )
+
+    for position, segment in enumerate(sorted_segments):
+        start = max(0, int(round(segment.get('start', 0))))
+        end = max(start + 1, int(round(segment.get('end', start))))
+        normalized_segment = dict(segment)
+        normalized_segment['start'] = start
+        normalized_segment['end'] = end
+        normalized_segment['duration'] = end - start
+        normalized_segment['index'] = position + 1
+        normalized_segment['segment_id'] = normalized_segment.get('segment_id') or create_segment_id(file_path)
+        normalized_segments.append(normalized_segment)
+
+    return normalized_segments
+
+
+def reconcile_segment_ids(file_path, previous_segments, new_segments):
+    prior_segments = normalize_segments(file_path, previous_segments)
+    updated_segments = [dict(segment) for segment in new_segments]
+    candidates = []
+
+    for new_index, new_segment in enumerate(updated_segments):
+        if new_segment.get('segment_id'):
+            continue
+
+        new_start = int(round(new_segment.get('start', 0)))
+        new_end = max(new_start + 1, int(round(new_segment.get('end', new_start))))
+
+        for prior_index, prior_segment in enumerate(prior_segments):
+            overlap = max(0, min(prior_segment['end'], new_end) - max(prior_segment['start'], new_start))
+            boundary_gap = abs(prior_segment['start'] - new_start) + abs(prior_segment['end'] - new_end)
+            if overlap > 0 or boundary_gap <= 200:
+                candidates.append((-overlap, boundary_gap, prior_index, new_index))
+
+    candidates.sort()
+    matched_prior = set()
+    matched_new = set()
+
+    for _, _, prior_index, new_index in candidates:
+        if prior_index in matched_prior or new_index in matched_new:
+            continue
+        updated_segments[new_index]['segment_id'] = prior_segments[prior_index]['segment_id']
+        matched_prior.add(prior_index)
+        matched_new.add(new_index)
+
+    return normalize_segments(file_path, updated_segments)
 
 
 class WaveformWidget(QWidget):
@@ -50,9 +118,18 @@ class WaveformWidget(QWidget):
         self.marker_color = QColor(50, 50, 50)
         self.setMouseTracking(True)
 
-    def load_file(self, file_path, segments=None):
+    def load_file(self, file_path, segments=None, processor=None):
+        temp_wav_path = None
+
         try:
-            audio = AudioSegment.from_file(file_path)
+            source_path = file_path
+            if processor is not None:
+                temp_dir = ensure_dir(user_data_dir() / 'temp')
+                temp_wav_path = str(temp_dir / f"waveform_preview_{uuid.uuid4().hex}.wav")
+                processor.convert_to_wav(file_path, temp_wav_path)
+                source_path = temp_wav_path
+
+            audio = AudioSegment.from_wav(source_path) if processor is not None else AudioSegment.from_file(source_path)
             audio = audio.set_channels(1)
             self.sample_rate = audio.frame_rate
             self.duration_ms = len(audio)
@@ -69,7 +146,18 @@ class WaveformWidget(QWidget):
                 self.segments = []
             self.update()
         except Exception as e:
+            self.audio_data = None
+            self.duration_ms = 0
+            if processor is not None:
+                processor.log(f"[WAVEFORM] Error loading waveform for {file_path}: {e}")
             print(f"Error loading waveform: {e}")
+            self.update()
+        finally:
+            if temp_wav_path and os.path.exists(temp_wav_path):
+                try:
+                    os.remove(temp_wav_path)
+                except OSError:
+                    pass
 
     def zoom_to_fit(self):
         self.zoom_level = 1.0
@@ -218,11 +306,12 @@ class FileEditorWindow(QDialog):
         self.setWindowTitle(f"File Editor: {Path(file_path).name}")
         self.resize(1000, 700)
         self.file_path = file_path
-        self.segments = [dict(s) for s in segments] 
+        self.segments = normalize_segments(file_path, segments)
+        self._saved_segments = None
         self.processor = processor
         self.media_player = QMediaPlayer()
         self.init_ui()
-        self.waveform.load_file(file_path, self.segments)
+        self.waveform.load_file(file_path, self.segments, self.processor)
         
     def init_ui(self):
         layout = QVBoxLayout(self)
@@ -265,7 +354,7 @@ class FileEditorWindow(QDialog):
         footer = QHBoxLayout()
         btn_save = QPushButton("Save & Close")
         btn_save.setProperty("class", "primary")
-        btn_save.clicked.connect(self.accept)
+        btn_save.clicked.connect(self.save_and_close)
         footer.addStretch()
         footer.addWidget(btn_save)
         layout.addLayout(footer)
@@ -275,20 +364,23 @@ class FileEditorWindow(QDialog):
         self.lbl_sens.setText(f"{val} dB")
 
     def reslice_file(self):
+        if not self.processor:
+            return
         thresh = self.slider_sens.value()
         reply = QMessageBox.question(self, "Confirm Re-Slice", 
                                      "This will overwrite all current segments with new detection settings.\nContinue?",
                                      QMessageBox.Yes | QMessageBox.No)
         if reply == QMessageBox.Yes:
+            selected_segment_id = None
+            if 0 <= self.waveform.selected_segment_index < len(self.segments):
+                selected_segment_id = self.segments[self.waveform.selected_segment_index].get('segment_id')
             new_segs, _ = self.processor.detect_segments(
                 self.file_path, 
                 silence_thresh=thresh, 
                 min_silence_len=200
             )
-            self.segments = new_segs
-            self.waveform.segments = self.segments
-            self.waveform.update()
-            self.refresh_list()
+            self.segments = reconcile_segment_ids(self.file_path, self.segments, new_segs)
+            self._sync_segments(selected_segment_id)
 
     def refresh_list(self):
         self.seg_list.clear()
@@ -312,6 +404,8 @@ class FileEditorWindow(QDialog):
         self._play_range(0, self.waveform.duration_ms, context="editor_all")
 
     def _play_range(self, start, end, context):
+        if not self.processor:
+            return
         self.media_player.stop()
         self.media_player.setMedia(QMediaContent())
         temp_file = self.processor.get_temp_segment_file(self.file_path, start, end, context=context)
@@ -320,24 +414,65 @@ class FileEditorWindow(QDialog):
             self.media_player.play()
 
     def add_segment(self):
-        start = self.waveform.x_to_ms(10)
+        start = int(self.waveform.x_to_ms(10))
         end = start + 500
-        new_seg = {'start': start, 'end': end, 'duration': 500, 'index': len(self.segments)+1}
+        new_seg = {
+            'start': start,
+            'end': end,
+            'duration': 500,
+            'index': len(self.segments) + 1,
+            'segment_id': create_segment_id(self.file_path),
+        }
         self.segments.append(new_seg)
-        self.segments.sort(key=lambda x: x['start'])
-        self.waveform.update()
-        self.refresh_list()
+        self._sync_segments(new_seg['segment_id'])
 
     def delete_segment(self):
         idx = self.waveform.selected_segment_index
-        if idx >= 0:
+        if 0 <= idx < len(self.segments):
             del self.segments[idx]
-            self.waveform.selected_segment_index = -1
-            self.waveform.update()
-            self.refresh_list()
+            next_segment_id = None
+            if self.segments:
+                next_index = min(idx, len(self.segments) - 1)
+                next_segment_id = self.segments[next_index].get('segment_id')
+            self._sync_segments(next_segment_id)
 
     def get_segments(self):
-        return self.segments
+        if self._saved_segments is not None:
+            return [dict(segment) for segment in self._saved_segments]
+        return [dict(segment) for segment in self.segments]
+
+    def _sync_segments(self, selected_segment_id=None):
+        self.segments = normalize_segments(self.file_path, self.segments)
+        self.waveform.segments = self.segments
+
+        selected_index = -1
+        if selected_segment_id:
+            for index, segment in enumerate(self.segments):
+                if segment.get('segment_id') == selected_segment_id:
+                    selected_index = index
+                    break
+
+        self.waveform.selected_segment_index = selected_index
+        self.refresh_list()
+        if 0 <= selected_index < self.seg_list.count():
+            self.seg_list.setCurrentRow(selected_index)
+        self.waveform.update()
+
+    def select_segment_by_id(self, segment_id):
+        for index, segment in enumerate(self.segments):
+            if segment.get('segment_id') == segment_id:
+                self.waveform.selected_segment_index = index
+                self.seg_list.setCurrentRow(index)
+                self.waveform.update()
+                return
+
+    def save_and_close(self):
+        # Capture a deep snapshot of the live segment data BEFORE any
+        # Qt teardown. self.segments is the same list the waveform edits
+        # in-place during drag, so we read the edits directly.
+        self._saved_segments = normalize_segments(
+            self.file_path, [dict(seg) for seg in self.segments])
+        super().accept()
 
 
 class GroupTreeWidget(QTreeWidget):
@@ -404,6 +539,10 @@ class NewExperimentWizard(QWidget):
         super().__init__()
         self.parent = parent
         self.processor = AudioProcessor(verbose=True) if AudioProcessor else None
+        self._active_word_item = None
+        self._active_word_text_input = None
+        self.loaded_properties = None
+        self.imported_package_dir = None
         
         # New Data Structure:
         # { 
@@ -417,6 +556,238 @@ class NewExperimentWizard(QWidget):
         self.media_player = QMediaPlayer()
         
         self.init_ui()
+
+    def _has_setup_data(self):
+        if self.loaded_properties:
+            return True
+
+        if list(self.groups.keys()) != ["Group 1"]:
+            return True
+
+        group = self.groups.get("Group 1", {})
+        return bool(group.get("files") or group.get("words"))
+
+    def import_experiment_zip(self, file_path=None):
+        if file_path is None:
+            file_path, _ = QFileDialog.getOpenFileName(self, "Upload Experiment Package", "", "ZIP Files (*.zip)")
+
+        if not file_path:
+            return False
+
+        if self._has_setup_data():
+            reply = QMessageBox.question(
+                self,
+                "Replace Current Draft",
+                "Loading an experiment package will replace the current experiment draft in the editor. Continue?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return False
+
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        self.parent.status_msg.setText("Importing experiment package...")  # type: ignore
+
+        try:
+            imported_groups, loaded_properties, extract_dir = self._load_experiment_package(file_path)
+        except Exception as exc:
+            QMessageBox.critical(self, "Import Failed", f"Could not import experiment package:\n{exc}")
+            return False
+        finally:
+            QApplication.restoreOverrideCursor()
+            self.parent.status_msg.setText("Ready")  # type: ignore
+
+        self.groups = imported_groups
+        self.loaded_properties = loaded_properties
+        self.imported_package_dir = extract_dir
+        self.populate_tree()
+        self.clear_right_panel()
+
+        first_group = next(iter(self.groups), None)
+        if first_group:
+            self._select_group_item(first_group)
+
+        self.activateWindow()
+        self.setFocus()
+        return True
+
+    def _extract_experiment_package(self, file_path):
+        import_root = ensure_dir(user_data_dir() / "editable_experiments")
+        safe_stem = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in Path(file_path).stem) or "experiment"
+        extract_dir = ensure_dir(import_root / f"{safe_stem}_{uuid.uuid4().hex[:8]}")
+
+        with zipfile.ZipFile(file_path, 'r') as zip_ref:
+            zip_ref.extractall(extract_dir)
+
+        json_files = sorted(extract_dir.glob("*.json"))
+        if not json_files:
+            json_files = sorted(extract_dir.rglob("*.json"))
+        if not json_files:
+            raise FileNotFoundError("No experiment configuration JSON found inside the ZIP package.")
+
+        return extract_dir, json_files[0]
+
+    def _resolve_imported_media_path(self, package_dir, file_lookup, source_ref):
+        if not source_ref:
+            raise ValueError("Experiment package contains a word without a source audio reference.")
+
+        entry = file_lookup.get(source_ref)
+        if entry:
+            return entry['path'], entry
+
+        candidate = (package_dir / str(source_ref)).resolve()
+        if candidate.exists():
+            return str(candidate), {
+                'path': str(candidate),
+                'original_name': candidate.name,
+                'owner_group': None,
+            }
+
+        media_candidate = (package_dir / "media" / str(source_ref)).resolve()
+        if media_candidate.exists():
+            return str(media_candidate), {
+                'path': str(media_candidate),
+                'original_name': media_candidate.name,
+                'owner_group': None,
+            }
+
+        raise FileNotFoundError(f"Missing source audio '{source_ref}' in the experiment package.")
+
+    def _load_experiment_package(self, file_path):
+        extract_dir, config_path = self._extract_experiment_package(file_path)
+
+        with open(config_path, 'r', encoding='utf-8') as f:
+            config = json.load(f)
+
+        config_groups = config.get('groups')
+        if not isinstance(config_groups, list):
+            raise ValueError("This experiment package format cannot be edited by the current setup tool.")
+
+        groups = {}
+        for index, group_cfg in enumerate(config_groups, start=1):
+            group_name = str(group_cfg.get('name') or f"Group {index}")
+            if group_name in groups:
+                suffix = 2
+                unique_name = f"{group_name} ({suffix})"
+                while unique_name in groups:
+                    suffix += 1
+                    unique_name = f"{group_name} ({suffix})"
+                group_name = unique_name
+            groups[group_name] = {"files": [], "words": []}
+
+        file_lookup = {}
+        for file_cfg in config.get('files', []):
+            file_name = file_cfg.get('file_name') or Path(file_cfg.get('path', '')).name
+            if not file_name:
+                continue
+
+            rel_path = file_cfg.get('path') or f"media/{file_name}"
+            abs_path = (extract_dir / rel_path).resolve()
+            if not abs_path.exists():
+                fallback = (extract_dir / "media" / file_name).resolve()
+                if fallback.exists():
+                    abs_path = fallback
+
+            entry = {
+                'path': str(abs_path),
+                'original_name': file_cfg.get('original_name') or file_name,
+                'owner_group': file_cfg.get('owner_group'),
+                'auto_slice_word': file_cfg.get('auto_slice_word', True),
+            }
+            file_lookup[file_name] = entry
+            file_lookup[rel_path] = entry
+
+        file_segments = {}
+        file_first_group = {}
+        staged_words = []
+
+        for group_cfg in config_groups:
+            group_name = str(group_cfg.get('name') or '')
+            if group_name not in groups:
+                continue
+
+            for word_cfg in group_cfg.get('words', []) or []:
+                source_ref = word_cfg.get('source_file') or word_cfg.get('file') or word_cfg.get('source')
+                resolved_path, source_meta = self._resolve_imported_media_path(extract_dir, file_lookup, source_ref)
+
+                start_ms = int(round(word_cfg.get('start_ms', word_cfg.get('start', 0))))
+                end_raw = word_cfg.get('end_ms', word_cfg.get('end', start_ms + 1))
+                end_ms = max(start_ms + 1, int(round(end_raw)))
+                segment_id = word_cfg.get('id') or word_cfg.get('segment_id') or create_segment_id(resolved_path)
+
+                file_segments.setdefault(resolved_path, []).append({
+                    'start': start_ms,
+                    'end': end_ms,
+                    'segment_id': segment_id,
+                })
+                file_first_group.setdefault(resolved_path, group_name)
+
+                staged_words.append({
+                    'group_name': group_name,
+                    'text': word_cfg.get('text', ''),
+                    'segment_id': segment_id,
+                    'source_path': resolved_path,
+                    'source_meta': source_meta,
+                })
+
+        normalized_segments_by_path = {
+            path: normalize_segments(path, segments)
+            for path, segments in file_segments.items()
+        }
+        segment_lookup = {
+            path: {segment['segment_id']: segment for segment in segments}
+            for path, segments in normalized_segments_by_path.items()
+        }
+
+        for source_path, segments in normalized_segments_by_path.items():
+            source_meta = next(
+                (word['source_meta'] for word in staged_words if word['source_path'] == source_path),
+                None,
+            ) or {}
+            owner_group = source_meta.get('owner_group')
+            if owner_group not in groups:
+                owner_group = file_first_group.get(source_path)
+            if owner_group not in groups:
+                owner_group = next(iter(groups), "Group 1")
+                groups.setdefault(owner_group, {"files": [], "words": []})
+
+            groups[owner_group]['files'].append({
+                'path': source_path,
+                'original_name': source_meta.get('original_name') or Path(source_path).name,
+                'segments': segments,
+                'duration': None,
+                'auto_slice_word': source_meta.get('auto_slice_word', True),
+            })
+
+        for staged_word in staged_words:
+            group_name = staged_word['group_name']
+            segments_for_file = segment_lookup.get(staged_word['source_path'], {})
+            segment = segments_for_file.get(staged_word['segment_id'])
+            if not segment:
+                continue
+
+            groups[group_name]['words'].append({
+                'id': staged_word['segment_id'],
+                'segment_id': staged_word['segment_id'],
+                'text': staged_word['text'],
+                'file_path': staged_word['source_path'],
+                'start': segment['start'],
+                'end': segment['end'],
+                'seg_index': segment['index'],
+            })
+
+        loaded_properties = {
+            'name': config.get('name', Path(file_path).stem),
+            'grid': config.get('grid', {}),
+            'order': config.get('order', 'random'),
+            'sequence': list(config.get('sequence', []) or []),
+            'repetitions': dict(config.get('repetitions', {}) or {}),
+            'active_block_sequence': list(config.get('active_block_sequence', []) or []),
+            'proceed_condition': dict(config.get('proceed_condition', {}) or {}),
+            'beeps': dict(config.get('beeps', {}) or {}),
+        }
+
+        return groups, loaded_properties, str(extract_dir)
         
     def init_ui(self):
         layout = QVBoxLayout(self)
@@ -455,6 +826,7 @@ class NewExperimentWizard(QWidget):
         # Tree
         self.tree = GroupTreeWidget(self)
         self.tree.itemSelectionChanged.connect(self.on_selection_changed)
+        self.tree.itemClicked.connect(self.on_tree_item_clicked)
         self.tree.itemDoubleClicked.connect(self.on_item_double_clicked)
         left_layout.addWidget(self.tree)
         
@@ -494,13 +866,13 @@ class NewExperimentWizard(QWidget):
             grp_item = QTreeWidgetItem(self.tree)
             grp_item.setText(0, grp_name)
             # Allow drop on groups
-            grp_item.setFlags(grp_item.flags() | Qt.ItemIsDropEnabled)
+            grp_item.setFlags(grp_item.flags() | Qt.ItemIsDropEnabled | Qt.ItemIsSelectable | Qt.ItemIsEnabled)
             # Tag as group
             grp_item.setData(0, Qt.UserRole, "group")
             
             for word in grp_data["words"]:
                 word_item = QTreeWidgetItem(grp_item)
-                label = f"{word['text'] if word['text'] else '[No Text]'} ({Path(word['file_path']).name} #{word['seg_index']})"
+                label = self._format_word_label(word)
                 word_item.setText(0, label)
                 word_item.setFlags(word_item.flags() | Qt.ItemIsDragEnabled | Qt.ItemIsSelectable | Qt.ItemIsEnabled)
                 # Tag as word
@@ -509,6 +881,237 @@ class NewExperimentWizard(QWidget):
                 word_item.setData(0, Qt.UserRole + 1, word)
                 
             grp_item.setExpanded(True)
+
+    def _format_word_label(self, word_data):
+        text = word_data.get('text', '') or '[No Text]'
+        return f"{text} ({Path(word_data['file_path']).name} #{word_data['seg_index']})"
+
+    def _create_word_entry(self, file_path, segment, text=''):
+        segment_id = segment['segment_id']
+        return {
+            'id': segment_id,
+            'segment_id': segment_id,
+            'text': text,
+            'file_path': file_path,
+            'start': segment['start'],
+            'end': segment['end'],
+            'seg_index': segment['index'],
+        }
+
+    def _show_details_for_item(self, item):
+        self._commit_active_word_text()
+
+        if not item:
+            self.clear_right_panel()
+            return
+
+        role = item.data(0, Qt.UserRole)
+        if role == "group":
+            self.show_group_details(item.text(0))
+            return
+
+        if role == "word":
+            word_data = item.data(0, Qt.UserRole + 1)
+            if not word_data:
+                self.clear_right_panel()
+                return
+            self.show_word_details(word_data, item)
+
+            inputs = self.right_panel.findChildren(QLineEdit)
+            if inputs:
+                from PyQt5.QtCore import QTimer
+                QTimer.singleShot(0, inputs[0].setFocus)
+
+    def _find_file_entry(self, file_path):
+        file_key = canonicalize_audio_path(file_path)
+        for group_name, group_data in self.groups.items():
+            for file_entry in group_data['files']:
+                if canonicalize_audio_path(file_entry['path']) == file_key:
+                    return group_name, file_entry
+        return None, None
+
+    def _select_group_item(self, group_name):
+        root = self.tree.invisibleRootItem()
+        for index in range(root.childCount()):
+            group_item = root.child(index)
+            if group_item and group_item.text(0) == group_name:
+                self.tree.setCurrentItem(group_item)
+                return True
+        return False
+
+    def _select_word_item(self, segment_id):
+        root = self.tree.invisibleRootItem()
+        for group_index in range(root.childCount()):
+            group_item = root.child(group_index)
+            if not group_item:
+                continue
+            for word_index in range(group_item.childCount()):
+                word_item = group_item.child(word_index)
+                if not word_item:
+                    continue
+                word_data = word_item.data(0, Qt.UserRole + 1)
+                if word_data and word_data.get('segment_id') == segment_id:
+                    self.tree.setCurrentItem(word_item)
+                    return True
+        return False
+
+    def _format_review_file_label(self, file_entry):
+        word_count = len(file_entry.get('segments', []))
+        word_label = "word" if word_count == 1 else "words"
+        mode_label = "auto-slice on" if file_entry.get('auto_slice_word', True) else "auto-slice off"
+        return f"{file_entry['original_name']} ({word_count} {word_label}, {mode_label})"
+
+    def _build_single_recording_segment(self, file_entry):
+        duration = file_entry.get('duration')
+
+        if (not duration or duration <= 0) and self.processor:
+            try:
+                _segments, duration = self.processor.detect_segments(file_entry['path'])
+                file_entry['duration'] = duration
+            except Exception:
+                duration = None
+
+        if not duration or duration <= 0:
+            existing_segments = file_entry.get('segments', [])
+            if existing_segments:
+                duration = max(int(round(segment.get('end', 0))) for segment in existing_segments)
+
+        end_ms = max(1, int(round(duration or 1)))
+        return normalize_segments(file_entry['path'], [{'start': 0, 'end': end_ms}])
+
+    def _replace_words_for_file(self, owner_group, file_entry, segments):
+        normalized_segments = normalize_segments(file_entry['path'], segments)
+        file_entry['segments'] = normalized_segments
+
+        file_key = canonicalize_audio_path(file_entry['path'])
+        owner_words = self.groups[owner_group]['words']
+        insert_at = len(owner_words)
+        for index, word in enumerate(owner_words):
+            if canonicalize_audio_path(word['file_path']) == file_key:
+                insert_at = index
+                break
+
+        for group_data in self.groups.values():
+            group_data['words'] = [
+                word for word in group_data['words']
+                if canonicalize_audio_path(word['file_path']) != file_key
+            ]
+
+        new_words = [self._create_word_entry(file_entry['path'], segment) for segment in normalized_segments]
+        self.groups[owner_group]['words'][insert_at:insert_at] = new_words
+        return normalized_segments
+
+    def _set_file_auto_slice(self, file_path, enabled):
+        owner_group, file_entry = self._find_file_entry(file_path)
+        if not owner_group or not file_entry:
+            raise ValueError("Could not find recording entry.")
+
+        file_entry['auto_slice_word'] = enabled
+
+        if enabled:
+            if not self.processor:
+                raise RuntimeError("Audio processor is not available.")
+            segments, duration = self.processor.detect_segments(file_entry['path'])
+            file_entry['duration'] = duration
+            updated_segments = normalize_segments(file_entry['path'], segments)
+        else:
+            updated_segments = self._build_single_recording_segment(file_entry)
+
+        return file_entry, self._replace_words_for_file(owner_group, file_entry, updated_segments)
+
+    def _apply_file_segment_changes(self, file_path, updated_segments):
+        owner_group, file_entry = self._find_file_entry(file_path)
+        if not owner_group or not file_entry:
+            return None, []
+
+        file_entry['segments'] = normalize_segments(file_entry['path'], file_entry.get('segments', []))
+        previous_segments = [dict(segment) for segment in file_entry['segments']]
+        merged_segments = reconcile_segment_ids(file_entry['path'], previous_segments, updated_segments)
+        file_entry['segments'] = merged_segments
+
+        previous_segment_ids = {segment['segment_id'] for segment in previous_segments}
+        previous_ids_by_index = {segment['index']: segment['segment_id'] for segment in previous_segments}
+        file_key = canonicalize_audio_path(file_entry['path'])
+        existing_words = {}
+
+        for group_data in self.groups.values():
+            for word in group_data['words']:
+                if canonicalize_audio_path(word['file_path']) != file_key:
+                    continue
+                if not word.get('segment_id'):
+                    word['segment_id'] = previous_ids_by_index.get(word.get('seg_index')) or word.get('id') or create_segment_id(file_entry['path'])
+                word['id'] = word.get('id') or word['segment_id']
+                existing_words[word['segment_id']] = word
+
+        active_segment_ids = {segment['segment_id'] for segment in merged_segments}
+
+        for segment in merged_segments:
+            existing_word = existing_words.get(segment['segment_id'])
+            if not existing_word:
+                continue
+            existing_word['start'] = segment['start']
+            existing_word['end'] = segment['end']
+            existing_word['seg_index'] = segment['index']
+            existing_word['file_path'] = file_entry['path']
+            existing_word['segment_id'] = segment['segment_id']
+            existing_word['id'] = existing_word.get('id') or segment['segment_id']
+
+        for group_data in self.groups.values():
+            group_data['words'] = [
+                word for word in group_data['words']
+                if canonicalize_audio_path(word['file_path']) != file_key
+                or word.get('segment_id') in active_segment_ids
+            ]
+
+        owner_words = self.groups[owner_group]['words']
+        insert_at = 0
+        for index, word in enumerate(owner_words):
+            if canonicalize_audio_path(word['file_path']) == file_key:
+                insert_at = index + 1
+
+        new_words = [
+            self._create_word_entry(file_entry['path'], segment)
+            for segment in merged_segments
+            if segment['segment_id'] not in existing_words and segment['segment_id'] not in previous_segment_ids
+        ]
+        if new_words:
+            owner_words[insert_at:insert_at] = new_words
+
+        return owner_group, merged_segments
+
+    def _open_recording_editor(self, file_path, selected_segment_id=None, fallback_group=None, dialog_parent=None, list_item=None):
+        self._commit_active_word_text()
+
+        if not self.processor:
+            return
+
+        owner_group, file_entry = self._find_file_entry(file_path)
+        if not owner_group or not file_entry:
+            QMessageBox.warning(self, "Missing Recording", "Could not find the source recording for this word.")
+            return
+
+        file_entry['segments'] = normalize_segments(file_entry['path'], file_entry.get('segments', []))
+        editor = FileEditorWindow(file_entry['path'], file_entry['segments'], self.processor, dialog_parent or self)
+        if selected_segment_id:
+            editor.select_segment_by_id(selected_segment_id)
+
+        if editor.exec_() != QDialog.Accepted:
+            return
+
+        owner_group, merged_segments = self._apply_file_segment_changes(file_entry['path'], editor.get_segments())
+        if list_item is not None:
+            list_item.setText(self._format_review_file_label(file_entry))
+
+        self.populate_tree()
+        if selected_segment_id and any(segment.get('segment_id') == selected_segment_id for segment in merged_segments):
+            if self._select_word_item(selected_segment_id):
+                return
+
+        if fallback_group and self._select_group_item(fallback_group):
+            return
+
+        if owner_group:
+            self._select_group_item(owner_group)
 
     def sync_from_tree(self):
         """
@@ -539,6 +1142,19 @@ class NewExperimentWizard(QWidget):
                     words.append(word_data)
                     
             new_groups[grp_name] = {"files": files, "words": words}
+
+        referenced_file_keys = {
+            canonicalize_audio_path(word['file_path'])
+            for group_data in new_groups.values()
+            for word in group_data['words']
+            if word.get('file_path')
+        }
+
+        for group_data in new_groups.values():
+            group_data['files'] = [
+                file_entry for file_entry in group_data['files']
+                if file_entry.get('path') and canonicalize_audio_path(file_entry['path']) in referenced_file_keys
+            ]
             
         self.groups = new_groups
         # Refresh right panel if needed?
@@ -553,6 +1169,7 @@ class NewExperimentWizard(QWidget):
             
         self.groups[name] = {"files": [], "words": []}
         self.populate_tree()
+        self._select_group_item(name)
 
     def delete_current_group(self, checked=False):
         item = self.tree.currentItem()
@@ -589,42 +1206,63 @@ class NewExperimentWizard(QWidget):
             item.setText(0, new_name)
 
     def on_selection_changed(self):
-        item = self.tree.currentItem()
-        if not item: 
-            self.clear_right_panel()
-            return
-        
-        role = item.data(0, Qt.UserRole)
-        
-        if role == "group":
-            self.show_group_details(item.text(0))
-        elif role == "word":
-            word_data = item.data(0, Qt.UserRole + 1)
-            self.show_word_details(word_data, item)
-            
-            # Additional focus assurance for mouse clicks
-            # Find the line edit in the new panel and focus it
-            inputs = self.right_panel.findChildren(QLineEdit)
-            if inputs:
-                from PyQt5.QtCore import QTimer
-                QTimer.singleShot(0, inputs[0].setFocus)
+        items = self.tree.selectedItems()
+        self._show_details_for_item(items[0] if items else None)
+
+    def on_tree_item_clicked(self, item, col):
+        self._show_details_for_item(item)
 
     def on_item_double_clicked(self, item, col):
         role = item.data(0, Qt.UserRole)
         if role == "group":
             self.rename_group_item(item)
         elif role == "word":
-            # Play or edit? User says double click usually plays or edits.
-            # Let's open the fine-tuning editor
             word_data = item.data(0, Qt.UserRole + 1)
-            self.edit_word_dialog(word_data, item)
+            if not word_data:
+                return
+            parent_item = item.parent()
+            fallback_group = parent_item.text(0) if parent_item else None
+            self._open_recording_editor(word_data['file_path'], word_data.get('segment_id'), fallback_group)
 
     def clear_right_panel(self):
+        self._active_word_item = None
+        self._active_word_text_input = None
+
         # Clear layout
         while self.right_layout.count():
             child = self.right_layout.takeAt(0)
             if child.widget():
                 child.widget().deleteLater()
+
+    def _update_word_in_groups(self, updated_word_data):
+        segment_id = updated_word_data.get('segment_id')
+        file_key = canonicalize_audio_path(updated_word_data.get('file_path', ''))
+
+        for group_data in self.groups.values():
+            for word in group_data['words']:
+                same_segment = segment_id and word.get('segment_id') == segment_id
+                same_file_and_index = (
+                    canonicalize_audio_path(word.get('file_path', '')) == file_key
+                    and word.get('seg_index') == updated_word_data.get('seg_index')
+                )
+                if same_segment or same_file_and_index:
+                    word['text'] = updated_word_data.get('text', '')
+                    return
+
+    def _commit_active_word_text(self):
+        if not self._active_word_item or not self._active_word_text_input:
+            return
+
+        word_data = self._active_word_item.data(0, Qt.UserRole + 1)
+        if not word_data:
+            return
+
+        text = self._active_word_text_input.text()
+        if word_data.get('text', '') != text:
+            word_data['text'] = text
+            self._active_word_item.setData(0, Qt.UserRole + 1, word_data)
+            self._active_word_item.setText(0, self._format_word_label(word_data))
+            self._update_word_in_groups(word_data)
 
     def show_group_details(self, group_name):
         self.clear_right_panel()
@@ -706,11 +1344,24 @@ class NewExperimentWizard(QWidget):
         lbl = QLabel("Word Details")
         lbl.setStyleSheet("font-size: 16px; font-weight: bold;")
         self.right_layout.addWidget(lbl)
+        self.right_layout.addWidget(QLabel(f"Source Recording: {Path(word_data['file_path']).name}"))
         
         # Actions
         btn_play = QPushButton("▶ Play Audio (Enter)")
         btn_play.clicked.connect(lambda checked: self.play_word_audio(word_data))
         self.right_layout.addWidget(btn_play)
+
+        parent_item = item.parent()
+        fallback_group = parent_item.text(0) if parent_item else None
+        btn_edit_slices = QPushButton("Review / Edit Recording Slices")
+        btn_edit_slices.clicked.connect(
+            lambda checked: self._open_recording_editor(
+                word_data['file_path'],
+                word_data.get('segment_id'),
+                fallback_group,
+            )
+        )
+        self.right_layout.addWidget(btn_edit_slices)
         
         # Text Assignment (Vertical Layout)
         self.right_layout.addWidget(QLabel("Assigned Text:"))
@@ -718,6 +1369,8 @@ class NewExperimentWizard(QWidget):
         txt_input = QLineEdit()
         txt_input.setText(word_data.get("text", ""))
         self.right_layout.addWidget(txt_input)
+        self._active_word_item = item
+        self._active_word_text_input = txt_input
         
         # Install Event Filter to capture Arrow Keys even when focused
         txt_input.installEventFilter(self)
@@ -734,16 +1387,13 @@ class NewExperimentWizard(QWidget):
             word_data["text"] = text
             # CRITICAL FIX: Update the actual data stored in the item so it syncs correctly
             item.setData(0, Qt.UserRole + 1, word_data)
+            self._update_word_in_groups(word_data)
             
             # Update tree label
-            label = f"{text if text else '[No Text]'} ({Path(word_data['file_path']).name} #{word_data['seg_index']})"
-            item.setText(0, label)
+            item.setText(0, self._format_word_label(word_data))
             
         txt_input.textChanged.connect(update_text)
-        
-        btn_fine = QPushButton("Fine-tune (Visual Editor)")
-        btn_fine.clicked.connect(lambda checked: self.edit_word_dialog(word_data, item))
-        self.right_layout.addWidget(btn_fine)
+        txt_input.editingFinished.connect(self._commit_active_word_text)
         
         # Delete Button
         btn_del = QPushButton("Delete Word")
@@ -769,97 +1419,168 @@ class NewExperimentWizard(QWidget):
         self.parent.status_msg.setText("Processing...") # type: ignore
         
         stats = []
-        for fpath in files:
-            segments, dur = self.processor.detect_segments(fpath)
-            
-            # File Entry
-            f_entry = {
-                "path": fpath, 
-                "original_name": Path(fpath).name,
-                "segments": segments,
-                "duration": dur
-            }
-            self.groups[group_name]["files"].append(f_entry)
-            
-            # Create Words
-            for seg in segments:
-                w_entry = {
-                    "id": f"{Path(fpath).stem}_{seg['index']}",
-                    "text": "",
-                    "file_path": fpath,
-                    "start": seg['start'],
-                    "end": seg['end'],
-                    "seg_index": seg['index']
+        errors = []
+        new_files = []
+        try:
+            for fpath in files:
+                try:
+                    segments, dur = self.processor.detect_segments(fpath)
+                except Exception as e:
+                    errors.append(f"{Path(fpath).name}: {str(e)}")
+                    continue
+
+                normalized_segments = normalize_segments(fpath, segments)
+                
+                # File Entry
+                f_entry = {
+                    "path": fpath, 
+                    "original_name": Path(fpath).name,
+                    "segments": normalized_segments,
+                    "duration": dur,
+                    "auto_slice_word": True,
                 }
-                self.groups[group_name]["words"].append(w_entry)
-            
-            stats.append(f"{Path(fpath).name}: {len(segments)} words")
-            
-        QApplication.restoreOverrideCursor()
-        self.parent.status_msg.setText("Ready") # type: ignore
+                self.groups[group_name]["files"].append(f_entry)
+                new_files.append(f_entry)
+                
+                # Create Words
+                for seg in normalized_segments:
+                    self.groups[group_name]["words"].append(self._create_word_entry(fpath, seg))
+                
+                stats.append(f"{Path(fpath).name}: {len(normalized_segments)} words")
+        finally:
+            QApplication.restoreOverrideCursor()
+            self.parent.status_msg.setText("Ready") # type: ignore
+
+        if not stats and errors:
+            QMessageBox.warning(self, "Upload Failed", "No files were processed successfully.\n\n" + "\n".join(errors))
+            return
+
         self.populate_tree()
+        self._select_group_item(group_name)
         
         # Prompt for immediate review
         msg = QMessageBox(self)
         msg.setWindowTitle("Upload Report")
-        msg.setText("\n".join(stats))
+        report_lines = list(stats)
+        if errors:
+            report_lines.append("")
+            report_lines.append("Failed files:")
+            report_lines.extend(errors)
+        msg.setText("\n".join(report_lines))
         btn_review = msg.addButton("Review / Edit Files", QMessageBox.ActionRole)
         btn_ok = msg.addButton("OK", QMessageBox.AcceptRole)
         msg.exec_()
         
         if msg.clickedButton() == btn_review:
-            self.review_files_in_group(group_name)
+            self.review_files_in_group(group_name, review_files=new_files)
 
-    def review_files_in_group(self, group_name):
+    def review_files_in_group(self, group_name, review_files=None):
         # Open the file list dialog
         # (Same logic as 'open_file_review_dialog' in previous version)
         dialog = QDialog(self)
         dialog.setWindowTitle(f"Review Files: {group_name}")
-        dialog.resize(500, 400)
+        dialog.resize(560, 440)
         lay = QVBoxLayout(dialog)
+
+        select_all_checkbox = QCheckBox("Select / Deselect All")
+        lay.addWidget(select_all_checkbox)
         
         file_list = QListWidget()
-        files = self.groups[group_name]["files"]
+        files = list(review_files) if review_files is not None else self.groups[group_name]["files"]
         for f in files:
-            file_list.addItem(f"{f['original_name']} ({len(f['segments'])} words)")
+            f.setdefault('auto_slice_word', True)
+
+        updating_items = {'value': False}
+
+        for f in files:
+            item = QListWidgetItem(self._format_review_file_label(f))
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsSelectable | Qt.ItemIsEnabled)
+            item.setCheckState(Qt.Checked if f.get('auto_slice_word', True) else Qt.Unchecked)
+            file_list.addItem(item)
             
-        lay.addWidget(QLabel("Double-click a file to edit segments:"))
+        lay.addWidget(QLabel("Check recordings to auto-slice them. Uncheck to keep the whole recording as one word. Double-click a file to edit its segments manually."))
         lay.addWidget(file_list)
+
+        btn_close = QPushButton("Close")
+        lay.addWidget(btn_close)
+
+        def refresh_select_all_checkbox():
+            if not files:
+                all_checked = False
+            else:
+                all_checked = all(f.get('auto_slice_word', True) for f in files)
+
+            select_all_checkbox.blockSignals(True)
+            select_all_checkbox.setChecked(all_checked)
+            select_all_checkbox.blockSignals(False)
+
+        def apply_auto_slice_to_item(item, enabled):
+            idx = file_list.row(item)
+            if idx < 0 or idx >= len(files):
+                return
+
+            file_data = files[idx]
+            if file_data.get('auto_slice_word', True) == enabled:
+                item.setText(self._format_review_file_label(file_data))
+                return
+
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            self.parent.status_msg.setText("Updating recording slices...")  # type: ignore
+            try:
+                file_data, _segments = self._set_file_auto_slice(file_data['path'], enabled)
+                item.setText(self._format_review_file_label(file_data))
+                self.populate_tree()
+                self._select_group_item(group_name)
+            except Exception as e:
+                file_data['auto_slice_word'] = not enabled
+                updating_items['value'] = True
+                item.setCheckState(Qt.Checked if file_data.get('auto_slice_word', True) else Qt.Unchecked)
+                updating_items['value'] = False
+                QMessageBox.warning(dialog, "Slice Update Failed", f"Could not update {file_data['original_name']}:\n{e}")
+            finally:
+                QApplication.restoreOverrideCursor()
+                self.parent.status_msg.setText("Ready")  # type: ignore
+                refresh_select_all_checkbox()
+
+        def on_item_changed(item):
+            if updating_items['value']:
+                return
+            apply_auto_slice_to_item(item, item.checkState() == Qt.Checked)
+
+        def on_select_all_toggled(checked):
+            target_state = Qt.Checked if checked else Qt.Unchecked
+            changed_items = []
+
+            updating_items['value'] = True
+            for i in range(file_list.count()):
+                item = file_list.item(i)
+                if item is None:
+                    continue
+                if item.checkState() != target_state:
+                    item.setCheckState(target_state)
+                    changed_items.append(item)
+            updating_items['value'] = False
+
+            for item in changed_items:
+                apply_auto_slice_to_item(item, target_state == Qt.Checked)
+
+            refresh_select_all_checkbox()
         
         def open_editor(item):
             idx = file_list.row(item)
             file_data = files[idx]
-            
-            editor = FileEditorWindow(file_data['path'], file_data['segments'], self.processor, dialog)
-            if editor.exec_() == QDialog.Accepted:
-                new_segs = editor.get_segments()
-                file_data['segments'] = new_segs
-                
-                # Re-sync words: Remove old words for this file, add new ones
-                grp_words = self.groups[group_name]["words"]
-                # Filter out old
-                self.groups[group_name]["words"] = [w for w in grp_words if w['file_path'] != file_data['path']]
-                
-                # Add new
-                for seg in new_segs:
-                    w_entry = {
-                        "id": f"{Path(file_data['path']).stem}_{seg['index']}",
-                        "text": "",
-                        "file_path": file_data['path'],
-                        "start": seg['start'],
-                        "end": seg['end'],
-                        "seg_index": seg['index']
-                    }
-                    self.groups[group_name]["words"].append(w_entry)
-                
-                item.setText(f"{file_data['original_name']} ({len(new_segs)} words)")
-                # Refresh main tree
-                self.populate_tree()
+            self._open_recording_editor(file_data['path'], fallback_group=group_name, dialog_parent=dialog, list_item=item)
 
+        file_list.itemChanged.connect(on_item_changed)
         file_list.itemDoubleClicked.connect(open_editor)
+        select_all_checkbox.toggled.connect(on_select_all_toggled)
+        btn_close.clicked.connect(dialog.accept)
+        refresh_select_all_checkbox()
         dialog.exec_()
 
     def play_word_audio(self, word_data):
+        if not self.processor:
+            return
         self.media_player.stop()
         self.media_player.setMedia(QMediaContent())
         temp = self.processor.get_temp_segment_file(
@@ -868,58 +1589,10 @@ class NewExperimentWizard(QWidget):
         if temp:
             self.media_player.setMedia(QMediaContent(QUrl.fromLocalFile(os.path.abspath(temp))))
             self.media_player.play()
-
-    def edit_word_dialog(self, word_data, item_to_update):
-        # Single word editor
-        dlg = QDialog(self)
-        dlg.setWindowTitle("Fine Tune Word")
-        lay = QVBoxLayout(dlg)
-        
-        wf = WaveformWidget()
-        seg = [{'start': word_data['start'], 'end': word_data['end'], 'index': 1}]
-        wf.load_file(word_data['file_path'], seg)
-        
-        # Zoom logic
-        dur = word_data['end'] - word_data['start']
-        padding = dur * 0.5
-        wf.zoom_level = wf.duration_ms / (dur + 2*padding) if dur > 0 else 1
-        start_view = max(0, word_data['start'] - padding)
-        wf.scroll_offset = start_view / wf.duration_ms
-        
-        lay.addWidget(wf)
-        
-        # Play button in fine tune
-        btn_play = QPushButton("Play Segment")
-        def play():
-            curr_seg = wf.segments[0]
-            self.media_player.stop()
-            self.media_player.setMedia(QMediaContent())
-            t_f = self.processor.get_temp_segment_file(word_data['file_path'], curr_seg['start'], curr_seg['end'], "fine_tune")
-            if t_f:
-                 self.media_player.setMedia(QMediaContent(QUrl.fromLocalFile(os.path.abspath(t_f))))
-                 self.media_player.play()
-        btn_play.clicked.connect(play)
-        lay.addWidget(btn_play)
-        
-        btn_save = QPushButton("Save")
-        def save():
-            new_seg = wf.segments[0]
-            word_data['start'] = new_seg['start']
-            word_data['end'] = new_seg['end']
-            
-            # Update UI label if needed
-            label = f"{word_data['text'] if word_data['text'] else '[No Text]'} ({Path(word_data['file_path']).name} #{word_data['seg_index']})"
-            item_to_update.setText(0, label)
-            
-            dlg.accept()
-        btn_save.clicked.connect(save)
-        lay.addWidget(btn_save)
-        
-        dlg.exec_()
         
     def go_next(self):
         self.sync_from_tree()
-        self.parent.show_experiment_properties(self.groups) # type: ignore
+        self.parent.show_experiment_properties(self.groups, self.loaded_properties) # type: ignore
 
 
 from PyQt5.QtWidgets import QHeaderView 
@@ -1134,7 +1807,7 @@ class ExperimentPropertiesPage(QWidget):
 
     def set_data(self, groups, loaded_properties=None):
         self.groups = groups
-        self.current_group_order = sorted(groups.keys())
+        self.current_group_order = list(groups.keys())
         
         # Calculate suggested grid size from total words
         total_words = 0
@@ -1146,10 +1819,6 @@ class ExperimentPropertiesPage(QWidget):
         self.spin_rows.setValue(side)
         self.spin_cols.setValue(side)
         
-        if loaded_properties:
-            # TODO: Handle loaded properties for re-importing
-            pass
-
         # Populate Repetition Widgets
         while self.repeat_form.count():
             child = self.repeat_form.takeAt(0)
@@ -1169,7 +1838,110 @@ class ExperimentPropertiesPage(QWidget):
             
         # Initialize Stiff List
         self.rebuild_default_blocks()
+
+        if loaded_properties:
+            self._apply_loaded_properties(loaded_properties)
+
         self.toggle_order_view()
+
+    def _normalize_loaded_block_sequence(self, raw_sequence):
+        normalized = []
+        for item in raw_sequence or []:
+            if not isinstance(item, (list, tuple)) or not item:
+                continue
+            group_name = item[0]
+            if group_name not in self.groups:
+                continue
+            try:
+                block_index = int(item[1]) if len(item) > 1 else 1
+            except Exception:
+                block_index = 1
+            normalized.append((group_name, max(1, block_index)))
+        return normalized
+
+    def _apply_loaded_properties(self, loaded_properties):
+        self.txt_exp_name.setText(str(loaded_properties.get('name', self.txt_exp_name.text())))
+
+        grid = loaded_properties.get('grid', {}) or {}
+        self.spin_rows.setValue(int(grid.get('rows', self.spin_rows.value()) or self.spin_rows.value()))
+        self.spin_cols.setValue(int(grid.get('cols', self.spin_cols.value()) or self.spin_cols.value()))
+
+        repetitions = loaded_properties.get('repetitions', {}) or {}
+        for group_name, spin in self.repeat_widgets.items():
+            try:
+                repeat_count = int(repetitions.get(group_name, spin.value()))
+            except Exception:
+                repeat_count = spin.value()
+            spin.blockSignals(True)
+            spin.setValue(max(1, repeat_count))
+            spin.blockSignals(False)
+
+        block_sequence = self._normalize_loaded_block_sequence(loaded_properties.get('active_block_sequence'))
+        if block_sequence:
+            self.active_block_sequence = block_sequence
+
+            seen_groups = []
+            for group_name, _ in block_sequence:
+                if group_name not in seen_groups:
+                    seen_groups.append(group_name)
+            self.current_group_order = seen_groups + [g for g in self.groups.keys() if g not in seen_groups]
+        else:
+            self.rebuild_default_blocks()
+
+        proceed = loaded_properties.get('proceed_condition', {}) or {}
+        proceed_type = proceed.get('type', 'key')
+        self.radio_key.setChecked(proceed_type != 'time')
+        self.radio_time.setChecked(proceed_type == 'time')
+        try:
+            self.spin_delay.setValue(int(proceed.get('delay_ms', self.spin_delay.value()) or self.spin_delay.value()))
+        except Exception:
+            pass
+
+        beeps = loaded_properties.get('beeps', {}) or {}
+        before_cfg = beeps.get('before', {}) or {}
+        after_cfg = beeps.get('after', {}) or {}
+
+        self.chk_beep_before.setChecked(bool(before_cfg.get('enabled')))
+        self.chk_beep_after.setChecked(bool(after_cfg.get('enabled')))
+        try:
+            self.spin_beep_before.setValue(int(before_cfg.get('delay_ms', self.spin_beep_before.value()) or self.spin_beep_before.value()))
+        except Exception:
+            pass
+        try:
+            self.spin_beep_after.setValue(int(after_cfg.get('delay_ms', self.spin_beep_after.value()) or self.spin_beep_after.value()))
+        except Exception:
+            pass
+
+        order = loaded_properties.get('order', 'random')
+        self.radio_stiff.setChecked(order == 'stiff')
+        self.radio_random.setChecked(order != 'stiff')
+
+        if order == 'stiff' and loaded_properties.get('sequence'):
+            self._restore_stiff_sequence(loaded_properties.get('sequence', []))
+        else:
+            self.reset_order()
+
+    def _restore_stiff_sequence(self, sequence_ids):
+        self.word_list.clear()
+
+        words_by_id = {}
+        for group_name, group_data in self.groups.items():
+            for word in group_data.get('words', []):
+                word_id = word.get('id')
+                if word_id:
+                    words_by_id[word_id] = (group_name, word)
+
+        missing_ids = []
+        for word_id in sequence_ids:
+            group_and_word = words_by_id.get(word_id)
+            if not group_and_word:
+                missing_ids.append(word_id)
+                continue
+            group_name, word = group_and_word
+            self._add_word_to_list(word, group_name)
+
+        if missing_ids:
+            self.reset_order()
 
     def rebuild_default_blocks(self):
         """Generates active_block_sequence based on current_group_order and repetition counts."""
@@ -1295,6 +2067,8 @@ class ExperimentPropertiesPage(QWidget):
             new_block_sequence = []
             for i in range(list_g.count()):
                 item = list_g.item(i)
+                if item is None:
+                    continue
                 g_name = item.data(Qt.UserRole)
                 idx = item.data(Qt.UserRole + 1)
                 new_block_sequence.append((g_name, idx))
@@ -1353,11 +2127,24 @@ class ExperimentPropertiesPage(QWidget):
                 
                 # Copy to media folder
                 shutil.copy2(src_path, media_root / new_name)
+
+                owner_group = None
+                matched_file_entry = None
+                for group_name, group_data in self.groups.items():
+                    for file_entry in group_data.get("files", []):
+                        if str(Path(file_entry["path"]).resolve()) == val_path:
+                            owner_group = group_name
+                            matched_file_entry = file_entry
+                            break
+                    if owner_group:
+                        break
                 
                 global_files_config.append({
                     "file_name": new_name,
                     "path": f"media/{new_name}",
-                    "original_name": base_name
+                    "original_name": base_name,
+                    "owner_group": owner_group,
+                    "auto_slice_word": matched_file_entry.get("auto_slice_word", True) if matched_file_entry else True,
                 })
 
             # Pass 2: Build Groups Config
@@ -1387,6 +2174,8 @@ class ExperimentPropertiesPage(QWidget):
             if self.radio_stiff.isChecked():
                 for i in range(self.word_list.count()):
                     item = self.word_list.item(i)
+                    if item is None:
+                        continue
                     word_data = item.data(Qt.UserRole)
                     if word_data and 'id' in word_data:
                         # Append ID with optional decoration if needed, 
@@ -1410,6 +2199,7 @@ class ExperimentPropertiesPage(QWidget):
 
             # 4. Final Config Structure
             config = {
+                "app_version": APP_VERSION,
                 "name": exp_name,
                 "grid": {"rows": self.spin_rows.value(), "cols": self.spin_cols.value()},
                 "order": "stiff" if self.radio_stiff.isChecked() else "random",
