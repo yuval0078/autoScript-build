@@ -1,15 +1,11 @@
 import os
-import re
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 
 import project_version
 from app_paths import app_dir, source_script_path
-
-SEMANTIC_VERSION_PATTERN = re.compile(
-    r"^\d+\.\d+\.\d+(?:[.-][0-9A-Za-z.-]+)?$"
-)
 
 
 class AppPathsAndVersionTests(unittest.TestCase):
@@ -26,12 +22,24 @@ class AppPathsAndVersionTests(unittest.TestCase):
             finally:
                 os.chdir(original_cwd)
 
-    def test_project_version_metadata_is_present(self):
-        self.assertTrue(project_version.APP_NAME)
-        self.assertRegex(project_version.APP_VERSION, SEMANTIC_VERSION_PATTERN)
+    def test_project_version_uses_calendar_versioning(self):
+        parsed_version = datetime.strptime(project_version.APP_VERSION, "%Y.%m.%d")
+
+        self.assertEqual(
+            parsed_version.strftime("%Y.%m.%d"),
+            project_version.APP_VERSION,
+        )
         self.assertEqual(
             project_version.APP_VERSION_LABEL,
             f"Version {project_version.APP_VERSION}",
+        )
+        self.assertEqual(
+            project_version.RELEASE_TAG,
+            f"v{project_version.APP_VERSION}",
+        )
+        self.assertEqual(
+            project_version.PORTABLE_ARCHIVE_NAME,
+            f"TouchpadExperiment-{project_version.RELEASE_TAG}-portable.zip",
         )
 
 
