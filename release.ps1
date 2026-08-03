@@ -17,6 +17,16 @@ try {
     $releaseTag = $releaseInfoLines[1].Trim()
     $archiveName = $releaseInfoLines[2].Trim()
 
+    if ($appVersion -notmatch '^\d+\.\d+\.\d+$') {
+        throw "APP_VERSION must use semantic versioning (major.minor.patch)."
+    }
+    if ($releaseTag -ne "v$appVersion") {
+        throw "RELEASE_TAG does not match APP_VERSION."
+    }
+    if ($archiveName -ne "TouchpadExperiment-$releaseTag-portable.zip") {
+        throw "PORTABLE_ARCHIVE_NAME does not match RELEASE_TAG."
+    }
+
     if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
         throw "Git is not installed or not available in PATH."
     }
