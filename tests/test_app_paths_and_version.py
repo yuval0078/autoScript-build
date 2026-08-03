@@ -1,10 +1,15 @@
 import os
+import re
 import tempfile
 import unittest
 from pathlib import Path
 
 import project_version
 from app_paths import app_dir, source_script_path
+
+SEMANTIC_VERSION_PATTERN = re.compile(
+    r"^\d+\.\d+\.\d+(?:[.-][0-9A-Za-z.-]+)?$"
+)
 
 
 class AppPathsAndVersionTests(unittest.TestCase):
@@ -23,7 +28,7 @@ class AppPathsAndVersionTests(unittest.TestCase):
 
     def test_project_version_metadata_is_present(self):
         self.assertTrue(project_version.APP_NAME)
-        self.assertTrue(project_version.APP_VERSION)
+        self.assertRegex(project_version.APP_VERSION, SEMANTIC_VERSION_PATTERN)
         self.assertEqual(
             project_version.APP_VERSION_LABEL,
             f"Version {project_version.APP_VERSION}",
