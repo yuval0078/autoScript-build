@@ -1,30 +1,30 @@
 # Versioning and releases
 
-AutoScript uses **Calendar Versioning** in `YYYY.MM.DD` format. The current baseline is `2026.01.25`, normalized from the latest legacy portable archive, `TouchpadExperiment_Portable_20260125.zip`.
+AutoScript uses **Semantic Versioning** in `MAJOR.MINOR.PATCH` format. The current application version is `1.0.3`, matching the version displayed by the latest portable build.
 
 ## Single source of truth
 
 Change the version only in `project_version.py`:
 
 ```python
-APP_VERSION = "2026.01.25"
+APP_VERSION = "1.0.3"
 ```
 
 The following values are derived automatically:
 
-- application label: `Version 2026.01.25`
-- Git tag: `v2026.01.25`
-- release archive: `TouchpadExperiment-v2026.01.25-portable.zip`
+- application label: `Version 1.0.3`
+- Git tag: `v1.0.3`
+- release archive: `TouchpadExperiment-v1.0.3-portable.zip`
 
 Do not duplicate or manually edit these derived values elsewhere.
 
 ## Choosing the next version
 
-Use the date on which the release is prepared:
+Increment:
 
-- first release on August 3, 2026: `2026.08.03`
-- another release on a later date: use that later date
-- more than one release on the same date: append a revision suffix only after deliberately extending the versioning scheme; the current scripts require one release per date
+- **PATCH** for bug fixes that do not intentionally change existing behavior, for example `1.0.3` to `1.0.4`;
+- **MINOR** for backward-compatible features, for example `1.0.3` to `1.1.0`;
+- **MAJOR** for incompatible changes to workflows or data formats, for example `1.0.3` to `2.0.0`.
 
 ## Preparing a release
 
@@ -39,20 +39,21 @@ Use the date on which the release is prepared:
 
 The release script:
 
-1. verifies that the current branch is `main` and the working tree is clean;
-2. runs the focused unit tests;
-3. builds the versioned portable archive;
-4. creates the annotated Git tag only after tests and the build succeed;
-5. refuses to move an existing release tag to another commit.
+1. verifies that the version, tag, and archive name agree;
+2. verifies that the current branch is `main` and the working tree is clean;
+3. runs the focused unit tests;
+4. builds the versioned portable archive;
+5. creates the annotated Git tag only after tests and the build succeed;
+6. refuses to move an existing release tag to another commit.
 
 After it succeeds, push the branch and tag:
 
 ```powershell
 git push origin main
-git push origin v2026.01.25
+git push origin v1.0.3
 ```
 
-Then create a GitHub Release for the same tag and attach the generated portable ZIP.
+Then create a GitHub Release for the same tag and attach `TouchpadExperiment-v1.0.3-portable.zip`.
 
 ## Repository policy
 
