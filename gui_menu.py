@@ -8,7 +8,7 @@ import math
 import time
 import stat
 from pathlib import Path
-from app_paths import ensure_dir, user_data_dir, asset_path
+from app_paths import ensure_dir, user_data_dir, asset_path, source_script_path
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton, 
                              QLabel, QFileDialog, QMessageBox, QApplication,
                              QDialog, QListWidget, QToolButton, QMenu)
@@ -217,7 +217,11 @@ class MainMenu(QWidget):
                 else:
                     QMessageBox.critical(self, "Error", f"ExperimentRunner.exe not found at {experiment_exe}")
             else:
-                command = [sys.executable, "tablet_experiment.py"]
+                runner_script = source_script_path("tablet_experiment.py")
+                if not runner_script.exists():
+                    QMessageBox.critical(self, "Error", f"tablet_experiment.py not found at {runner_script}")
+                    return
+                command = [sys.executable, str(runner_script)]
                 if test_mode:
                     command.append("--test-mode")
                 command.extend(str(path) for path in config_files)
@@ -299,11 +303,11 @@ class MainMenu(QWidget):
                     QMessageBox.critical(self, "Error", f"Analyzer.exe not found at {analyzer_exe}")
             else:
                 # Running as script - launch as subprocess
-                script_path = Path("analyzer_refactored.py")
+                script_path = source_script_path("analyzer_refactored.py")
                 if script_path.exists():
                     subprocess.Popen([sys.executable, str(script_path)])
                 else:
-                    QMessageBox.critical(self, "Error", "analyzer_refactored.py not found!")
+                    QMessageBox.critical(self, "Error", f"analyzer_refactored.py not found at {script_path}")
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to launch analyzer: {e}")
 
