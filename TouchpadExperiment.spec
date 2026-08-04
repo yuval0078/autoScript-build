@@ -33,6 +33,7 @@ common_sources = [
     ('tablet_experiment.py', '.'),
     ('audio_processor.py', '.'),
     ('app_paths.py', '.'),
+    ('archive_utils.py', '.'),
     ('project_version.py', '.'),
     ('qt_bootstrap.py', '.'),
     ('gui_menu.py', '.'),

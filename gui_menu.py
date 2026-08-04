@@ -9,6 +9,7 @@ import time
 import stat
 from pathlib import Path
 from app_paths import ensure_dir, user_data_dir, asset_path, source_script_path
+from archive_utils import safe_extract_zip
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton, 
                              QLabel, QFileDialog, QMessageBox, QApplication,
                              QDialog, QListWidget, QToolButton, QMenu)
@@ -178,7 +179,7 @@ class MainMenu(QWidget):
                     extract_dir = ensure_dir(work_dir / f"{index + 1:02d}_{safe_name}")
                 
                 with zipfile.ZipFile(file_path, 'r') as zip_ref:
-                    zip_ref.extractall(extract_dir)
+                    safe_extract_zip(zip_ref, extract_dir)
                     
                 json_files = list(extract_dir.glob("*.json"))
                 if not json_files:

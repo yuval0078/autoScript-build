@@ -14,6 +14,7 @@ import logging
 from pathlib import Path
 
 from app_paths import asset_path, ensure_dir, user_data_dir
+from archive_utils import unique_temp_path
 
 
 class AudioProcessor:
@@ -198,7 +199,7 @@ class AudioProcessor:
             temp_dir = ensure_dir(self.data_dir / 'temp')
 
             # Ensure we have a WAV to work with
-            temp_full_wav = str(temp_dir / f"temp_full_source_{context}.wav")
+            temp_full_wav = str(unique_temp_path(temp_dir, prefix=f"full_source_{context}_"))
             self.convert_to_wav(input_file, temp_full_wav)
             
             sound = AudioSegment.from_wav(temp_full_wav)
@@ -210,7 +211,7 @@ class AudioProcessor:
             segment = sound[start_ms:end_ms]
             
             # Export to context-specific temp file for playback
-            temp_playback = str(temp_dir / f"temp_playback_{context}.wav")
+            temp_playback = str(unique_temp_path(temp_dir, prefix=f"playback_{context}_"))
             segment.export(temp_playback, format="wav")
             
             # Cleanup full temp
@@ -241,7 +242,7 @@ class AudioProcessor:
         temp_dir = ensure_dir(self.data_dir / 'temp')
         
         # Convert to temp wav if needed (pydub works best with wav)
-        temp_wav = str(temp_dir / f"temp_analysis_{Path(input_file).stem}.wav")
+        temp_wav = str(unique_temp_path(temp_dir, prefix=f"analysis_{Path(input_file).stem}_"))
         self.convert_to_wav(input_file, temp_wav)
         
         try:
@@ -379,7 +380,7 @@ class AudioProcessor:
         temp_dir = ensure_dir(self.data_dir / 'temp')
         
         # Convert to WAV first (pydub works best with wav)
-        temp_wav = str(temp_dir / "temp_audio.wav")
+        temp_wav = str(unique_temp_path(temp_dir, prefix=f"slice_{Path(input_file).stem}_"))
         self.convert_to_wav(input_file, temp_wav)
         
         try:
