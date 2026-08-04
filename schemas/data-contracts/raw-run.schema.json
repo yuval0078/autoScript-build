@@ -1,0 +1,149 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autoscript.local/schemas/data-contracts/raw-run.schema.json",
+  "title": "Runner result JSON as currently emitted",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "app_version",
+    "experiment_name",
+    "experiment_id",
+    "experiment_version",
+    "session_experiment_index",
+    "session_experiment_count",
+    "participant_number",
+    "participant_age",
+    "participant_gender",
+    "session_id",
+    "timestamp",
+    "calibration",
+    "config",
+    "words"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1.0"
+    },
+    "app_version": {
+      "type": "string",
+      "minLength": 1
+    },
+    "experiment_name": {
+      "type": "string",
+      "minLength": 1
+    },
+    "experiment_id": {
+      "type": [
+        "string",
+        "integer"
+      ]
+    },
+    "experiment_version": {
+      "type": [
+        "integer",
+        "string"
+      ]
+    },
+    "session_experiment_index": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "session_experiment_count": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "participant_number": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "participant_age": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "participant_gender": {
+      "type": "string",
+      "enum": [
+        "Male",
+        "Female",
+        "Other",
+        "Prefer not to say"
+      ]
+    },
+    "session_id": {
+      "type": "string",
+      "pattern": "^[0-9]+_\\d{8}_\\d{6}_[0-9a-f]{6}$"
+    },
+    "timestamp": {
+      "$ref": "common.schema.json#/$defs/localTimestamp"
+    },
+    "calibration": {
+      "$ref": "common.schema.json#/$defs/calibration"
+    },
+    "config": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "words": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/wordRecord"
+      }
+    }
+  },
+  "$defs": {
+    "wordRecord": {
+      "type": "object",
+      "required": [
+        "word",
+        "cell",
+        "group",
+        "start_time",
+        "end_time",
+        "audio_start_time",
+        "audio_end_time",
+        "pen_events"
+      ],
+      "properties": {
+        "word": {
+          "type": "string"
+        },
+        "cell": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "group": {
+          "type": "string"
+        },
+        "start_time": {
+          "type": "number"
+        },
+        "end_time": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "audio_start_time": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "audio_end_time": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "pen_events": {
+          "type": "array",
+          "items": {
+            "$ref": "common.schema.json#/$defs/penEvent"
+          }
+        }
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}
