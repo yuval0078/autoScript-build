@@ -35,13 +35,15 @@
     "experiment_id": {
       "type": [
         "string",
-        "integer"
+        "integer",
+        "null"
       ]
     },
     "experiment_version": {
       "type": [
         "integer",
-        "string"
+        "string",
+        "null"
       ]
     },
     "session_experiment_index": {
