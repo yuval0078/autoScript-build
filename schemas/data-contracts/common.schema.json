@@ -1,81 +1,94 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://autoscript.local/schemas/data-contracts/common.schema.json",
-  "title": "AutoScript common data-contract definitions",
+  "title": "AutoScript definitions for currently emitted files",
   "$defs": {
-    "uuid": {
+    "localTimestamp": {
       "type": "string",
-      "format": "uuid",
-      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+      "pattern": "^\\d{8}_\\d{6}$",
+      "description": "Local timestamp emitted with datetime.now().strftime('%Y%m%d_%H%M%S')."
     },
-    "timestamp": {
-      "type": "string",
-      "format": "date-time",
-      "pattern": "Z$"
+    "coordinatePair": {
+      "type": "array",
+      "prefixItems": [
+        {
+          "type": "number"
+        },
+        {
+          "type": "number"
+        }
+      ],
+      "minItems": 2,
+      "maxItems": 2
     },
-    "sha256": {
-      "type": "string",
-      "pattern": "^[0-9a-f]{64}$"
-    },
-    "participantCode": {
-      "type": "string",
-      "minLength": 1,
-      "maxLength": 128
-    },
-    "cell": {
+    "calibration": {
       "type": "object",
-      "required": ["index", "row", "column"],
+      "required": [
+        "corners"
+      ],
       "properties": {
-        "index": {"type": "integer", "minimum": 0},
-        "row": {"type": "integer", "minimum": 0},
-        "column": {"type": "integer", "minimum": 0}
+        "corners": {
+          "type": "array",
+          "prefixItems": [
+            {
+              "$ref": "#/$defs/coordinatePair"
+            },
+            {
+              "$ref": "#/$defs/coordinatePair"
+            },
+            {
+              "$ref": "#/$defs/coordinatePair"
+            },
+            {
+              "$ref": "#/$defs/coordinatePair"
+            }
+          ],
+          "minItems": 4,
+          "maxItems": 4
+        }
       },
       "additionalProperties": true
     },
     "penEvent": {
       "type": "object",
-      "required": ["event_id", "type", "x", "y", "pressure"],
+      "required": [
+        "type",
+        "x",
+        "y",
+        "pressure",
+        "timestamp",
+        "absolute_time",
+        "speed"
+      ],
       "properties": {
-        "event_id": {"type": "integer", "minimum": 0},
-        "type": {"type": "string", "enum": ["press", "move", "release"]},
-        "x": {"type": "number"},
-        "y": {"type": "number"},
-        "pressure": {"type": "number", "minimum": 0},
-        "timestamp": {"type": ["number", "null"]},
-        "absolute_time": {"type": ["number", "null"]},
-        "speed": {"type": ["number", "null"], "minimum": 0},
-        "direction": {"type": ["number", "null"]},
-        "tilt_x": {"type": ["number", "null"]},
-        "tilt_y": {"type": ["number", "null"]}
-      },
-      "additionalProperties": true
-    },
-    "calibration": {
-      "oneOf": [
-        {"type": "object", "additionalProperties": true},
-        {"type": "array", "items": {}},
-        {"type": "null"}
-      ]
-    },
-    "participant": {
-      "type": "object",
-      "required": ["code"],
-      "properties": {
-        "code": {"$ref": "#/$defs/participantCode"},
-        "age": {"type": ["integer", "number", "string", "null"]},
-        "gender": {"type": ["string", "null"]}
-      },
-      "additionalProperties": true
-    },
-    "artifactReference": {
-      "type": "object",
-      "required": ["filename", "media_type", "size_bytes", "sha256"],
-      "properties": {
-        "artifact_id": {"$ref": "#/$defs/uuid"},
-        "filename": {"type": "string", "minLength": 1},
-        "media_type": {"type": "string", "minLength": 1},
-        "size_bytes": {"type": "integer", "minimum": 0},
-        "sha256": {"$ref": "#/$defs/sha256"}
+        "type": {
+          "type": "string",
+          "enum": [
+            "press",
+            "move",
+            "release"
+          ]
+        },
+        "x": {
+          "type": "number"
+        },
+        "y": {
+          "type": "number"
+        },
+        "pressure": {
+          "type": "number",
+          "minimum": 0
+        },
+        "timestamp": {
+          "type": "number"
+        },
+        "absolute_time": {
+          "type": "number"
+        },
+        "speed": {
+          "type": "number",
+          "minimum": 0
+        }
       },
       "additionalProperties": true
     }
