@@ -68,7 +68,8 @@ Current details:
 
 - `schema_version` is the string `"1.0"`.
 - `experiment_id` falls back to the experiment name when the loaded configuration does not provide one.
-- `experiment_version` falls back to `1`.
+- In the manifest compatibility path, `experiment_id` and `experiment_version` can be `null` when the manifest omits them.
+- `experiment_version` otherwise falls back to `1`.
 - `timestamp` uses local time in `YYYYMMDD_HHMMSS` form, not ISO 8601.
 - `session_id` is `<participant>_<timestamp>_<six hex characters>`.
 - `calibration` is `{"corners": [[x, y], ...]}` with four corner pairs.
@@ -175,6 +176,17 @@ These are **database fields**, not claims about the current JSON output. A later
 | Trainable JSON | participant number and timestamp | No source run ID and no original-word identity |
 | CSV | participant, experiment step, word, cell | No immutable run/export ID |
 
+## Server-side versioning rules for the current files
+
+These rules operate around the current files; they do not alter their internal structure.
+
+1. **Exact ZIP bytes define an experiment-version artifact.** On upload, the server calculates SHA-256 and stores the ZIP unchanged.
+2. **Logical experiment identity is server metadata.** A user selects whether an uploaded ZIP starts a new experiment or becomes a new version of an existing experiment; the server must not infer this solely from `name`.
+3. **Published versions are immutable.** Editing an experiment means uploading a new ZIP and creating a new server-side version record. An existing version record is never repointed to different bytes.
+4. **A run is linked to the selected server version before or during upload.** The raw file's `experiment_id` and `experiment_version` remain preserved as source metadata, but the database relationship is authoritative.
+5. **Raw results are immutable artifacts.** Repeated upload of the same `session_id` is accepted only when the checksum is identical; a different checksum is treated as a conflict requiring review.
+6. **Analyzer outputs are derived artifacts.** A new CSV or trainable JSON export creates a new artifact record linked to its source raw result; it does not overwrite the source data.
+
 ## Stage 1 boundary
 
 Stage 1 is complete when:
@@ -182,6 +194,7 @@ Stage 1 is complete when:
 1. the four actual outputs are documented;
 2. the three JSON outputs have schemas matching current emitted structure;
 3. current omissions and unstable fields are explicit;
-4. future database IDs are kept separate from the current file contracts.
+4. future database IDs are kept separate from the current file contracts;
+5. immutability and versioning are defined around the current artifacts.
 
 No desktop serialization code is changed in this stage.
