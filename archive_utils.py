@@ -93,6 +93,7 @@ def unique_temp_path(
     directory_path = Path(directory)
     directory_path.mkdir(parents=True, exist_ok=True)
     safe_prefix = re.sub(r"[^0-9A-Za-z._-]+", "_", prefix) or "autoscript_"
+    safe_prefix = safe_prefix[:80]
 
     handle = tempfile.NamedTemporaryFile(
         mode="wb",
