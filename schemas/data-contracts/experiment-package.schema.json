@@ -1,158 +1,238 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://autoscript.local/schemas/data-contracts/experiment-package.schema.json",
-  "title": "AutoScript experiment package manifest",
+  "title": "Builder experiment JSON as currently emitted inside the ZIP",
   "type": "object",
   "required": [
-    "schema_name",
-    "schema_version",
-    "created_at",
     "app_version",
-    "experiment_id",
-    "experiment_version_id",
-    "version_number",
     "name",
     "grid",
     "order",
+    "sequence",
+    "repetitions",
+    "active_block_sequence",
+    "proceed_condition",
+    "beeps",
     "files",
     "groups"
   ],
   "properties": {
-    "schema_name": {"const": "autoscript.experiment-package"},
-    "schema_version": {"const": "1.0.0"},
-    "created_at": {"$ref": "common.schema.json#/$defs/timestamp"},
-    "app_version": {"type": "string", "minLength": 1},
-    "experiment_id": {"$ref": "common.schema.json#/$defs/uuid"},
-    "experiment_version_id": {"$ref": "common.schema.json#/$defs/uuid"},
-    "version_number": {"type": "integer", "minimum": 1},
-    "name": {"type": "string", "minLength": 1},
-    "description": {"type": ["string", "null"]},
+    "app_version": {
+      "type": "string",
+      "minLength": 1
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1
+    },
     "grid": {
       "type": "object",
-      "required": ["rows", "cols"],
+      "required": [
+        "rows",
+        "cols"
+      ],
       "properties": {
-        "rows": {"type": "integer", "minimum": 1},
-        "cols": {"type": "integer", "minimum": 1}
+        "rows": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "cols": {
+          "type": "integer",
+          "minimum": 1
+        }
       },
       "additionalProperties": true
     },
-    "order": {"type": "string", "enum": ["stiff", "random"]},
+    "order": {
+      "type": "string",
+      "enum": [
+        "stiff",
+        "random"
+      ]
+    },
     "sequence": {
       "type": "array",
-      "items": {"$ref": "common.schema.json#/$defs/uuid"}
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
     },
     "repetitions": {
       "type": "object",
-      "additionalProperties": {"type": "integer", "minimum": 1}
+      "additionalProperties": {
+        "type": "integer",
+        "minimum": 1
+      }
     },
     "active_block_sequence": {
       "type": "array",
       "items": {
-        "type": "object",
-        "required": ["group_id", "repetition_index"],
-        "properties": {
-          "group_id": {"$ref": "common.schema.json#/$defs/uuid"},
-          "repetition_index": {"type": "integer", "minimum": 1}
-        },
-        "additionalProperties": true
+        "type": "array",
+        "prefixItems": [
+          {
+            "type": "string",
+            "minLength": 1
+          },
+          {
+            "type": "integer",
+            "minimum": 1
+          }
+        ],
+        "minItems": 2,
+        "maxItems": 2
       }
     },
     "proceed_condition": {
       "type": "object",
-      "required": ["type", "delay_ms"],
+      "required": [
+        "type",
+        "delay_ms"
+      ],
       "properties": {
-        "type": {"type": "string", "enum": ["key", "time"]},
-        "key": {"type": ["string", "null"]},
-        "delay_ms": {"type": "integer", "minimum": 0}
+        "type": {
+          "type": "string",
+          "enum": [
+            "key",
+            "time"
+          ]
+        },
+        "delay_ms": {
+          "type": "integer",
+          "minimum": 0
+        }
       },
       "additionalProperties": true
     },
     "beeps": {
       "type": "object",
-      "required": ["before", "after"],
+      "required": [
+        "before",
+        "after"
+      ],
       "properties": {
-        "before": {"$ref": "#/$defs/beep"},
-        "after": {"$ref": "#/$defs/beep"}
+        "before": {
+          "$ref": "#/$defs/beep"
+        },
+        "after": {
+          "$ref": "#/$defs/beep"
+        }
       },
       "additionalProperties": true
     },
     "files": {
       "type": "array",
-      "items": {"$ref": "#/$defs/mediaFile"}
+      "items": {
+        "$ref": "#/$defs/mediaFile"
+      }
     },
     "groups": {
       "type": "array",
-      "minItems": 1,
-      "items": {"$ref": "#/$defs/group"}
+      "items": {
+        "$ref": "#/$defs/group"
+      }
     }
   },
   "$defs": {
     "beep": {
       "type": "object",
-      "required": ["enabled", "delay_ms"],
+      "required": [
+        "enabled",
+        "delay_ms"
+      ],
       "properties": {
-        "enabled": {"type": "boolean"},
-        "delay_ms": {"type": "integer", "minimum": 0}
+        "enabled": {
+          "type": "boolean"
+        },
+        "delay_ms": {
+          "type": "integer",
+          "minimum": 0
+        }
       },
       "additionalProperties": true
     },
     "mediaFile": {
       "type": "object",
       "required": [
-        "file_id",
         "file_name",
         "path",
         "original_name",
-        "media_type",
-        "size_bytes",
-        "sha256"
+        "owner_group",
+        "auto_slice_word"
       ],
       "properties": {
-        "file_id": {"$ref": "common.schema.json#/$defs/uuid"},
-        "file_name": {"type": "string", "minLength": 1},
-        "path": {"type": "string", "pattern": "^media/[^/]+$"},
-        "original_name": {"type": "string", "minLength": 1},
-        "owner_group_id": {
-          "oneOf": [
-            {"$ref": "common.schema.json#/$defs/uuid"},
-            {"type": "null"}
+        "file_name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "path": {
+          "type": "string",
+          "pattern": "^media/[^/]+$"
+        },
+        "original_name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "owner_group": {
+          "type": [
+            "string",
+            "null"
           ]
         },
-        "auto_slice_word": {"type": "boolean"},
-        "media_type": {"type": "string", "minLength": 1},
-        "size_bytes": {"type": "integer", "minimum": 0},
-        "sha256": {"$ref": "common.schema.json#/$defs/sha256"}
+        "auto_slice_word": {
+          "type": "boolean"
+        }
       },
       "additionalProperties": true
     },
     "group": {
       "type": "object",
-      "required": ["group_id", "name", "words"],
+      "required": [
+        "name",
+        "words"
+      ],
       "properties": {
-        "group_id": {"$ref": "common.schema.json#/$defs/uuid"},
-        "name": {"type": "string", "minLength": 1},
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
         "words": {
           "type": "array",
-          "items": {"$ref": "#/$defs/prompt"}
+          "items": {
+            "$ref": "#/$defs/word"
+          }
         }
       },
       "additionalProperties": true
     },
-    "prompt": {
+    "word": {
       "type": "object",
       "required": [
-        "prompt_id",
+        "id",
         "text",
-        "source_file_id",
+        "source_file",
         "start_ms",
         "end_ms"
       ],
       "properties": {
-        "prompt_id": {"$ref": "common.schema.json#/$defs/uuid"},
-        "text": {"type": "string"},
-        "source_file_id": {"$ref": "common.schema.json#/$defs/uuid"},
-        "start_ms": {"type": "integer", "minimum": 0},
-        "end_ms": {"type": "integer", "minimum": 1}
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "text": {
+          "type": "string"
+        },
+        "source_file": {
+          "type": "string",
+          "minLength": 1
+        },
+        "start_ms": {
+          "type": "number",
+          "minimum": 0
+        },
+        "end_ms": {
+          "type": "number",
+          "minimum": 0
+        }
       },
       "additionalProperties": true
     }
