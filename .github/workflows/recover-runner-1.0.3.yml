@@ -1,0 +1,67 @@
+name: Apply runner 1.0.3 recovery
+
+on:
+  push:
+    branches:
+      - agent/fix-launch-paths-and-version
+    paths:
+      - .github/workflows/recover-runner-1.0.3.yml
+
+permissions:
+  contents: write
+
+jobs:
+  recover-runner:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out recovery branch
+        uses: actions/checkout@v4
+        with:
+          ref: agent/fix-launch-paths-and-version
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Decode and apply recovered runner patch
+        shell: pwsh
+        run: |
+          $encoded = ((Get-ChildItem .recovery/runner_patch.part* | Sort-Object Name | ForEach-Object {
+            Get-Content $_.FullName -Raw
+          }) -join '')
+          $compressed = [Convert]::FromBase64String($encoded.Trim())
+          $inputStream = [IO.MemoryStream]::new($compressed)
+          $gzipStream = [IO.Compression.GzipStream]::new(
+            $inputStream,
+            [IO.Compression.CompressionMode]::Decompress
+          )
+          $outputStream = [IO.File]::Create("runner-recovery.patch")
+          $gzipStream.CopyTo($outputStream)
+          $outputStream.Dispose()
+          $gzipStream.Dispose()
+          $inputStream.Dispose()
+
+          git apply --check runner-recovery.patch
+          git apply runner-recovery.patch
+
+      - name: Validate recovered source
+        shell: pwsh
+        run: |
+          python -m py_compile tablet_experiment.py gui_menu.py audio_processor.py
+          python -m unittest discover -s tests -v
+
+      - name: Commit recovered runner fixes
+        shell: pwsh
+        run: |
+          Remove-Item runner-recovery.patch -Force
+          Remove-Item .recovery -Recurse -Force
+          Remove-Item .github/workflows/recover-runner-1.0.3.yml -Force
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Recover runner audio and multi-experiment fixes"
+          git push origin HEAD:agent/fix-launch-paths-and-version
