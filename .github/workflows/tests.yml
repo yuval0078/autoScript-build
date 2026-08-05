@@ -34,104 +34,104 @@ jobs:
       - name: Ensure LFS archive is downloaded
         run: git lfs pull
 
-      - name: Extract recoverable source files
+      - name: Extract and compare recoverable source files
         shell: bash
         run: |
           python - <<'PY'
           from __future__ import annotations
 
+          import difflib
           import hashlib
           import json
           import shutil
           import zipfile
-          from pathlib import Path
+          from pathlib import Path, PurePosixPath
 
           repo = Path.cwd()
           archive = repo / "portable build" / "TouchpadExperiment_Portable_20260125.zip"
           output = repo / "recovery_output"
-          extracted = output / "extracted"
-          source_out = output / "source"
-          output.mkdir(exist_ok=True)
-          source_out.mkdir(exist_ok=True)
+          recovered_out = output / "recovered_source"
+          current_out = output / "current_source"
+          diff_out = output / "diffs"
+          for directory in (recovered_out, current_out, diff_out):
+              directory.mkdir(parents=True, exist_ok=True)
 
           if not archive.is_file():
               raise SystemExit(f"Archive not found: {archive}")
-
-          header = archive.read_bytes()[:80]
-          if header.startswith(b"version https://git-lfs.github.com/spec"):
+          if archive.read_bytes()[:80].startswith(b"version https://git-lfs.github.com/spec"):
               raise SystemExit("The ZIP is still an LFS pointer; git lfs pull did not download it")
 
+          def sha256_bytes(data: bytes) -> str:
+              return hashlib.sha256(data).hexdigest()
+
+          recovered = {}
           with zipfile.ZipFile(archive) as zf:
-              zf.extractall(extracted)
+              for entry in zf.infolist():
+                  normalized = entry.filename.replace("\\", "/")
+                  marker = "TouchpadExperiment/_internal/"
+                  if marker not in normalized or not normalized.endswith(".py"):
+                      continue
+                  relative = normalized.split(marker, 1)[1]
+                  if "/" in relative:
+                      continue
+                  name = PurePosixPath(relative).name
+                  data = zf.read(entry)
+                  recovered[name] = data
+                  (recovered_out / name).write_bytes(data)
 
-          def sha256(path: Path) -> str:
-              digest = hashlib.sha256()
-              with path.open("rb") as handle:
-                  for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                      digest.update(chunk)
-              return digest.hexdigest()
-
-          recovered = []
-          for path in sorted(extracted.rglob("*.py")):
-              if path.parent.name != "_internal":
-                  continue
-              destination = source_out / path.name
-              shutil.copy2(path, destination)
-
-              root_file = repo / path.name
-              record = {
-                  "name": path.name,
-                  "archive_path": str(path.relative_to(extracted)),
-                  "size": path.stat().st_size,
-                  "sha256": sha256(path),
-                  "root_exists": root_file.is_file(),
-                  "matches_root": root_file.is_file() and path.read_bytes() == root_file.read_bytes(),
-              }
+          summary = []
+          for name, recovered_bytes in sorted(recovered.items()):
+              root_file = repo / name
+              current_bytes = root_file.read_bytes() if root_file.is_file() else b""
               if root_file.is_file():
-                  record["root_sha256"] = sha256(root_file)
-                  record["root_size"] = root_file.stat().st_size
-              recovered.append(record)
+                  shutil.copy2(root_file, current_out / name)
 
-          inventory = []
-          for path in sorted(extracted.rglob("*")):
-              if path.is_file():
-                  inventory.append({
-                      "path": str(path.relative_to(extracted)),
-                      "size": path.stat().st_size,
-                  })
+              recovered_text = recovered_bytes.decode("utf-8", errors="replace").splitlines(keepends=True)
+              current_text = current_bytes.decode("utf-8", errors="replace").splitlines(keepends=True)
+              patch = "".join(difflib.unified_diff(
+                  current_text,
+                  recovered_text,
+                  fromfile=f"current/{name}",
+                  tofile=f"portable/{name}",
+              ))
+              (diff_out / f"{name}.diff").write_text(patch, encoding="utf-8")
 
-          (output / "recovered-files.json").write_text(
-              json.dumps(recovered, indent=2, ensure_ascii=False),
+              additions = sum(1 for line in patch.splitlines() if line.startswith("+") and not line.startswith("+++"))
+              deletions = sum(1 for line in patch.splitlines() if line.startswith("-") and not line.startswith("---"))
+              summary.append({
+                  "name": name,
+                  "recovered_size": len(recovered_bytes),
+                  "current_size": len(current_bytes),
+                  "recovered_sha256": sha256_bytes(recovered_bytes),
+                  "current_sha256": sha256_bytes(current_bytes) if current_bytes else None,
+                  "matches_current": recovered_bytes == current_bytes,
+                  "diff_additions_portable": additions,
+                  "diff_deletions_portable": deletions,
+              })
+
+          (output / "comparison.json").write_text(
+              json.dumps(summary, indent=2, ensure_ascii=False),
               encoding="utf-8",
           )
-          (output / "archive-inventory.json").write_text(
-              json.dumps(inventory, indent=2, ensure_ascii=False),
-              encoding="utf-8",
-          )
-
-          report_lines = [
-              f"Archive: {archive}",
+          report = [
               f"Archive size: {archive.stat().st_size}",
-              f"Recovered top-level _internal Python files: {len(recovered)}",
+              f"Recovered source files: {len(summary)}",
               "",
           ]
-          for item in recovered:
-              report_lines.append(
-                  f"{item['name']}: size={item['size']} matches_root={item['matches_root']} "
-                  f"sha256={item['sha256']}"
+          for item in summary:
+              report.append(
+                  f"{item['name']}: matches_current={item['matches_current']} "
+                  f"portable_additions={item['diff_additions_portable']} "
+                  f"portable_deletions={item['diff_deletions_portable']}"
               )
-          (output / "recovery-report.txt").write_text(
-              "\n".join(report_lines) + "\n",
-              encoding="utf-8",
-          )
-
-          print("\n".join(report_lines))
+          (output / "comparison-report.txt").write_text("\n".join(report) + "\n", encoding="utf-8")
+          print("\n".join(report))
           PY
 
-      - name: Upload recovery material
+      - name: Upload compact recovery comparison
         uses: actions/upload-artifact@v4
         with:
-          name: portable-1.0.3-recovery
+          name: portable-1.0.3-comparison
           path: recovery_output
           if-no-files-found: error
           retention-days: 7
