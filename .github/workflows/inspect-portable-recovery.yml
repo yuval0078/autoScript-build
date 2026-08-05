@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - recovery/inspect-portable-zip
+  pull_request:
+    branches:
+      - main
 
 permissions:
   contents: read
@@ -60,8 +63,6 @@ jobs:
 
           recovered = []
           for path in sorted(extracted.rglob("*.py")):
-              # Recover application source files copied by the PyInstaller spec,
-              # not Python packages bundled under nested dependency folders.
               if path.parent.name != "_internal":
                   continue
               destination = source_out / path.name
@@ -81,8 +82,6 @@ jobs:
                   record["root_size"] = root_file.stat().st_size
               recovered.append(record)
 
-          # Record all top-level files and executables so we know which entry
-          # scripts may only exist inside PyInstaller archives.
           inventory = []
           for path in sorted(extracted.rglob("*")):
               if path.is_file():
