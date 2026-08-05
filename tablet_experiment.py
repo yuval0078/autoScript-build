@@ -12,20 +12,11 @@ import winsound
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QLabel, QPushButton, QMessageBox, QInputDialog)
 from PyQt5.QtCore import Qt, QTimer, QPointF, QEvent
-from PyQt5.QtGui import QPainter, QPen, QColor, QTabletEvent, QFont, QBrush, QKeySequence
+from PyQt5.QtGui import QPainter, QPen, QColor, QTabletEvent, QFont, QBrush
 from datetime import datetime
 import time
 import json
 import uuid
-from project_version import APP_VERSION
-
-# Import AudioProcessor for segment playback
-try:
-    from audio_processor import AudioProcessor
-    HAVE_AUDIO_PROCESSOR = True
-except ImportError:
-    HAVE_AUDIO_PROCESSOR = False
-    print("Warning: AudioProcessor not found (using full files only)")
 
 
 def _is_manifest(config: dict) -> bool:
@@ -94,26 +85,6 @@ def _manifest_to_legacy_config(config_path: str, manifest: dict) -> dict:
     return legacy_config
 
 
-def load_experiment_config(config_path: str) -> dict:
-    """Load one experiment config path, supporting legacy JSON and manifests."""
-    if not os.path.exists(config_path):
-        raise FileNotFoundError(f"Config file not found: {config_path}")
-
-    with open(config_path, 'r', encoding='utf-8') as f:
-        raw_config = json.load(f)
-
-    if _is_manifest(raw_config):
-        config = _manifest_to_legacy_config(os.path.abspath(config_path), raw_config)
-        config['__manifest__'] = raw_config
-        print(f"✓ Loaded manifest (schema {raw_config.get('schema_version', '1.0')}) from {config_path}")
-    else:
-        config = raw_config
-        config['__file_path__'] = os.path.abspath(config_path)
-        print(f"✓ Loaded legacy configuration from {config_path}")
-
-    return config
-
-
 class PenDataRecorder:
     """Records pen movement data (position, pressure, speed, etc.)"""
     
@@ -123,12 +94,10 @@ class PenDataRecorder:
         self.current_word_data = None
         self.last_point = None
         self.last_time = None
-        self._word_motion_state = {}
-        self._finished_word_ids = set()
     
-    def create_word_record(self, word_info):
-        """Create a word recording without making it the only active record."""
-        word_data = {
+    def start_word(self, word_info):
+        """Start recording a new word"""
+        self.current_word_data = {
             'word': word_info['word'],
             'cell': word_info['cell'],
             'group': word_info.get('group', 'unknown'),  # Group name
@@ -138,52 +107,9 @@ class PenDataRecorder:
             'audio_end_time': None,    # When audio finishes playing
             'pen_events': []  # List of pen events with full data
         }
-        self._word_motion_state[id(word_data)] = {
-            'last_point': None,
-            'last_time': None
-        }
-        return word_data
-    
-    def start_word(self, word_info):
-        """Start recording a new word"""
-        self.current_word_data = self.create_word_record(word_info)
         self.last_point = None
         self.last_time = None
         print(f"🖊 Recording pen data for word: '{word_info['word']}' (group: {word_info.get('group', 'unknown')})")
-    
-    def record_event_for_word(self, word_data, event_type, x, y, pressure, timestamp):
-        """Record a pen event into a specific word record."""
-        if not word_data:
-            return
-        
-        current_time = time.time()
-        state = self._word_motion_state.setdefault(id(word_data), {
-            'last_point': None,
-            'last_time': None
-        })
-        
-        speed = 0.0
-        if state['last_point'] and state['last_time']:
-            dx = x - state['last_point'][0]
-            dy = y - state['last_point'][1]
-            distance = math.sqrt(dx*dx + dy*dy)
-            time_delta = current_time - state['last_time']
-            if time_delta > 0:
-                speed = distance / time_delta
-        
-        event_data = {
-            'type': event_type,
-            'x': x,
-            'y': y,
-            'pressure': pressure,
-            'timestamp': timestamp,
-            'absolute_time': current_time,
-            'speed': speed
-        }
-        
-        word_data['pen_events'].append(event_data)
-        state['last_point'] = (x, y)
-        state['last_time'] = current_time
     
     def record_event(self, event_type, x, y, pressure, timestamp):
         """Record a pen event with position, pressure, and calculated speed"""
@@ -219,16 +145,6 @@ class PenDataRecorder:
         self.last_point = (x, y)
         self.last_time = current_time
     
-    def set_audio_start_for_word(self, word_data):
-        """Mark when audio starts playing for a specific word record."""
-        if word_data and word_data['audio_start_time'] is None:
-            word_data['audio_start_time'] = time.time()
-    
-    def set_audio_end_for_word(self, word_data):
-        """Mark when audio finishes playing for a specific word record."""
-        if word_data and word_data['audio_end_time'] is None:
-            word_data['audio_end_time'] = time.time()
-    
     def set_audio_start(self):
         """Mark when audio starts playing"""
         if self.current_word_data:
@@ -242,25 +158,12 @@ class PenDataRecorder:
     def end_word(self):
         """Finish recording current word"""
         if self.current_word_data:
-            self.end_word_record(self.current_word_data)
+            self.current_word_data['end_time'] = time.time()
+            self.all_word_data.append(self.current_word_data)
+            print(f"✓ Recorded {len(self.current_word_data['pen_events'])} pen events")
             self.current_word_data = None
             self.last_point = None
             self.last_time = None
-    
-    def end_word_record(self, word_data):
-        """Finish and store a specific word record once."""
-        if not word_data:
-            return
-        
-        word_id = id(word_data)
-        if word_id in self._finished_word_ids:
-            return
-        
-        word_data['end_time'] = time.time()
-        self.all_word_data.append(word_data)
-        self._finished_word_ids.add(word_id)
-        self._word_motion_state.pop(word_id, None)
-        print(f"✓ Recorded {len(word_data['pen_events'])} pen events")
     
     def save_to_file(self, filepath):
         """Save all recorded data to JSON file"""
@@ -283,11 +186,10 @@ class PenDataRecorder:
 class CalibrationCanvas(QWidget):
     """Canvas for calibration - captures 4 corner points"""
     
-    def __init__(self, parent=None, test_mode=False):
+    def __init__(self, parent=None):
         super().__init__(parent)
         # No minimum size - will fill entire screen
         self.setStyleSheet("background-color: white;")
-        self.test_mode = test_mode
         
         # Reference to main window
         self.main_window = None
@@ -306,33 +208,11 @@ class CalibrationCanvas(QWidget):
         # Enable tablet tracking
         self.setMouseTracking(True)
         self.setAttribute(Qt.WA_TabletTracking, True)
-
-    def _record_calibration_point(self):
-        self.calibration_points.append((self.pen_x, self.pen_y))
-        self.current_step += 1
-        self.touch_recorded = True
-
-        if self.main_window:
-            self.main_window.update_calibration_status()
-
-        print(f"✓ Recorded corner {self.current_step}/4: ({self.pen_x:.1f}, {self.pen_y:.1f})")
-
-        if self.current_step == 4 and self.main_window:
-            self.main_window.calibration_complete()
-
-    def _record_touch_if_ready(self, now=None):
-        if self.touch_recorded or self.current_step >= 4 or not self.touch_start_time:
-            return False
-
-        now = now or time.time()
-        if now - self.touch_start_time < 0.5:
-            return False
-
-        self._record_calibration_point()
-        return True
     
     def tabletEvent(self, event: QTabletEvent):
         """Handle tablet events"""
+        import time
+        
         # Get position - use globalPos for consistency
         global_pos = event.globalPos()
         self.pen_x = global_pos.x()
@@ -358,12 +238,27 @@ class CalibrationCanvas(QWidget):
                     self.touch_recorded = False
                 
                 # Check if we've held long enough (check during move)
-                self._record_touch_if_ready()
+                if self.touch_start_time and not self.touch_recorded:
+                    duration = time.time() - self.touch_start_time
+                    if duration >= 0.5 and self.current_step < 4:
+                        # Valid touch - record calibration point
+                        self.calibration_points.append((self.pen_x, self.pen_y))
+                        self.current_step += 1
+                        self.touch_recorded = True
+                        
+                        if self.main_window:
+                            self.main_window.update_calibration_status()
+                        
+                        print(f"✓ Recorded corner {self.current_step}/4: ({self.pen_x:.1f}, {self.pen_y:.1f})")
+                        
+                        # Check if calibration is complete
+                        if self.current_step == 4:
+                            if self.main_window:
+                                self.main_window.calibration_complete()
             else:
                 self.pen_touching = False
                 
         elif event_type == QTabletEvent.TabletRelease:
-            self._record_touch_if_ready()
             # Pen released - just reset state
             print(f"  Release detected")
             self.pen_touching = False
@@ -372,53 +267,20 @@ class CalibrationCanvas(QWidget):
         
         self.update()
         event.accept()
-
-    def mousePressEvent(self, event):
-        if not self.test_mode or event.button() != Qt.LeftButton:
-            return super().mousePressEvent(event)
-
-        global_pos = event.globalPos()
-        self.pen_x = global_pos.x()
-        self.pen_y = global_pos.y()
-        self.pen_touching = True
-        self.touch_start_time = time.time()
-        self.touch_recorded = False
-        print(f"  Mouse press detected at ({self.pen_x:.1f}, {self.pen_y:.1f})")
-        self.update()
-        event.accept()
-
-    def mouseMoveEvent(self, event):
-        if not self.test_mode:
-            return super().mouseMoveEvent(event)
-
-        global_pos = event.globalPos()
-        self.pen_x = global_pos.x()
-        self.pen_y = global_pos.y()
-        if event.buttons() & Qt.LeftButton:
-            self.pen_touching = True
-            self._record_touch_if_ready()
-        self.update()
-        event.accept()
-
-    def mouseReleaseEvent(self, event):
-        if not self.test_mode or event.button() != Qt.LeftButton:
-            return super().mouseReleaseEvent(event)
-
-        global_pos = event.globalPos()
-        self.pen_x = global_pos.x()
-        self.pen_y = global_pos.y()
-        self._record_touch_if_ready()
-        print("  Mouse release detected")
-        self.pen_touching = False
-        self.touch_start_time = None
-        self.touch_recorded = False
-        self.update()
-        event.accept()
     
     def paintEvent(self, event):
         """Draw the canvas with calibration points"""
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
+        
+        # Check if waiting for spacebar (after successful calibration)
+        if self.main_window and getattr(self.main_window, 'waiting_for_spacebar', False):
+            # Draw "Press SPACE to continue" message
+            painter.fillRect(self.rect(), QColor(255, 255, 255))
+            painter.setPen(QPen(QColor(0, 128, 0)))
+            painter.setFont(QFont("Arial", 32, QFont.Bold))
+            painter.drawText(self.rect(), Qt.AlignCenter, "✓ Calibration successful!\n\nPress SPACE to start experiment")
+            return
         
         # Draw instructions overlay at top center
         painter.setPen(QPen(QColor(0, 0, 0)))
@@ -436,10 +298,7 @@ class CalibrationCanvas(QWidget):
         painter.setPen(QPen(QColor(102, 126, 234)))
         
         if self.current_step < 4:
-            if self.test_mode:
-                step_text = f"Click {self.current_step + 1}/4: HOLD any paper corner (0.5s)"
-            else:
-                step_text = f"Touch {self.current_step + 1}/4: HOLD any paper corner (0.5s)"
+            step_text = f"Touch {self.current_step + 1}/4: HOLD any paper corner (0.5s)"
         else:
             step_text = "All 4 corners captured! Press 'V' to validate or 'R' to reset"
         
@@ -447,9 +306,8 @@ class CalibrationCanvas(QWidget):
         
         painter.setFont(QFont("Arial", 12))
         painter.setPen(QPen(QColor(100, 100, 100)))
-        detail_text = "Mouse test mode | ESC=exit | R=reset | V=validate" if self.test_mode else "Corners auto-detected by position | ESC=exit | R=reset | V=validate"
         painter.drawText(box_x + 10, box_y + 60, box_width - 20, 30, Qt.AlignCenter, 
-                detail_text)
+                        "Corners auto-detected by position | ESC=exit | R=reset | V=validate")
         
         # Draw recorded calibration points
         for i, (x, y) in enumerate(self.calibration_points):
@@ -512,30 +370,22 @@ class CalibrationCanvas(QWidget):
 class CalibrationWindow(QMainWindow):
     """Main calibration window"""
     
-    def __init__(self, config=None, session_configs=None, session_config_index=0,
-                 session_results=None, test_mode=False):
+    def __init__(self, config=None):
         super().__init__()
-        self.session_configs = list(session_configs) if session_configs else ([config] if config else [])
-        self.session_config_index = session_config_index
-        self.session_results = session_results if session_results is not None else []
-        self.config = config or (self.session_configs[0] if self.session_configs else None)
-        self.test_mode = test_mode
+        self.config = config
+        self.waiting_for_spacebar = False
         self.resume_experiment_data = None  # For recalibration resume
-        self.pending_participant_number = None
-        self.pending_participant_age = None
-        self.pending_participant_gender = None
         self.init_ui()
     
     def init_ui(self):
         """Initialize the user interface"""
-        title = "Tablet Experiment - Calibration (Test Mode)" if self.test_mode else "Tablet Experiment - Calibration"
-        self.setWindowTitle(title)
+        self.setWindowTitle("Tablet Experiment - Calibration")
         
         # Make window fullscreen
         self.showFullScreen()
         
         # Canvas as the only central widget (fullscreen)
-        self.canvas = CalibrationCanvas(self, test_mode=self.test_mode)
+        self.canvas = CalibrationCanvas(self)
         self.canvas.main_window = self
         self.setCentralWidget(self.canvas)
         
@@ -547,8 +397,14 @@ class CalibrationWindow(QMainWindow):
         if event.key() == Qt.Key_Escape:
             # ESC to exit fullscreen or close
             self.close()
+        elif event.key() == Qt.Key_Space:
+            # Space to proceed after calibration
+            if self.waiting_for_spacebar:
+                self.waiting_for_spacebar = False
+                self.start_experiment()
         elif event.key() == Qt.Key_R:
             # R to reset calibration
+            self.waiting_for_spacebar = False
             self.reset_calibration()
         elif event.key() == Qt.Key_V:
             # V to validate
@@ -654,10 +510,14 @@ class CalibrationWindow(QMainWindow):
             msg = QMessageBox(self)
             msg.setIcon(QMessageBox.Information)
             msg.setWindowTitle("Calibration Successful")
-            msg.setText("✓ Calibration successful!")
+            msg.setText("✓ Calibration successful!\n\nProceeding to experiment.")
             msg.exec_()
-
-            self.prepare_experiment_start()
+            
+            print("✓ Calibration complete - waiting for spacebar to proceed")
+            
+            # Show "press spacebar to continue" message
+            self.waiting_for_spacebar = True
+            self.canvas.update()
             
         else:
             # Not a good rectangle - ask to redo
@@ -677,53 +537,6 @@ class CalibrationWindow(QMainWindow):
             
             self.reset_calibration()
     
-    def prepare_experiment_start(self):
-        """Collect required data, then open the experiment stage."""
-        
-        if not (hasattr(self, 'resume_experiment_data') and self.resume_experiment_data):
-            participant_number, ok = QInputDialog.getInt(
-                self,
-                'Participant Number',
-                'Enter participant number:',
-                value=1,
-                min=1,
-                max=9999
-            )
-            
-            if not ok:
-                return
-            
-            age, ok = QInputDialog.getInt(
-                self,
-                'Participant Age',
-                'Enter participant age:',
-                value=25,
-                min=1,
-                max=120
-            )
-            
-            if not ok:
-                return
-            
-            gender, ok = QInputDialog.getItem(
-                self,
-                'Participant Gender',
-                'Select participant gender:',
-                ['Male', 'Female', 'Other', 'Prefer not to say'],
-                0,
-                False
-            )
-            
-            if not ok:
-                return
-            
-            self.pending_participant_number = participant_number
-            self.pending_participant_age = age
-            self.pending_participant_gender = gender
-        
-        print("✓ Participant details collected - opening experiment stage")
-        self.start_experiment()
-    
     def start_experiment(self):
         """Start the experiment stage after successful calibration"""
         # Check if this is a recalibration (resume existing experiment)
@@ -737,53 +550,65 @@ class CalibrationWindow(QMainWindow):
                 resume_data['participant_number'], 
                 self.config,
                 resume_data['age'],
-                resume_data['gender'],
-                auto_start=False,
-                session_configs=self.session_configs,
-                session_config_index=self.session_config_index,
-                session_results=self.session_results,
-                test_mode=self.test_mode
+                resume_data['gender']
             )
             # Restore experiment state
             self.experiment_window.canvas.current_cell = resume_data['current_cell']
             self.experiment_window.canvas.pen_recorder = resume_data['pen_recorder']
             self.experiment_window.canvas.all_data = resume_data['all_data']
             self.experiment_window.canvas.page_number = resume_data['page_number']
-            self.experiment_window.canvas.time_mode_page_start = resume_data.get('time_mode_page_start')
-            self.experiment_window.canvas.time_mode_word_records = resume_data.get('time_mode_word_records', {})
-            self.experiment_window.canvas.time_mode_strokes_by_cell = resume_data.get('time_mode_strokes_by_cell', {})
-            self.experiment_window.canvas.current_stroke_cell = resume_data.get('current_stroke_cell')
-            self.experiment_window.canvas.current_stroke = resume_data.get('current_stroke', [])
-            self.experiment_window.canvas.is_drawing = resume_data.get('is_drawing', False)
-            self.experiment_window.canvas.pending_time_mode_page_refresh = resume_data.get('pending_time_mode_page_refresh', False)
-            self.experiment_window.canvas.pending_time_mode_finish = resume_data.get('pending_time_mode_finish', False)
             self.experiment_window.show()
             
             # Continue playing current word
             self.experiment_window.canvas.play_current_word()
             print(f"✓ Resumed experiment at word {resume_data['current_cell'] + 1}")
             return
-
-        participant_number = self.pending_participant_number
-        age = self.pending_participant_age
-        gender = self.pending_participant_gender
-        if participant_number is None:
-            self.prepare_experiment_start()
+        
+        # New experiment - ask for participant details
+        participant_number, ok = QInputDialog.getInt(
+            self,
+            'Participant Number',
+            'Enter participant number:',
+            value=1,
+            min=1,
+            max=9999
+        )
+        
+        if not ok:
+            # User cancelled - go back to calibration
+            return
+        
+        # Ask for age
+        age, ok = QInputDialog.getInt(
+            self,
+            'Participant Age',
+            'Enter participant age:',
+            value=25,
+            min=1,
+            max=120
+        )
+        
+        if not ok:
+            return
+        
+        # Ask for gender
+        gender, ok = QInputDialog.getItem(
+            self,
+            'Participant Gender',
+            'Select participant gender:',
+            ['Male', 'Female', 'Other', 'Prefer not to say'],
+            0,
+            False
+        )
+        
+        if not ok:
             return
         
         self.hide()  # Hide calibration window
         
         # Create and show experiment window with age and gender
         self.experiment_window = ExperimentWindow(
-            self.calibration_data,
-            participant_number,
-            self.config,
-            age,
-            gender,
-            session_configs=self.session_configs,
-            session_config_index=self.session_config_index,
-            session_results=self.session_results,
-            test_mode=self.test_mode
+            self.calibration_data, participant_number, self.config, age, gender
         )
         self.experiment_window.show()
 
@@ -791,17 +616,13 @@ class CalibrationWindow(QMainWindow):
 class ExperimentCanvas(QWidget):
     """Canvas for the main experiment with configurable grid"""
     
-    def __init__(self, calibration_data, participant_number, config=None, age=None, gender=None,
-                 parent=None, session_index=0, session_total=1, test_mode=False):
+    def __init__(self, calibration_data, participant_number, config=None, age=None, gender=None, parent=None):
         super().__init__(parent)
         self.calibration_data = calibration_data
         self.participant_number = participant_number
         self.config = config
-        self.test_mode = test_mode
         self.participant_age = age
         self.participant_gender = gender
-        self.session_index = session_index
-        self.session_total = session_total
         self.current_cell = 0
         
         # Default settings
@@ -847,21 +668,7 @@ class ExperimentCanvas(QWidget):
         self.total_cells = self.grid_rows * self.grid_cols
         
         self.current_strokes = []  # Strokes for current cell
-        # Currently unused in final export. Kept for possible detailed stroke/timing export
-        # and restored during recalibration resume.
-        self.all_data = []
-        self.time_mode_page_start = None
-        self.time_mode_word_records = {}
-        self.time_mode_strokes_by_cell = {}
-        self.current_stroke_cell = None
-        self.pending_time_mode_page_refresh = False
-        self.pending_time_mode_finish = False
-        self.waiting_for_save_spacebar = False
-        self.waiting_for_next_experiment_spacebar = False
-        self.completed_data = None
-        self.waiting_for_experiment_start = False
-        self.starting_experiment_after_space = False
-        self.start_gate_after_key_definition = False
+        self.all_data = []  # All experiment data
         
         # Pagination state
         self.page_number = 1
@@ -890,13 +697,6 @@ class ExperimentCanvas(QWidget):
         self.is_drawing = False
         self.current_stroke = []
         
-        # Audio slicing support
-        self.processor = AudioProcessor(verbose=False) if HAVE_AUDIO_PROCESSOR else None
-        
-        # Special State: Waiting for Key definition
-        self.waiting_for_proceed_key = (self.proceed_mode == 'key')
-        self.proceed_key_name = "Space" # Default display name
-        
         # Pen data recorder
         self.pen_recorder = PenDataRecorder()
         
@@ -916,165 +716,70 @@ class ExperimentCanvas(QWidget):
         self.setMouseTracking(True)
         
     def load_words(self):
-        """Load words from all supported config formats."""
+        """Load words from the experiment configuration JSON."""
+        import random
+        
         self.words = []
+        
         if not self.config:
             print("✗ No experiment configuration provided.")
             return
 
+        # Load from config object
+        words_data = self.config.get('words', {})
         base_dir = os.path.dirname(self.config.get('__file_path__', '.'))
-
-        # --- A. DETECT NEW JSON FORMAT ---
-        if 'groups' in self.config and isinstance(self.config['groups'], list):
-            # Parse Properties
-            self.exp_name = self.config.get('name', 'My Experiment')
+        audio_dir = os.path.join(base_dir, 'audio')
+        repetitions = self.config.get('properties', {}).get('repetitions', {})
+        order = self.config.get('properties', {}).get('order', 'random')
             
-            grid = self.config.get('grid', {})
-            self.grid_rows = grid.get('rows', 5)
-            self.grid_cols = grid.get('cols', 5)
+        # First, load all unique words
+        unique_words = []
+        for group_name, word_list in words_data.items():
+            for word_entry in word_list:
+                # Resolve audio reference: URL, absolute, or relative to extracted audio dir
+                file_ref = word_entry.get('file', '')
+                if file_ref.startswith(('http://', 'https://')):
+                    word_file = file_ref
+                elif os.path.isabs(file_ref):
+                    word_file = file_ref
+                else:
+                    word_file = os.path.join(audio_dir, file_ref)
+                unique_words.append({
+                    'file': word_file,
+                    'word': word_entry['word'],
+                    'group': group_name
+                })
             
-            # Note: Active proceeding condition logic will be handled outside load_words
-            proceed = self.config.get('proceed_condition', {})
-            self.proceed_mode = proceed.get('type', 'key')
-            self.proceed_delay = proceed.get('delay_ms', 2000)
+        # Handle repetitions
+        if order == 'random':
+            # Random order: repeat each word X times based on group, then shuffle with spacing
+            word_pool = []
+            for word_data in unique_words:
+                group_name = word_data['group']
+                repeat_count = repetitions.get(group_name, 1)
+                # Add this word multiple times
+                for rep in range(repeat_count):
+                    word_pool.append(word_data.copy())
 
-            beeps = self.config.get('beeps', {})
-            self.beep_before = beeps.get('before', {}).get('enabled', False)
-            self.beep_before_delay = beeps.get('before', {}).get('delay_ms', 100)
-            self.beep_after = beeps.get('after', {}).get('enabled', False)
-            self.beep_after_delay = beeps.get('after', {}).get('delay_ms', 100)
-            
-            # 1. Build File Map
-            # Map "file_name" or "original_name" or just path -> Absolute Path
-            file_map = {} # filename -> abs_path
-            for f_entry in self.config.get('files', []):
-                fname = f_entry.get('file_name', '')
-                rel_path = f_entry.get('path', '')
-                abs_path = os.path.join(base_dir, rel_path)
-                if fname:
-                    file_map[fname] = abs_path
-                # Fallback mapping
-                orig = f_entry.get('original_name', '')
-                if orig: 
-                     file_map[orig] = abs_path
-                file_map[rel_path] = abs_path
+            # Shuffle with spacing constraint: same words should be spaced apart
+            self.words = self._shuffle_with_spacing(word_pool)
 
-            # 2. Build Word Lookup Map (ID -> Object)
-            word_lookup = {}
-            for grp in self.config.get('groups', []):
-                grp_name = grp.get('name', 'Default')
-                for w in grp.get('words', []):
-                    # Resolve audio file
-                    src_ref = w.get('source_file')
-                    active_file = file_map.get(src_ref)
-                    if not active_file and src_ref and os.path.exists(os.path.join(base_dir, 'media', src_ref)):
-                        active_file = os.path.join(base_dir, 'media', src_ref)
-
-                    w_obj = {
-                        'id': w.get('id'),
-                        'word': w.get('text', ''),
-                        'group': grp_name,
-                        'file': active_file,
-                        'start_ms': w.get('start_ms'),
-                        'end_ms': w.get('end_ms')
-                    }
-                    word_lookup[w.get('id')] = w_obj
-
-            # 3. Determine Execution Sequence
-            order_type = self.config.get('order', 'random')
-            
-            if order_type == 'stiff':
-                # Use explicit sequence of IDs
-                seq_ids = self.config.get('sequence', [])
-                for wid in seq_ids:
-                    if wid in word_lookup:
-                        self.words.append(word_lookup[wid].copy())
-                    else:
-                        print(f"Warning: Sequence ID {wid} not found in groups.")
-
-            elif order_type == 'random':
-                # Use Groups + Repetitions
-                repetitions = self.config.get('repetitions', {})
-                pool = []
-                
-                # Iterate groups to find words
-                for grp in self.config.get('groups', []):
-                    grp_name = grp.get('name', 'Default')
-                    count = repetitions.get(grp_name, 1)
-                    
-                    grp_words = []
-                    for w in grp.get('words', []):
-                         if w.get('id') in word_lookup:
-                             grp_words.append(word_lookup[w.get('id')])
-                    
-                    # Add this group's words 'count' times
-                    for _ in range(count):
-                        for w_obj in grp_words:
-                            pool.append(w_obj.copy())
-                            
-                # Shuffle with spacing
-                self.words = self._shuffle_with_spacing(pool)
-
-
-        # --- B. LEGACY FORMAT FALLBACK ---
         else:
-            # Load from config object
-            words_data = self.config.get('words', {})
-            audio_dir = os.path.join(base_dir, 'audio')
-            repetitions = self.config.get('properties', {}).get('repetitions', {})
-            order = self.config.get('properties', {}).get('order', 'random')
-            
-            # First, load all unique words
-            unique_words = []
-            for group_name, word_list in words_data.items():
-                for word_entry in word_list:
-                    # Resolve audio reference: URL, absolute, or relative to extracted audio dir
-                    file_ref = word_entry.get('file', '')
-                    if file_ref.startswith(('http://', 'https://')):
-                        word_file = file_ref
-                    elif os.path.isabs(file_ref):
-                        word_file = file_ref
-                    else:
-                        word_file = os.path.join(audio_dir, file_ref)
-                    unique_words.append({
-                        'file': word_file,
-                        'word': word_entry['word'],
-                        'group': group_name
-                    })
-                
-            # Handle repetitions
-            if order == 'random':
-                # Random order: repeat each word X times based on group, then shuffle with spacing
-                word_pool = []
+            # Ordinal order: play all groups in order, then repeat entire sequence
+            # Use maximum repetition count
+            max_repeats = max(repetitions.values()) if repetitions else 1
+
+            for rep in range(max_repeats):
                 for word_data in unique_words:
                     group_name = word_data['group']
-                    repeat_count = repetitions.get(group_name, 1)
-                    # Add this word multiple times
-                    for rep in range(repeat_count):
-                        word_pool.append(word_data.copy())
-
-                # Shuffle with spacing constraint: same words should be spaced apart
-                self.words = self._shuffle_with_spacing(word_pool)
-
-            else:
-                # Ordinal order: play all groups in order, then repeat entire sequence
-                # Use maximum repetition count
-                max_repeats = max(repetitions.values()) if repetitions else 1
-
-                for rep in range(max_repeats):
-                    for word_data in unique_words:
-                        group_name = word_data['group']
-                        group_repeats = repetitions.get(group_name, 1)
-                        # Only add if this repetition is within the group's repeat count
-                        if rep < group_repeats:
-                            self.words.append(word_data.copy())
-            
-        # Common Finalization
-        self.grid_size = self.grid_rows # For compatibility with some methods, though we should use rows/cols
-        self.total_cells = self.grid_rows * self.grid_cols
+                    group_repeats = repetitions.get(group_name, 1)
+                    # Only add if this repetition is within the group's repeat count
+                    if rep < group_repeats:
+                        self.words.append(word_data.copy())
         
+        # Note: We do NOT limit to grid size anymore, as we support multiple pages
+        # self.words = self.words[:self.total_cells] 
         print(f"✓ Loaded {len(self.words)} words for experiment")
-    
     
     def _shuffle_with_spacing(self, word_pool):
         """
@@ -1131,154 +836,11 @@ class ExperimentCanvas(QWidget):
         
         return result
     
-    def _is_time_mode(self):
-        """Return True when prompts advance by timer instead of a participant key."""
-        return self.proceed_mode == 'time'
-    
-    def _get_page_start(self):
-        """Return the global word index of the first cell on the visible page."""
-        return (self.current_cell // self.total_cells) * self.total_cells
-    
-    def _ensure_time_mode_page_records(self):
-        """Create one active word record per visible cell for time-advance mode."""
-        if not self._is_time_mode():
-            return
-        
-        page_start = self._get_page_start()
-        if self.time_mode_page_start == page_start and self.time_mode_word_records:
-            return
-        
-        if self.time_mode_word_records:
-            self._finalize_time_mode_page()
-        
-        self.time_mode_page_start = page_start
-        self.time_mode_word_records = {}
-        self.time_mode_strokes_by_cell = {}
-        self.current_stroke_cell = None
-        
-        page_end = min(page_start + self.total_cells, len(self.words))
-        for global_idx in range(page_start, page_end):
-            word_data = self.words[global_idx]
-            local_cell = global_idx % self.total_cells
-            self.time_mode_word_records[local_cell] = self.pen_recorder.create_word_record({
-                'word': word_data['word'],
-                'cell': global_idx,
-                'group': word_data.get('group', 'unknown')
-            })
-            self.time_mode_strokes_by_cell[local_cell] = []
-    
-    def _time_mode_record_for_cell(self, local_cell):
-        """Return the word record assigned to a visible local cell."""
-        if self.time_mode_word_records:
-            return self.time_mode_word_records.get(local_cell)
-        
-        self._ensure_time_mode_page_records()
-        return self.time_mode_word_records.get(local_cell)
-    
-    def _current_time_mode_word_record(self):
-        """Return the word record for the currently playing prompt."""
-        if not self._is_time_mode():
-            return None
-        return self._time_mode_record_for_cell(self.current_cell % self.total_cells)
-    
-    def _finalize_time_mode_page(self):
-        """Finish every word record on the active time-mode page."""
-        if not self.time_mode_word_records:
-            return
-        
-        for local_cell in sorted(self.time_mode_word_records):
-            self.pen_recorder.end_word_record(self.time_mode_word_records[local_cell])
-        
-        self.time_mode_word_records = {}
-        self.time_mode_strokes_by_cell = {}
-        self.current_stroke = []
-        self.current_stroke_cell = None
-        self.is_drawing = False
-        self.pending_time_mode_page_refresh = False
-    
-    def _complete_pending_time_mode_transition(self):
-        """Finish a deferred page transition after an in-progress stroke ends."""
-        if self.pending_time_mode_finish:
-            self.pending_time_mode_finish = False
-            self.wait_for_save_spacebar()
-            return
-        
-        if self.pending_time_mode_page_refresh:
-            print("⚠ Page full - pausing for refresh")
-            self._finalize_time_mode_page()
-            self.is_paused_for_refresh = True
-            self.update()
-    
-    def request_initial_start_screen(self):
-        """Show the experiment-stage Space gate before the first prompt starts."""
-        if self.waiting_for_proceed_key:
-            self.start_gate_after_key_definition = True
-            self.update()
-            return
-        
-        self.show_experiment_start_screen()
-    
-    def show_experiment_start_screen(self):
-        """Wait for Space inside the experiment window before starting audio."""
-        self.waiting_for_experiment_start = True
-        self.starting_experiment_after_space = False
-        self.update()
-    
-    def begin_after_start_screen(self):
-        """Start playback after the requested 1000 ms post-Space pause."""
-        self.waiting_for_experiment_start = False
-        self.starting_experiment_after_space = False
-        
-        if self.waiting_for_proceed_key:
-            self.update()
-            return
-        
-        self.play_current_word()
-        self.update()
-    
-    def _audio_is_playing(self):
-        """Return True while pygame is still playing the current prompt."""
-        try:
-            import pygame
-            return bool(pygame.mixer.get_init() and pygame.mixer.music.get_busy())
-        except Exception:
-            return False
-    
-    def wait_for_save_spacebar(self):
-        """Enter the end-wait state while keeping pen input active until Space."""
-        if self.session_index < self.session_total - 1:
-            self.waiting_for_next_experiment_spacebar = True
-        else:
-            self.waiting_for_save_spacebar = True
-        self.auto_proceed_timer.stop()
-        if not self._audio_is_playing():
-            self.audio_monitor_timer.stop()
-        self.update()
-    
     def check_audio_finished(self):
         """Check if audio has finished playing"""
         try:
             import pygame
             if pygame.mixer.get_init() and not pygame.mixer.music.get_busy():
-                if self._is_time_mode():
-                    word_record = self._current_time_mode_word_record()
-                    if word_record and word_record['audio_end_time'] is None:
-                        self.pen_recorder.set_audio_end_for_word(word_record)
-                        print(f"♫ Audio finished playing")
-                        
-                        if self.beep_after:
-                            QTimer.singleShot(self.beep_after_delay, lambda: winsound.Beep(800, 150))
-                        
-                        delay = self.proceed_delay
-                        if self.beep_after:
-                            delay += self.beep_after_delay + 150
-                        print(f"⏳ Auto-advancing in {delay}ms...")
-                        self.auto_proceed_timer.start(delay)
-                        
-                    self.audio_monitor_timer.stop()
-                    self.update()
-                    return
-                
                 # Audio finished playing
                 if self.pen_recorder.current_word_data and self.pen_recorder.current_word_data['audio_end_time'] is None:
                     self.pen_recorder.set_audio_end()
@@ -1298,7 +860,6 @@ class ExperimentCanvas(QWidget):
                         
                 # Stop the timer
                 self.audio_monitor_timer.stop()
-                self.update()
         except Exception as e:
             pass
     
@@ -1317,60 +878,6 @@ class ExperimentCanvas(QWidget):
         else:
             self._start_word_logic()
 
-    def _is_url(self, path):
-        """Return True for HTTP(S) audio references."""
-        return isinstance(path, str) and path.lower().startswith(('http://', 'https://'))
-
-    def _download_audio_url(self, audio_url):
-        """Download a URL audio prompt to a reusable local cache file."""
-        try:
-            import hashlib
-            import urllib.parse
-            import urllib.request
-            from app_paths import ensure_dir, user_data_dir
-
-            parsed = urllib.parse.urlparse(audio_url)
-            suffix = os.path.splitext(parsed.path)[1] or '.audio'
-            cache_name = hashlib.sha256(audio_url.encode('utf-8')).hexdigest()[:24] + suffix
-            cache_path = ensure_dir(user_data_dir() / 'temp' / 'audio_url_cache') / cache_name
-
-            if cache_path.exists() and cache_path.stat().st_size > 0:
-                return str(cache_path)
-
-            print(f"Downloading audio prompt: {audio_url}")
-            request = urllib.request.Request(audio_url, headers={'User-Agent': 'AutoScript/1.0'})
-            with urllib.request.urlopen(request, timeout=30) as response:
-                with open(cache_path, 'wb') as f:
-                    f.write(response.read())
-
-            return str(cache_path)
-        except Exception as e:
-            print(f"Error downloading audio URL: {e}")
-            return None
-
-    def _prepare_audio_file(self, audio_file):
-        """Resolve local/URL audio references to an existing local playback path."""
-        if not audio_file:
-            print("Audio file not specified")
-            return None
-
-        if self._is_url(audio_file):
-            audio_file = self._download_audio_url(audio_file)
-            if not audio_file:
-                return None
-
-        # Try to use wav version if available (better compatibility)
-        if audio_file.lower().endswith('.m4a'):
-            wav_file = audio_file[:-4] + '.wav'
-            if os.path.exists(wav_file):
-                audio_file = wav_file
-
-        if not os.path.exists(audio_file):
-            print(f"Audio file not found: {audio_file}")
-            return None
-
-        return os.path.abspath(audio_file)
-
     def _start_word_logic(self):
         # Reset timing data for new word
         self.current_word_data = {
@@ -1381,26 +888,31 @@ class ExperimentCanvas(QWidget):
             'video_file': None
         }
         
+        # Start pen data recording for this word
         word_data = self.words[self.current_cell]
-        if self._is_time_mode():
-            self._ensure_time_mode_page_records()
-            word_record = self._current_time_mode_word_record()
-            self.pen_recorder.set_audio_start_for_word(word_record)
-        else:
-            # Start pen data recording for this word
-            self.pen_recorder.start_word({
-                'word': word_data['word'],
-                'cell': self.current_cell,
-                'group': word_data['group']
-            })
-            
-            # Mark audio start time
-            self.pen_recorder.set_audio_start()
+        self.pen_recorder.start_word({
+            'word': word_data['word'],
+            'cell': self.current_cell,
+            'group': word_data['group']
+        })
         
-        audio_file = self._prepare_audio_file(word_data.get('file'))
-        if not audio_file:
+        # Mark audio start time
+        self.pen_recorder.set_audio_start()
+        
+        audio_file = word_data['file']
+        
+        # Try to use wav version if available (better compatibility)
+        if audio_file.lower().endswith('.m4a'):
+            wav_file = audio_file[:-4] + '.wav'
+            if os.path.exists(wav_file):
+                audio_file = wav_file
+        
+        if not os.path.exists(audio_file):
+            print(f"✗ Audio file not found: {audio_file}")
             return
-        abs_audio_file = audio_file
+        
+        # Convert to absolute path
+        abs_audio_file = os.path.abspath(audio_file)
         
         # Try pygame mixer with wav files
         try:
@@ -1409,36 +921,14 @@ class ExperimentCanvas(QWidget):
                 # Initialize with higher frequency for better quality
                 pygame.mixer.init(frequency=44100, size=-16, channels=2, buffer=512)
             
-            # --- START SEGMENT LOGIC ---
-            start_ms = word_data.get('start_ms')
-            end_ms = word_data.get('end_ms')
-            
-            if start_ms is not None and end_ms is not None and self.processor:
-                # Use AudioProcessor to create a temp file for this segment
-                # This works for both WAV and M4A source files
-                segment_context = f"exp_playback_{self.current_cell}_{int(start_ms)}_{int(end_ms)}"
-                temp_file = self.processor.get_temp_segment_file(
-                    abs_audio_file, start_ms, end_ms, context=segment_context
-                )
-                if temp_file:
-                    pygame.mixer.music.load(temp_file)
-                    pygame.mixer.music.play()
-                    print(f"♪ Playing segment {self.current_cell + 1}: '{word_data['word']}' ({start_ms}-{end_ms}ms)")
-                else:
-                    print(f"⚠ Failed to create segment, falling back to full file: {abs_audio_file}")
-                    pygame.mixer.music.load(abs_audio_file)
-                    pygame.mixer.music.play()
-                    print(f"♪ Playing full file {self.current_cell + 1}: '{word_data['word']}'")
-            else:
-                # Fallback: Play full file
-                pygame.mixer.music.load(abs_audio_file)
-                pygame.mixer.music.play()
-                print(f"♪ Playing full file {self.current_cell + 1}: '{word_data['word']}'")
-            # --- END SEGMENT LOGIC ---
+            # Load and play the sound
+            pygame.mixer.music.load(abs_audio_file)
+            pygame.mixer.music.play()
             
             # Start monitoring for audio completion
             self.audio_monitor_timer.start()
             
+            print(f"♪ Playing word {self.current_cell + 1}: '{word_data['word']}' ({os.path.basename(audio_file)})")
         except Exception as e:
             print(f"✗ Error playing with pygame: {e}")
             # Fallback to opening in external player
@@ -1450,37 +940,6 @@ class ExperimentCanvas(QWidget):
     
     def advance_to_next_word(self):
         """Move to next cell and play next word"""
-        if self._is_time_mode():
-            if self.current_word_data['reading_end'] is None:
-                self.current_word_data['reading_end'] = time.time()
-            
-            self.current_cell += 1
-            
-            if self.current_cell >= len(self.words):
-                if self.is_drawing:
-                    self.pending_time_mode_finish = True
-                    return
-                self.wait_for_save_spacebar()
-                return
-            
-            if self.current_cell > 0 and self.current_cell % self.total_cells == 0:
-                if self.is_drawing:
-                    self.pending_time_mode_page_refresh = True
-                    return
-                print("⚠ Page full - pausing for refresh")
-                self._finalize_time_mode_page()
-                self.is_paused_for_refresh = True
-                self.update()
-                return
-            
-            self.play_current_word()
-            self.update()
-            return
-        
-        if self.current_cell >= len(self.words) - 1:
-            self.wait_for_save_spacebar()
-            return
-        
         # End pen data recording for current word
         self.pen_recorder.end_word()
         
@@ -1500,8 +959,6 @@ class ExperimentCanvas(QWidget):
                 'writing_end_time': self.current_word_data['writing_end'],
                 'video_file': self.current_word_data['video_file']
             }
-            # Currently unused in final export; retained while we decide whether the
-            # detailed stroke/timing structure is needed by the analyzer.
             self.all_data.append(cell_data)
         
         # Move to next cell
@@ -1510,7 +967,7 @@ class ExperimentCanvas(QWidget):
         
         # Check if experiment is complete
         if self.current_cell >= len(self.words):
-            self.wait_for_save_spacebar()
+            self.finish_experiment()
             return
             
         # Check for page refresh (if grid is full)
@@ -1524,42 +981,45 @@ class ExperimentCanvas(QWidget):
         self.play_current_word()
         self.update()
     
-    def _result_file_stem(self, config=None, exp_name=None):
-        """Return a filesystem-friendly experiment stem for result filenames."""
-        config = config if config is not None else self.config
-        exp_name = exp_name or self.exp_name or 'experiment'
-        stem = str(exp_name)
+    def finish_experiment(self):
+        """Save data and finish experiment"""
+        import json
+        from pathlib import Path
+        from PyQt5.QtWidgets import QFileDialog
+
+        from app_paths import ensure_dir, user_data_dir
         
-        if config and '__file_path__' in config:
-            try:
-                config_path = Path(config['__file_path__'])
-                if not stem or stem == 'experiment':
-                    stem = config_path.stem
-            except Exception:
-                pass
-        
-        safe = ''.join(c if c.isalnum() or c in ('-', '_') else '_' for c in stem)
-        return safe or 'experiment'
-    
-    def collect_experiment_data(self):
-        """Finalize this experiment and return the JSON-ready result data."""
-        if self.completed_data is not None:
-            return self.completed_data
-        
-        if self._is_time_mode():
-            self._finalize_time_mode_page()
-        elif self.pen_recorder.current_word_data:
+        # End any ongoing pen recording
+        if self.pen_recorder.current_word_data:
             self.pen_recorder.end_word()
         
+        # Extract experiment name from config file path (zip name)
+        exp_name_for_file = self.exp_name
+        if self.config and '__file_path__' in self.config:
+            config_path = Path(self.config['__file_path__'])
+            # Get the parent directory name (should be the unzipped experiment folder)
+            exp_folder = config_path.parent.name
+            if exp_folder and exp_folder != 'current_experiment':
+                exp_name_for_file = exp_folder
+            else:
+                # Fallback to JSON filename without extension
+                exp_name_for_file = config_path.stem
+        
+        # Create default results directory
+        results_dir = ensure_dir(user_data_dir() / 'results')
+        results_dir.mkdir(exist_ok=True)
+        
+        # Create default data filename: experimentname_pN_timestamp.json
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        self.completed_data = {
+        default_filename = f'{exp_name_for_file}_p{self.participant_number}_{timestamp}.json'
+        default_path = results_dir / default_filename
+        
+        # Combine all data into single structure
+        combined_data = {
             'schema_version': '1.0',
-            'app_version': APP_VERSION,
             'experiment_name': self.exp_name,
             'experiment_id': self.config.get('experiment_id', self.exp_name),
             'experiment_version': self.config.get('experiment_version', 1),
-            'session_experiment_index': self.session_index + 1,
-            'session_experiment_count': self.session_total,
             'participant_number': self.participant_number,
             'participant_age': self.participant_age,
             'participant_gender': self.participant_gender,
@@ -1567,24 +1027,59 @@ class ExperimentCanvas(QWidget):
             'timestamp': timestamp,
             'calibration': self.calibration_data,
             'config': self.config,
-            'words': self.pen_recorder.all_word_data
+            'words': self.pen_recorder.all_word_data  # Contains pen events and audio timing
         }
-        return self.completed_data
-    
-    def _confirm_discard(self, parent, text):
-        """Ask whether unsaved data should be discarded."""
-        discard_msg = QMessageBox(parent)
-        discard_msg.setIcon(QMessageBox.Warning)
-        discard_msg.setWindowTitle("Discard Data?")
-        discard_msg.setText(text)
-        discard_msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
-        discard_msg.setDefaultButton(QMessageBox.No)
-        discard_msg.setWindowModality(Qt.ApplicationModal)
-        discard_msg.setWindowFlag(Qt.WindowStaysOnTopHint, True)
-        return discard_msg.exec_() == QMessageBox.Yes
-    
-    def _cleanup_and_quit(self):
-        """Release audio resources and close the app."""
+        
+        # Show file save dialog
+        save_path, _ = QFileDialog.getSaveFileName(
+            None,
+            "Save Experiment Data",
+            str(default_path),
+            "JSON Files (*.json);;All Files (*.*)"
+        )
+        
+        if not save_path:
+            # User cancelled - ask if they want to discard
+            reply = QMessageBox.question(
+                None,
+                "Discard Data?",
+                "Are you sure you want to exit without saving the experiment data?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+            
+            if reply == QMessageBox.No:
+                # Return to allow user to save again
+                self.finish_experiment()
+                return
+            else:
+                # User confirmed discarding data
+                print("⚠ Experiment data discarded by user")
+        else:
+            # Save combined data
+            try:
+                data_file = Path(save_path)
+                with open(str(data_file), 'w', encoding='utf-8') as f:
+                    json.dump(combined_data, f, ensure_ascii=False, indent=2)
+                
+                print(f"✓ Experiment complete! Data saved to {data_file}")
+                print(f"  Participant: {self.participant_number}")
+                print(f"  Total words recorded: {len(self.pen_recorder.all_word_data)}")
+                total_events = sum(len(word['pen_events']) for word in self.pen_recorder.all_word_data)
+                print(f"  Total pen events: {total_events}")
+                
+                # Show completion message
+                msg = QMessageBox()
+                msg.setIcon(QMessageBox.Information)
+                msg.setWindowTitle("Experiment Complete")
+                msg.setText(f"Experiment finished!\n\nData saved to:\n{str(data_file)}")
+                msg.exec_()
+                
+            except Exception as e:
+                print(f"✗ Error saving data: {e}")
+                QMessageBox.critical(None, "Error", f"Failed to save data:\n{str(e)}")
+        
+        # Ensure audio resources are released
         try:
             import pygame
             if pygame.mixer.get_init():
@@ -1592,146 +1087,9 @@ class ExperimentCanvas(QWidget):
                 pygame.mixer.quit()
         except Exception:
             pass
-        app = QApplication.instance()
-        if app:
-            app.closeAllWindows()
-            app.quit()
-        else:
-            QApplication.quit()
-    
-    def _stop_runtime_activity(self):
-        """Stop experiment timers and any currently playing prompt."""
-        self.audio_monitor_timer.stop()
-        self.auto_proceed_timer.stop()
-        try:
-            import pygame
-            if pygame.mixer.get_init():
-                pygame.mixer.music.stop()
-        except Exception:
-            pass
-    
-    def _save_single_result(self, combined_data, dialog_parent):
-        """Save one experiment result using the existing file-save flow."""
-        from pathlib import Path
-        from PyQt5.QtWidgets import QFileDialog
-        from app_paths import ensure_dir, user_data_dir
-        
-        results_dir = ensure_dir(user_data_dir() / 'results')
-        default_filename = f"{self._result_file_stem()}_p{self.participant_number}_{combined_data['timestamp']}.json"
-        default_path = results_dir / default_filename
-        
-        save_dialog = QFileDialog(
-            dialog_parent,
-            "Save Experiment Data",
-            str(default_path),
-            "JSON Files (*.json);;All Files (*.*)"
-        )
-        save_dialog.setAcceptMode(QFileDialog.AcceptSave)
-        save_dialog.setDefaultSuffix("json")
-        save_dialog.setOption(QFileDialog.DontUseNativeDialog, True)
-        save_dialog.setWindowModality(Qt.ApplicationModal)
-        save_dialog.setWindowFlag(Qt.WindowStaysOnTopHint, True)
-        save_path = save_dialog.selectedFiles()[0] if save_dialog.exec_() == QFileDialog.Accepted else ""
-        
-        if not save_path:
-            if not self._confirm_discard(dialog_parent, "Are you sure you want to exit without saving the experiment data?"):
-                self.finish_experiment()
-            else:
-                print("⚠ Experiment data discarded by user")
-                self._cleanup_and_quit()
-            return
-        
-        try:
-            data_file = Path(save_path)
-            with open(str(data_file), 'w', encoding='utf-8') as f:
-                json.dump(combined_data, f, ensure_ascii=False, indent=2)
-            
-            msg = QMessageBox(dialog_parent)
-            msg.setIcon(QMessageBox.Information)
-            msg.setWindowTitle("Experiment Complete")
-            msg.setText(f"Experiment finished!\n\nData saved to:\n{str(data_file)}")
-            msg.setWindowModality(Qt.ApplicationModal)
-            msg.setWindowFlag(Qt.WindowStaysOnTopHint, True)
-            msg.exec_()
-        except Exception as e:
-            error_msg = QMessageBox(dialog_parent)
-            error_msg.setIcon(QMessageBox.Critical)
-            error_msg.setWindowTitle("Error")
-            error_msg.setText(f"Failed to save data:\n{str(e)}")
-            error_msg.setWindowModality(Qt.ApplicationModal)
-            error_msg.setWindowFlag(Qt.WindowStaysOnTopHint, True)
-            error_msg.exec_()
-            return
-        
-        self._cleanup_and_quit()
-    
-    def _save_session_results(self, session_results, dialog_parent):
-        """Save every experiment in a multi-experiment session as separate files."""
-        from pathlib import Path
-        from PyQt5.QtWidgets import QFileDialog
-        from app_paths import ensure_dir, user_data_dir
-        
-        results_dir = ensure_dir(user_data_dir() / 'results')
-        parent_dir = QFileDialog.getExistingDirectory(
-            dialog_parent,
-            f"Select Parent Folder for Participant {self.participant_number}",
-            str(results_dir)
-        )
-        
-        if not parent_dir:
-            if not self._confirm_discard(dialog_parent, "Are you sure you want to exit without saving this experiment session?"):
-                self.finish_experiment()
-            else:
-                print("⚠ Experiment session data discarded by user")
-                self._cleanup_and_quit()
-            return
-        
-        session_dir = Path(parent_dir) / str(self.participant_number)
-        session_dir.mkdir(parents=True, exist_ok=True)
-        
-        saved_files = []
-        try:
-            for index, result in enumerate(session_results, start=1):
-                stem = self._result_file_stem(result.get('config'), result.get('experiment_name'))
-                filename = f"{stem}_p{self.participant_number}_{result.get('timestamp')}.json"
-                data_file = session_dir / filename
-                if data_file.exists():
-                    data_file = session_dir / f"{stem}_p{self.participant_number}_{result.get('timestamp')}_{index}.json"
-                
-                with open(str(data_file), 'w', encoding='utf-8') as f:
-                    json.dump(result, f, ensure_ascii=False, indent=2)
-                saved_files.append(data_file)
-        except Exception as e:
-            error_msg = QMessageBox(dialog_parent)
-            error_msg.setIcon(QMessageBox.Critical)
-            error_msg.setWindowTitle("Error")
-            error_msg.setText(f"Failed to save session data:\n{str(e)}")
-            error_msg.setWindowModality(Qt.ApplicationModal)
-            error_msg.setWindowFlag(Qt.WindowStaysOnTopHint, True)
-            error_msg.exec_()
-            return
-        
-        msg = QMessageBox(dialog_parent)
-        msg.setIcon(QMessageBox.Information)
-        msg.setWindowTitle("Session Complete")
-        msg.setText(f"Saved {len(saved_files)} experiment files to:\n{str(session_dir)}")
-        msg.setWindowModality(Qt.ApplicationModal)
-        msg.setWindowFlag(Qt.WindowStaysOnTopHint, True)
-        msg.exec_()
-        self._cleanup_and_quit()
-    
-    def finish_experiment(self):
-        """Finalize and save this experiment or full multi-experiment session."""
-        dialog_parent = self.window()
-        current_data = self.collect_experiment_data()
-        self._stop_runtime_activity()
-        
-        main_window = self.window()
-        prior_results = list(getattr(main_window, 'session_results', []))
-        if self.session_total > 1:
-            self._save_session_results(prior_results + [current_data], dialog_parent)
-        else:
-            self._save_single_result(current_data, dialog_parent)
+
+        # Close application
+        QApplication.quit()
     
     def transform_point(self, pen_x, pen_y):
         """
@@ -1781,6 +1139,10 @@ class ExperimentCanvas(QWidget):
                 u += du
                 v += dv
         
+        # Clamp to valid range
+        u = max(0, min(1, u))
+        v = max(0, min(1, v))
+        
         # The virtual position is just the pen position (we draw the grid at the calibrated corners)
         virtual_x = pen_x
         virtual_y = pen_y
@@ -1807,123 +1169,6 @@ class ExperimentCanvas(QWidget):
         
         return cell
     
-    def _handle_time_mode_pointer_event(self, pointer_event, virtual_x, virtual_y, pressure, timestamp, cell):
-        """Record strokes by the cell they belong to, independent of the active prompt."""
-        if pointer_event == 'press':
-            if cell == -1:
-                return
-            
-            word_record = self._time_mode_record_for_cell(cell)
-            if not word_record:
-                return
-            
-            self.pen_recorder.record_event_for_word(word_record, 'press', virtual_x, virtual_y, pressure, timestamp)
-            self.is_drawing = True
-            self.current_stroke_cell = cell
-            self.current_stroke = [{
-                'x': virtual_x,
-                'y': virtual_y,
-                'pressure': pressure,
-                'time': timestamp
-            }]
-            
-        elif pointer_event == 'move' and self.is_drawing and self.current_stroke_cell is not None:
-            word_record = self._time_mode_record_for_cell(self.current_stroke_cell)
-            if not word_record:
-                return
-            
-            self.pen_recorder.record_event_for_word(word_record, 'move', virtual_x, virtual_y, pressure, timestamp)
-            self.current_stroke.append({
-                'x': virtual_x,
-                'y': virtual_y,
-                'pressure': pressure,
-                'time': timestamp
-            })
-            self.update()
-            
-        elif pointer_event == 'release':
-            if self.is_drawing and self.current_stroke and self.current_stroke_cell is not None:
-                word_record = self._time_mode_record_for_cell(self.current_stroke_cell)
-                if word_record:
-                    self.pen_recorder.record_event_for_word(word_record, 'release', virtual_x, virtual_y, pressure, timestamp)
-                
-                self.current_stroke.append({
-                    'x': virtual_x,
-                    'y': virtual_y,
-                    'pressure': pressure,
-                    'time': timestamp
-                })
-                self.time_mode_strokes_by_cell.setdefault(self.current_stroke_cell, []).append(self.current_stroke)
-            
-            self.current_stroke = []
-            self.current_stroke_cell = None
-            self.is_drawing = False
-            self.update()
-            self._complete_pending_time_mode_transition()
-
-    def _handle_pointer_event(self, pointer_event, virtual_x, virtual_y, pressure, timestamp, cell):
-        if (
-            self.waiting_for_experiment_start or
-            self.starting_experiment_after_space
-        ):
-            return
-
-        if getattr(self, 'is_paused_for_refresh', False):
-            return
-
-        if self._is_time_mode():
-            self._handle_time_mode_pointer_event(pointer_event, virtual_x, virtual_y, pressure, timestamp, cell)
-            return
-
-        if cell == -1 or cell != (self.current_cell % self.total_cells):
-            return
-
-        if pointer_event == 'press':
-            if self.current_word_data['writing_start'] is None:
-                self.current_word_data['writing_start'] = time.time()
-                if self.current_word_data['reading_end'] is None:
-                    self.current_word_data['reading_end'] = time.time()
-                if self.pen_recorder.current_word_data and self.pen_recorder.current_word_data['audio_end_time'] is None:
-                    self.pen_recorder.set_audio_end()
-
-            self.pen_recorder.record_event('press', virtual_x, virtual_y, pressure, timestamp)
-
-            self.is_drawing = True
-            self.current_stroke = [{
-                'x': virtual_x,
-                'y': virtual_y,
-                'pressure': pressure,
-                'time': timestamp
-            }]
-
-        elif pointer_event == 'move' and self.is_drawing:
-            self.pen_recorder.record_event('move', virtual_x, virtual_y, pressure, timestamp)
-
-            self.current_stroke.append({
-                'x': virtual_x,
-                'y': virtual_y,
-                'pressure': pressure,
-                'time': timestamp
-            })
-            self.update()
-
-        elif pointer_event == 'release':
-            if self.is_drawing and self.current_stroke:
-                self.pen_recorder.record_event('release', virtual_x, virtual_y, pressure, timestamp)
-
-                self.current_stroke.append({
-                    'x': virtual_x,
-                    'y': virtual_y,
-                    'pressure': pressure,
-                    'time': timestamp
-                })
-                self.current_strokes.append(self.current_stroke)
-                self.current_stroke = []
-                self.current_word_data['writing_end'] = time.time()
-
-            self.is_drawing = False
-            self.update()
-    
     def tabletEvent(self, event):
         """Handle tablet events for drawing"""
         # Get physical pen coordinates (use globalPos for consistency with calibration)
@@ -1938,114 +1183,74 @@ class ExperimentCanvas(QWidget):
         
         # Determine which cell this is in
         cell = self.get_cell_from_position(x_ratio, y_ratio)
-        pointer_map = {
-            QEvent.TabletPress: 'press',
-            QEvent.TabletMove: 'move',
-            QEvent.TabletRelease: 'release',
-        }
-        pointer_event = pointer_map.get(event.type())
-        if pointer_event:
-            self._handle_pointer_event(pointer_event, virtual_x, virtual_y, pressure, timestamp, cell)
+        
+        # If paused for refresh, ignore input
+        if getattr(self, 'is_paused_for_refresh', False):
+            return
+
+        # Only record strokes in the current cell (ignore if outside grid)
+        # Note: self.current_cell is global index, cell is local grid index
+        if cell == -1 or cell != (self.current_cell % self.total_cells):
+            return
+        
+        if event.type() == QEvent.TabletPress:
+            # Mark writing start on first stroke
+            if self.current_word_data['writing_start'] is None:
+                self.current_word_data['writing_start'] = time.time()
+                # Also mark reading end (when user starts writing)
+                if self.current_word_data['reading_end'] is None:
+                    self.current_word_data['reading_end'] = time.time()
+                # Mark audio end time only if not already set (from audio finishing naturally)
+                if self.pen_recorder.current_word_data and self.pen_recorder.current_word_data['audio_end_time'] is None:
+                    self.pen_recorder.set_audio_end()
+            
+            # Record pen event
+            self.pen_recorder.record_event('press', virtual_x, virtual_y, pressure, timestamp)
+            
+            self.is_drawing = True
+            self.current_stroke = [{
+                'x': virtual_x,
+                'y': virtual_y,
+                'pressure': pressure,
+                'time': timestamp
+            }]
+            
+        elif event.type() == QEvent.TabletMove and self.is_drawing:
+            # Record pen event
+            self.pen_recorder.record_event('move', virtual_x, virtual_y, pressure, timestamp)
+            
+            self.current_stroke.append({
+                'x': virtual_x,
+                'y': virtual_y,
+                'pressure': pressure,
+                'time': timestamp
+            })
+            self.update()
+            
+        elif event.type() == QEvent.TabletRelease:
+            if self.is_drawing and self.current_stroke:
+                # Record pen event
+                self.pen_recorder.record_event('release', virtual_x, virtual_y, pressure, timestamp)
+                
+                self.current_stroke.append({
+                    'x': virtual_x,
+                    'y': virtual_y,
+                    'pressure': pressure,
+                    'time': timestamp
+                })
+                self.current_strokes.append(self.current_stroke)
+                self.current_stroke = []
+                
+                # Update writing end time with each completed stroke
+                self.current_word_data['writing_end'] = time.time()
+            
+            self.is_drawing = False
+            self.update()
         
         event.accept()
     
-    def mousePressEvent(self, event):
-        if not self.test_mode or event.button() != Qt.LeftButton:
-            return
-
-        global_pos = event.globalPos()
-        timestamp = int(time.time() * 1000)
-        virtual_x, virtual_y, x_ratio, y_ratio = self.transform_point(global_pos.x(), global_pos.y())
-        cell = self.get_cell_from_position(x_ratio, y_ratio)
-        self._handle_pointer_event('press', virtual_x, virtual_y, 1.0, timestamp, cell)
-        event.accept()
-
-    def mouseMoveEvent(self, event):
-        if not self.test_mode or not (event.buttons() & Qt.LeftButton):
-            return
-
-        global_pos = event.globalPos()
-        timestamp = int(time.time() * 1000)
-        virtual_x, virtual_y, x_ratio, y_ratio = self.transform_point(global_pos.x(), global_pos.y())
-        cell = self.get_cell_from_position(x_ratio, y_ratio)
-        self._handle_pointer_event('move', virtual_x, virtual_y, 1.0, timestamp, cell)
-        event.accept()
-
-    def mouseReleaseEvent(self, event):
-        if not self.test_mode or event.button() != Qt.LeftButton:
-            return
-
-        global_pos = event.globalPos()
-        timestamp = int(time.time() * 1000)
-        virtual_x, virtual_y, x_ratio, y_ratio = self.transform_point(global_pos.x(), global_pos.y())
-        cell = self.get_cell_from_position(x_ratio, y_ratio)
-        self._handle_pointer_event('release', virtual_x, virtual_y, 1.0, timestamp, cell)
-        event.accept()
-            
     def keyPressEvent(self, event):
         """Handle keyboard events"""
-        if self.waiting_for_experiment_start or self.starting_experiment_after_space:
-            if event.key() == Qt.Key_Space and not self.starting_experiment_after_space:
-                self.waiting_for_experiment_start = False
-                self.starting_experiment_after_space = True
-                self.update()
-                QTimer.singleShot(1000, self.begin_after_start_screen)
-            elif event.key() == Qt.Key_Escape:
-                self.finish_experiment()
-            event.accept()
-            return
-        
-        if self.waiting_for_next_experiment_spacebar:
-            if event.key() == Qt.Key_Space:
-                if self._audio_is_playing():
-                    event.accept()
-                    return
-                self.waiting_for_next_experiment_spacebar = False
-                main_window = self.window()
-                if hasattr(main_window, 'finish_current_and_start_next'):
-                    main_window.finish_current_and_start_next()
-            elif event.key() == Qt.Key_Escape:
-                self.finish_experiment()
-            event.accept()
-            return
-        
-        if self.waiting_for_save_spacebar:
-            if event.key() == Qt.Key_Space:
-                if self._audio_is_playing():
-                    event.accept()
-                    return
-                self.waiting_for_save_spacebar = False
-                self.finish_experiment()
-            elif event.key() == Qt.Key_Escape:
-                self.finish_experiment()
-            event.accept()
-            return
-        
-        # --- NEW: Handle Proceed Key Definition ---
-        if self.waiting_for_proceed_key:
-            key_val = event.key()
-            # Ignore modifiers alone
-            if key_val in (Qt.Key_Control, Qt.Key_Shift, Qt.Key_Alt, Qt.Key_Meta):
-                return
-            
-            # Store the key
-            self.proceed_key = key_val
-            key_text = QKeySequence(key_val).toString()
-            print(f"✓ Proceed key defined as: {key_text} (ID: {key_val})")
-            
-            # Clear state and start
-            self.waiting_for_proceed_key = False
-            main_window = self.window()
-            if isinstance(main_window, QMainWindow):
-                main_window.statusBar().showMessage(f"Proceed Key: {key_text}")
-            if self.start_gate_after_key_definition:
-                self.start_gate_after_key_definition = False
-                self.show_experiment_start_screen()
-            else:
-                self.play_current_word()
-            self.update()
-            return
-
         # Handle Ctrl+R for recalibration
         if event.key() == Qt.Key_R and event.modifiers() == Qt.ControlModifier:
             print("\n⚠ Ctrl+R pressed - initiating recalibration...")
@@ -2067,15 +1272,13 @@ class ExperimentCanvas(QWidget):
             self.advance_to_next_word()
         elif event.key() == Qt.Key_Escape:
             # Confirm exit
-            msg = QMessageBox(self.window())
-            msg.setIcon(QMessageBox.Question)
-            msg.setWindowTitle('Exit Experiment')
-            msg.setText('Are you sure you want to exit?\nYou can save or discard data next.')
-            msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
-            msg.setDefaultButton(QMessageBox.No)
-            msg.setWindowModality(Qt.ApplicationModal)
-            msg.setWindowFlag(Qt.WindowStaysOnTopHint, True)
-            reply = msg.exec_()
+            reply = QMessageBox.question(
+                self,
+                'Exit Experiment',
+                'Are you sure you want to exit?\nProgress will be saved.',
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
             if reply == QMessageBox.Yes:
                 self.finish_experiment()
         event.accept()
@@ -2107,21 +1310,6 @@ class ExperimentCanvas(QWidget):
         # Fill background
         painter.fillRect(self.rect(), Qt.white)
         
-        if self.waiting_for_experiment_start or self.starting_experiment_after_space:
-            painter.setPen(QPen(Qt.black))
-            painter.setFont(QFont("Arial", 28, QFont.Bold))
-            text = "Starting experiment..." if self.starting_experiment_after_space else "Press SPACE to start experiment"
-            painter.drawText(self.rect(), Qt.AlignCenter, text)
-            return
-        
-        # Draw "Waiting for Key" Overlay
-        if self.waiting_for_proceed_key:
-            painter.setPen(QPen(Qt.black))
-            painter.setFont(QFont("Arial", 24, QFont.Bold))
-            text = "Press ANY KEY to define it separately\nas the 'Next Word' trigger."
-            painter.drawText(self.rect(), Qt.AlignCenter, text)
-            return
-
         # Draw quadrilateral using ACTUAL calibrated corners (original points)
         # This matches where the user actually touched the paper corners
         from PyQt5.QtGui import QPolygon
@@ -2141,15 +1329,7 @@ class ExperimentCanvas(QWidget):
         # Draw current strokes
         painter.setPen(QPen(Qt.black, 2))
         
-        strokes_to_draw = self.current_strokes
-        if self._is_time_mode():
-            strokes_to_draw = [
-                stroke
-                for cell_strokes in self.time_mode_strokes_by_cell.values()
-                for stroke in cell_strokes
-            ]
-        
-        for stroke in strokes_to_draw:
+        for stroke in self.current_strokes:
             if len(stroke) > 1:
                 for i in range(len(stroke) - 1):
                     p1 = stroke[i]
@@ -2182,14 +1362,7 @@ class ExperimentCanvas(QWidget):
         painter.setPen(QPen(Qt.black, 1))
         painter.setFont(QFont('Arial', 14, QFont.Bold))
         
-        if self.waiting_for_next_experiment_spacebar or self.waiting_for_save_spacebar:
-            if self._audio_is_playing():
-                text = "Finish writing - waiting for audio to finish"
-            elif self.waiting_for_next_experiment_spacebar:
-                text = "Finish writing - press SPACE for next experiment"
-            else:
-                text = "Finish writing - press SPACE to save data"
-        elif self.current_cell < len(self.words):
+        if self.current_cell < len(self.words):
             word = self.words[self.current_cell]['word']
             key_name = "SPACE"
             if self.proceed_mode == 'key':
@@ -2209,34 +1382,15 @@ class ExperimentCanvas(QWidget):
 class ExperimentWindow(QMainWindow):
     """Main window for the experiment stage"""
     
-    def __init__(
-        self,
-        calibration_data,
-        participant_number,
-        config=None,
-        age=None,
-        gender=None,
-        auto_start=True,
-        show_start_screen=True,
-        session_configs=None,
-        session_config_index=0,
-        session_results=None,
-        test_mode=False
-    ):
+    def __init__(self, calibration_data, participant_number, config=None, age=None, gender=None):
         super().__init__()
         self.calibration_data = calibration_data
         self.participant_number = participant_number
         self.participant_age = age
         self.participant_gender = gender
         self.config = config
-        self.session_configs = list(session_configs) if session_configs else ([config] if config else [])
-        self.session_config_index = session_config_index
-        self.session_results = list(session_results) if session_results else []
-        self.test_mode = test_mode
-        self.next_window = None
         
-        title = "Tablet Experiment - Experiment Stage (Test Mode)" if self.test_mode else "Tablet Experiment - Experiment Stage"
-        self.setWindowTitle(title)
+        self.setWindowTitle("Tablet Experiment - Experiment Stage")
         
         # Keep window on top of all other windows (including media player)
         self.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint)
@@ -2244,41 +1398,22 @@ class ExperimentWindow(QMainWindow):
         self.showFullScreen()
         
         # Create canvas
-        self.canvas = ExperimentCanvas(
-            calibration_data,
-            participant_number,
-            config,
-            age,
-            gender,
-            parent=self,
-            session_index=session_config_index,
-            session_total=max(1, len(self.session_configs)),
-            test_mode=self.test_mode
-        )
+        self.canvas = ExperimentCanvas(calibration_data, participant_number, config, age, gender)
         self.setCentralWidget(self.canvas)
         
         print("✓ Experiment stage started")
         print("  Press ESC to exit, Ctrl+R to recalibrate")
         
-        if auto_start:
-            if show_start_screen:
-                self.canvas.request_initial_start_screen()
-            elif not self.canvas.waiting_for_proceed_key:
-                self.canvas.play_current_word()
-
+        # Play first word
+        self.canvas.play_current_word()
+    
     def start_recalibration(self):
         """Start recalibration process"""
         print("⟲ Starting recalibration...")
         self.hide()
         
         # Create new calibration window
-        self.recalib_window = CalibrationWindow(
-            self.config,
-            session_configs=self.session_configs,
-            session_config_index=self.session_config_index,
-            session_results=self.session_results,
-            test_mode=self.test_mode
-        )
+        self.recalib_window = CalibrationWindow(self.config)
         # Store current experiment state to resume after recalibration
         self.recalib_window.resume_experiment_data = {
             'participant_number': self.participant_number,
@@ -2287,58 +1422,21 @@ class ExperimentWindow(QMainWindow):
             'current_cell': self.canvas.current_cell,
             'pen_recorder': self.canvas.pen_recorder,
             'all_data': self.canvas.all_data,
-            'page_number': self.canvas.page_number,
-            'time_mode_page_start': self.canvas.time_mode_page_start,
-            'time_mode_word_records': self.canvas.time_mode_word_records,
-            'time_mode_strokes_by_cell': self.canvas.time_mode_strokes_by_cell,
-            'current_stroke_cell': self.canvas.current_stroke_cell,
-            'current_stroke': self.canvas.current_stroke,
-            'is_drawing': self.canvas.is_drawing,
-            'pending_time_mode_page_refresh': self.canvas.pending_time_mode_page_refresh,
-            'pending_time_mode_finish': self.canvas.pending_time_mode_finish
+            'page_number': self.canvas.page_number
         }
         self.recalib_window.show()
-    
-    def finish_current_and_start_next(self):
-        """Finalize the current experiment and continue to the next session config."""
-        next_index = self.session_config_index + 1
-        if next_index >= len(self.session_configs):
-            self.canvas.finish_experiment()
-            return
-        
-        current_data = self.canvas.collect_experiment_data()
-        next_results = list(self.session_results)
-        next_results.append(current_data)
-        
-        next_config = self.session_configs[next_index]
-        # Force a fresh calibration before each experiment in multi-config sessions.
-        self.next_window = CalibrationWindow(
-            next_config,
-            session_configs=self.session_configs,
-            session_config_index=next_index,
-            session_results=next_results,
-            test_mode=self.test_mode
-        )
-        # Keep participant identity consistent across sequential experiments.
-        self.next_window.pending_participant_number = self.participant_number
-        self.next_window.pending_participant_age = self.participant_age
-        self.next_window.pending_participant_gender = self.participant_gender
-        self.next_window.show()
-        self.hide()
     
     def keyPressEvent(self, event):
         """Handle keyboard events at window level"""
         if event.key() == Qt.Key_Escape:
             # Confirm exit
-            msg = QMessageBox(self)
-            msg.setIcon(QMessageBox.Question)
-            msg.setWindowTitle('Exit Experiment')
-            msg.setText('Are you sure you want to exit?\nYou can save or discard data next.')
-            msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
-            msg.setDefaultButton(QMessageBox.No)
-            msg.setWindowModality(Qt.ApplicationModal)
-            msg.setWindowFlag(Qt.WindowStaysOnTopHint, True)
-            reply = msg.exec_()
+            reply = QMessageBox.question(
+                self,
+                'Exit Experiment',
+                'Are you sure you want to exit?\nProgress will be saved.',
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
             if reply == QMessageBox.Yes:
                 self.canvas.finish_experiment()
         else:
@@ -2350,20 +1448,26 @@ class ExperimentWindow(QMainWindow):
 def main():
     """Main entry point"""
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--test-mode",
-        action="store_true",
-        help="Use mouse input instead of pen/tablet input for calibration and drawing."
-    )
-    parser.add_argument(
-        "config_paths",
-        nargs="+",
-        help="Path(s) to experiment configuration JSON files from exported experiment ZIPs"
-    )
+    parser.add_argument("config_path", help="Path to experiment configuration JSON (from an exported experiment ZIP)")
     args = parser.parse_args()
     
+    if not os.path.exists(args.config_path):
+        print(f"✗ Config file not found: {args.config_path}")
+        sys.exit(2)
+
     try:
-        configs = [load_experiment_config(path) for path in args.config_paths]
+        with open(args.config_path, 'r', encoding='utf-8') as f:
+            raw_config = json.load(f)
+
+        # Support both legacy JSON (exported ZIP) and new manifest schema
+        if _is_manifest(raw_config):
+            config = _manifest_to_legacy_config(os.path.abspath(args.config_path), raw_config)
+            config['__manifest__'] = raw_config
+            print(f"✓ Loaded manifest (schema {raw_config.get('schema_version', '1.0')}) from {args.config_path}")
+        else:
+            config = raw_config
+            config['__file_path__'] = os.path.abspath(args.config_path)
+            print(f"✓ Loaded legacy configuration from {args.config_path}")
     except Exception as e:
         print(f"✗ Failed to load config: {e}")
         sys.exit(2)
@@ -2373,18 +1477,10 @@ def main():
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
     
-    window = CalibrationWindow(
-        configs[0],
-        session_configs=configs,
-        session_config_index=0,
-        session_results=[],
-        test_mode=args.test_mode
-    )
+    window = CalibrationWindow(config)
     window.show()
     
     print("Tablet Experiment - Calibration Stage")
-    if args.test_mode:
-        print("Mouse test mode enabled")
     print("Touch and hold (0.5s) any 4 corners of your paper")
     print("Corners will be automatically identified by position")
     print("Tolerance: 15mm deviation allowed")

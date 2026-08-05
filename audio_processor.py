@@ -9,8 +9,8 @@ import sys
 import subprocess
 import numpy as np
 import json
+import glob
 import shutil
-import logging
 from pathlib import Path
 
 from app_paths import asset_path, ensure_dir, user_data_dir
@@ -21,63 +21,29 @@ class AudioProcessor:
     
     def __init__(self, verbose=True):
         self.verbose = verbose
-        self.logger = self._create_logger()
-        self.log(f"[INIT] AudioProcessor starting (verbose={self.verbose})")
         self.ffmpeg_path = self.find_ffmpeg()
         self.ffprobe_path = self.find_ffprobe()
         self._configure_pydub()
         self.data_dir = user_data_dir()
-        self.log(f"[INIT] data_dir={self.data_dir}")
-        self.log(f"[INIT] ffmpeg={self.ffmpeg_path}")
-        self.log(f"[INIT] ffprobe={self.ffprobe_path}")
         # Temporary directory for intermediate processing only
         # No persistent recordings or sliced_words directories needed
         # All audio files are processed from their original locations
-
-    def _create_logger(self):
-        """Create a file logger for persistent debug traces."""
-        logger = logging.getLogger("autoscript.audio")
-        logger.setLevel(logging.DEBUG)
-
-        if logger.handlers:
-            return logger
-
-        try:
-            logs_dir = ensure_dir(user_data_dir() / 'logs')
-            log_path = logs_dir / 'audio_processor.log'
-            file_handler = logging.FileHandler(log_path, encoding='utf-8')
-            file_handler.setLevel(logging.DEBUG)
-            formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
-            file_handler.setFormatter(formatter)
-            logger.addHandler(file_handler)
-            logger.propagate = False
-        except Exception:
-            logging.basicConfig(level=logging.DEBUG)
-
-        return logger
         
     def log(self, message):
         """Print message only if verbose is True"""
-        try:
-            self.logger.debug(message)
-        except Exception:
-            pass
         if self.verbose:
             print(message)
 
     def find_ffmpeg(self):
         """Find ffmpeg executable"""
-        self.log("[FFMPEG] Looking for ffmpeg executable")
         # Prefer a bundled ffmpeg (works on other PCs with no installs)
         bundled = asset_path('assets/bin/ffmpeg.exe')
         if bundled.exists():
-            self.log(f"[FFMPEG] Found bundled ffmpeg at {bundled}")
             return str(bundled)
 
         # Try PsychoPy installation first
         psychopy_ffmpeg = Path(r"C:\Program Files\PsychoPy\share\ffpyplayer\ffmpeg\bin\ffmpeg.exe")
         if psychopy_ffmpeg.exists():
-            self.log(f"[FFMPEG] Found PsychoPy ffmpeg at {psychopy_ffmpeg}")
             return str(psychopy_ffmpeg)
         
         # Try system PATH
@@ -86,10 +52,8 @@ class AudioProcessor:
                                   capture_output=True, 
                                   text=True, 
                                   check=True)
-            self.log("[FFMPEG] Found ffmpeg from PATH")
             return 'ffmpeg'
         except (subprocess.CalledProcessError, FileNotFoundError):
-            self.log("[FFMPEG] ffmpeg not found in PATH")
             pass
         
         if self.verbose:
@@ -100,25 +64,20 @@ class AudioProcessor:
 
     def find_ffprobe(self):
         """Find ffprobe executable (optional but improves metadata/duration handling)."""
-        self.log("[FFPROBE] Looking for ffprobe executable")
         bundled = asset_path('assets/bin/ffprobe.exe')
         if bundled.exists():
-            self.log(f"[FFPROBE] Found bundled ffprobe at {bundled}")
             return str(bundled)
 
         if self.ffmpeg_path and self.ffmpeg_path.lower().endswith('ffmpeg.exe'):
             candidate = Path(self.ffmpeg_path).with_name('ffprobe.exe')
             if candidate.exists():
-                self.log(f"[FFPROBE] Found ffprobe near ffmpeg at {candidate}")
                 return str(candidate)
 
         # If ffmpeg is coming from PATH, ffprobe is typically alongside it.
         try:
             subprocess.run(['ffprobe', '-version'], capture_output=True, text=True, check=True)
-            self.log("[FFPROBE] Found ffprobe from PATH")
             return 'ffprobe'
         except (subprocess.CalledProcessError, FileNotFoundError):
-            self.log("[FFPROBE] ffprobe not found")
             return None
 
     def _configure_pydub(self):
@@ -130,20 +89,18 @@ class AudioProcessor:
                 AudioSegment.converter = self.ffmpeg_path  # type: ignore
             if getattr(self, 'ffprobe_path', None):
                 AudioSegment.ffprobe = self.ffprobe_path  # type: ignore
-            self.log("[PYDUB] Configured converter/probe paths")
         except Exception:
-            self.log("[PYDUB] Failed to configure pydub paths")
             return
     
     def convert_to_wav(self, input_file, output_wav):
         """Convert audio file (m4a/mp3/wav) to wav format"""
         input_path = Path(input_file)
-        self.log(f"[CONVERT] input={input_path} output={output_wav}")
         
         # If already wav, just copy - avoids requiring ffmpeg for wav files
         if input_path.suffix.lower() == '.wav':
             self.log(f"  ℹ Already WAV format: {input_path.name}")
             if str(input_path) != str(output_wav):
+                import shutil
                 shutil.copy(input_path, output_wav)
             return output_wav
 
@@ -175,7 +132,6 @@ class AudioProcessor:
             return output_wav
         except subprocess.CalledProcessError as e:
             self.log(f"  ✗ Error converting: {e.stderr}")
-            self.logger.exception("[CONVERT] ffmpeg conversion failed")
             raise
     
     def get_temp_segment_file(self, input_file, start_ms, end_ms, context="default"):
@@ -193,7 +149,6 @@ class AudioProcessor:
         """
         try:
             from pydub import AudioSegment
-            self.log(f"[SEGMENT] Extracting segment context={context} start={start_ms} end={end_ms} file={input_file}")
 
             temp_dir = ensure_dir(self.data_dir / 'temp')
 
@@ -224,90 +179,7 @@ class AudioProcessor:
             
         except Exception as e:
             self.log(f"Error extracting segment: {e}")
-            self.logger.exception("[SEGMENT] Failed to extract temp segment")
             return None
-
-    def detect_segments(self, input_file, silence_thresh=-30, min_silence_len=200, keep_silence=100, min_word_len=300):
-        """
-        Detect potential word segments in an audio file without writing separate files.
-        """
-        # Ensure configuration is active
-        self._configure_pydub()
-        self.log(
-            f"[DETECT] file={input_file} silence_thresh={silence_thresh} min_silence_len={min_silence_len} "
-            f"keep_silence={keep_silence} min_word_len={min_word_len}"
-        )
-
-        temp_dir = ensure_dir(self.data_dir / 'temp')
-        
-        # Convert to temp wav if needed (pydub works best with wav)
-        temp_wav = str(temp_dir / f"temp_analysis_{Path(input_file).stem}.wav")
-        self.convert_to_wav(input_file, temp_wav)
-        
-        try:
-            # Fix for Python 3.13 where audioop is removed
-            if sys.version_info >= (3, 13):
-                try:
-                    import audioop  # noqa: F401
-                except ImportError:
-                    pass
-
-            from pydub import AudioSegment
-            from pydub.silence import detect_nonsilent
-
-            # Configure pydub
-            if self.ffmpeg_path:
-                probe_candidate = Path(self.ffmpeg_path).with_name("ffprobe.exe")
-                if probe_candidate.exists():
-                    AudioSegment.ffprobe = str(probe_candidate)  # type: ignore
-
-            # Load audio
-            sound = AudioSegment.from_wav(temp_wav)
-            total_duration = len(sound)
-            self.log(f"[DETECT] loaded duration_ms={total_duration} dBFS={sound.dBFS:.2f}")
-            
-            # Use detect_nonsilent
-            ranges = detect_nonsilent(
-                sound, 
-                min_silence_len=min_silence_len,
-                silence_thresh=silence_thresh
-            )
-            self.log(f"[DETECT] raw_nonsilent_count={len(ranges)}")
-            
-            # Apply keep_silence (expand ranges)
-            segments = []
-            
-            # Apply expansion first
-            expanded_ranges = []
-            for start, end in ranges:
-                start = max(0, start - keep_silence)
-                end = min(len(sound), end + keep_silence)
-                duration = end - start 
-                if duration >= min_word_len:
-                    segments.append({
-                        'start': start,
-                        'end': end,
-                        'duration': duration,
-                        'index': len(segments) + 1
-                    })
-
-            self.log(f"[DETECT] filtered_segments={len(segments)}")
-            
-            # Clean up temp wav if we created a specific one for analysis
-            if os.path.exists(temp_wav) and temp_wav != input_file:
-                try:
-                    os.remove(temp_wav)
-                except:
-                    pass
-            
-            return segments, total_duration
-
-        except Exception as e:
-            self.log(f"Error checking segments: {e}")
-            self.logger.exception("[DETECT] Segment detection failed")
-            import traceback
-            traceback.print_exc()
-            return [], 0
 
     def detect_nonsilent(self, audio_data, sample_rate, silence_thresh=0.01, min_silence_len=300, min_word_len=100):
         """
@@ -371,7 +243,6 @@ class AudioProcessor:
         Slice audio file into separate word segments using pydub
         """
         self.log(f"\n📂 Processing: {input_file}")
-        self.log(f"[SLICE] base_name={base_name} output_dir={output_dir}")
 
         # Ensure configuration is active
         self._configure_pydub()
@@ -384,6 +255,7 @@ class AudioProcessor:
         
         try:
             # Fix for Python 3.13 where audioop is removed
+            import sys
             if sys.version_info >= (3, 13):
                 try:
                     import audioop  # noqa: F401
@@ -404,7 +276,6 @@ class AudioProcessor:
             # Load audio
             self.log(f"  Loading audio...")
             sound = AudioSegment.from_wav(temp_wav)
-            self.log(f"[SLICE] loaded duration_ms={len(sound)} dBFS={sound.dBFS:.2f}")
             
             # Detect non-silent chunks
             self.log(f"  🔍 Detecting words (pydub smart split)...")
@@ -416,7 +287,6 @@ class AudioProcessor:
                 min_silence_len=200,
                 silence_thresh=-30
             )
-            self.log(f"[SLICE] raw_nonsilent_count={len(ranges)}")
             
             # Apply keep_silence (expand ranges)
             keep_silence = 100
@@ -451,15 +321,12 @@ class AudioProcessor:
                     'end': end,
                     'duration': duration_ms
                 })
-            self.log(f"[SLICE] final_segments={len(segments)}")
                 
         except ImportError:
             self.log("  ✗ pydub not installed. Please run: pip install pydub")
-            self.logger.exception("[SLICE] Missing dependency while slicing")
             return []
         except Exception as e:
             self.log(f"  ✗ Error processing audio: {e}")
-            self.logger.exception("[SLICE] Audio slicing failed")
             if os.path.exists(temp_wav):
                 os.remove(temp_wav)
             raise
@@ -482,7 +349,6 @@ class AudioProcessor:
             list: List of dicts {'index', 'start', 'end', 'duration'}
         """
         file_path = Path(file_path)
-        self.log(f"[PROCESS_ONE] file={file_path}")
         if not file_path.exists():
             raise FileNotFoundError(f"File not found: {file_path}")
             
@@ -666,7 +532,6 @@ class AudioProcessor:
             dict: The complete labels database
         """
         source_dir = Path(source_directory)
-        self.log(f"[PROCESS_ALL] source={source_dir} output={output_directory} labels={labels_file}")
         if not source_dir.exists():
             self.log(f"✗ Source directory not found: {source_dir}")
             self.log(f"  Please provide a valid directory with audio files (m4a, mp3, or wav)")
@@ -697,7 +562,6 @@ class AudioProcessor:
         # Process each file
         for audio_file in audio_files:
             base_name = audio_file.stem
-            self.log(f"[PROCESS_ALL] processing file={audio_file.name}")
             
             # Slice audio
             segments = self.slice_audio_file(
@@ -727,7 +591,6 @@ class AudioProcessor:
         
         self.log(f"\n✓ Processing complete!")
         self.log(f"  Total words: {total_words}")
-        self.log(f"[PROCESS_ALL] total_words={total_words}")
         if output_directory:
             self.log(f"  Output: {output_directory}")
         if labels_file:

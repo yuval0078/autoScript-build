@@ -15,7 +15,6 @@ import os
 import json
 import math
 import csv
-import time
 from typing import List, Dict, Tuple, Optional, Any, Set
 from dataclasses import dataclass, field
 
@@ -25,7 +24,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QMessageBox, QComboBox, QTreeWidgetItemIterator, QInputDialog,
                              QDialog, QLineEdit, QDialogButtonBox, QFormLayout)
 from PyQt5.QtCore import Qt, QTimer, QPointF
-from PyQt5.QtGui import QPainter, QPen, QColor, QBrush, QFont, QImage
+from PyQt5.QtGui import QPainter, QPen, QColor, QBrush, QFont
 
 # =============================================================================
 # CONSTANTS
@@ -44,7 +43,6 @@ TRAIN_MODE_DISPLAY = {v: k for k, v in TRAIN_MODE_MAP.items()}
 HIT_THRESHOLD_PX = 30
 LETTER_Y_OFFSET = 40
 CANVAS_PADDING = 50
-CANVAS_WORD_SCALE = 1.0
 
 # Selection colors
 STROKE_SELECTED_COLOR = QColor(0, 120, 215)  # Blue for selected strokes
@@ -74,54 +72,11 @@ def calculate_bounds(pen_events: List[dict]) -> Tuple[float, float, float, float
     ys = [e["y"] for e in pen_events]
     return min(xs), min(ys), max(xs), max(ys)
 
-def find_stroke_indices(pen_events: List[dict], slice_points: Optional[List[int]] = None) -> Tuple[List[int], List[int]]:
-    """Returns (stroke_starts, stroke_ends), with optional virtual split points.
-
-    split point i means: current stroke ends at i, next starts at i+1.
-    """
-    if not pen_events:
-        return [], []
-
+def find_stroke_indices(pen_events: List[dict]) -> Tuple[List[int], List[int]]:
+    """Returns (stroke_starts, stroke_ends)"""
     starts = [i for i, e in enumerate(pen_events) if e["type"] == "press"]
-
-    if slice_points:
-        extra_starts = []
-        for idx in slice_points:
-            try:
-                split_idx = int(idx)
-            except Exception:
-                continue
-            next_idx = split_idx + 1
-            if 0 < next_idx < len(pen_events):
-                extra_starts.append(next_idx)
-        starts = sorted(set(starts + extra_starts))
-
-    if not starts:
-        starts = [0]
-
-    ends: List[int] = []
-    for i, start_idx in enumerate(starts):
-        if i + 1 < len(starts):
-            ends.append(starts[i + 1] - 1)
-        else:
-            ends.append(len(pen_events) - 1)
-
+    ends = [i for i, e in enumerate(pen_events) if e["type"] == "release"]
     return starts, ends
-
-
-def get_stroke_slice_points(word_data: Dict[str, Any]) -> List[int]:
-    """Get sanitized stroke split points for a word."""
-    raw = word_data.get("stroke_slices", [])
-    if not isinstance(raw, list):
-        return []
-
-    points: List[int] = []
-    for value in raw:
-        try:
-            points.append(int(value))
-        except Exception:
-            continue
-    return sorted(set(points))
 
 def get_sorted_letter_indices(assigned_letters: Dict[str, str]) -> List[int]:
     """Get sorted integer indices from assigned_letters dict"""
@@ -371,9 +326,9 @@ class ParticipantData:
     timestamp: str
     words: List[dict]
     calibration: Any = None
-    group: Optional[str] = None
+    group: str = None
     age: Any = None
-    gender: Optional[str] = None
+    gender: str = None
     
     # Cached computations per word
     _stroke_cache: Dict[int, Tuple[List[int], List[int]]] = field(default_factory=dict, repr=False)
@@ -408,10 +363,8 @@ class ParticipantData:
     def get_stroke_indices(self, word_idx: int) -> Tuple[List[int], List[int]]:
         """Get cached stroke start/end indices for a word"""
         if word_idx not in self._stroke_cache:
-            word_data = self.words[word_idx]
-            pen_events = word_data.get('pen_events', [])
-            slice_points = get_stroke_slice_points(word_data)
-            self._stroke_cache[word_idx] = find_stroke_indices(pen_events, slice_points)
+            pen_events = self.words[word_idx].get('pen_events', [])
+            self._stroke_cache[word_idx] = find_stroke_indices(pen_events)
         return self._stroke_cache[word_idx]
     
     def get_bounds(self, word_idx: int) -> Tuple[float, float, float, float]:
@@ -460,8 +413,7 @@ class AnimationCanvas(QWidget):
         self.pen_events = word_data.get("pen_events", [])
         
         # Calculate stroke indices
-        slice_points = get_stroke_slice_points(word_data)
-        self.stroke_starts, self.stroke_ends = find_stroke_indices(self.pen_events, slice_points)
+        self.stroke_starts, self.stroke_ends = find_stroke_indices(self.pen_events)
         
         # Load letters (new format) or convert from legacy assigned_letters
         if "letters" in word_data:
@@ -515,10 +467,7 @@ class AnimationCanvas(QWidget):
                 self.parent_player.event_slider.blockSignals(True)
                 self.parent_player.event_slider.setValue(self.current_event_index)
                 self.parent_player.event_slider.blockSignals(False)
-                self.parent_player.current_event_index = self.current_event_index
-                self.parent_player.canvas.set_event_index(self.current_event_index)
                 self.parent_player.update_info()
-                self.parent_player._update_canvas_title()
         
         self.update()
     
@@ -557,31 +506,16 @@ class AnimationCanvas(QWidget):
             min_x, min_y, max_x, max_y = calculate_bounds(self.pen_events)
             data_width = max_x - min_x
             data_height = max_y - min_y
-
-            top_padding = 20
-            bottom_padding = 70  # keep room for letter labels row
-            side_padding = CANVAS_PADDING
-
-            avail_w = max(1, self.width() - 2 * side_padding)
-            avail_h = max(1, self.height() - top_padding - bottom_padding)
-
+            
+            canvas_width = self.width() - 2 * CANVAS_PADDING
+            canvas_height = self.height() - 2 * CANVAS_PADDING - 100
+            
             if data_width > 0 and data_height > 0:
-                fit_scale = min(avail_w / data_width, avail_h / data_height)
-            elif data_width > 0:
-                fit_scale = avail_w / data_width
-            elif data_height > 0:
-                fit_scale = avail_h / data_height
+                scale = min(canvas_width / data_width, canvas_height / data_height, 1.0)
             else:
-                fit_scale = 1.0
-
-            scale = max(0.001, min(fit_scale * CANVAS_WORD_SCALE, 1.0))
-
-            scaled_w = data_width * scale
-            scaled_h = data_height * scale
-            offset_x = (self.width() - scaled_w) / 2.0
-            offset_y = top_padding + (avail_h - scaled_h) / 2.0
-
-            self._transform = (scale, offset_x, offset_y, min_x, min_y, data_width, data_height)
+                scale = 1.0
+            
+            self._transform = (scale, CANVAS_PADDING, CANVAS_PADDING, min_x, min_y, data_width, data_height)
         
         return self._transform or (1.0, CANVAS_PADDING, CANVAS_PADDING, 0, 0, 0, 0)
     
@@ -589,14 +523,14 @@ class AnimationCanvas(QWidget):
         """Transform data coordinates to screen coordinates"""
         scale, offset_x, offset_y, min_x, min_y, _, _ = self._ensure_transform()
         screen_x = (x - min_x) * scale + offset_x
-        screen_y = (y - min_y) * scale + offset_y
+        screen_y = (y - min_y) * scale + offset_y + 50
         return screen_x, screen_y
 
     def inverse_transform_point(self, screen_x: float, screen_y: float) -> Tuple[float, float]:
         """Transform screen coordinates to data coordinates"""
         scale, offset_x, offset_y, min_x, min_y, _, _ = self._ensure_transform()
         x = (screen_x - offset_x) / scale + min_x if scale > 0 else min_x
-        y = (screen_y - offset_y) / scale + min_y if scale > 0 else min_y
+        y = (screen_y - offset_y - 50) / scale + min_y if scale > 0 else min_y
         return x, y
 
     def get_stroke_from_point(self, pos) -> Optional[int]:
@@ -611,7 +545,8 @@ class AnimationCanvas(QWidget):
         current_stroke_idx = 0
         
         for i, event in enumerate(self.pen_events):
-            current_stroke_idx = self.get_stroke_for_event(i)
+            if event["type"] == "press":
+                current_stroke_idx = self.get_stroke_for_event(i)
             
             if event["type"] in ("press", "move"):
                 dist = math.sqrt((click_x - event["x"])**2 + (click_y - event["y"])**2)
@@ -628,7 +563,7 @@ class AnimationCanvas(QWidget):
             return None
         
         scale, offset_x, offset_y, _, _, _, data_height = self._ensure_transform()
-        drawing_bottom = offset_y + data_height * scale
+        drawing_bottom = offset_y + data_height * scale + 50
         letters_y_pos = min(int(drawing_bottom + LETTER_Y_OFFSET), self.height() - 10)
         
         # Check if click is near the letters row
@@ -679,10 +614,7 @@ class AnimationCanvas(QWidget):
                 self.parent_player.event_slider.blockSignals(True)
                 self.parent_player.event_slider.setValue(self.current_event_index)
                 self.parent_player.event_slider.blockSignals(False)
-                self.parent_player.current_event_index = self.current_event_index
-                self.parent_player.canvas.set_event_index(self.current_event_index)
                 self.parent_player.update_info()
-                self.parent_player._update_canvas_title()
             self.update()
             return
         
@@ -690,9 +622,8 @@ class AnimationCanvas(QWidget):
         stroke_idx = self.get_stroke_from_point(event.pos())
         if stroke_idx is not None:
             # Check modifiers for group selection
-            add_to_selection = bool(event.modifiers() & Qt.ShiftModifier) or bool(
-                self.parent_player and self.parent_player.group_select_mode
-            )
+            add_to_selection = (event.modifiers() & Qt.ShiftModifier) or \
+                              (self.parent_player and self.parent_player.group_select_mode)
             self.select_stroke(stroke_idx, add_to_selection)
                     
     def mouseDoubleClickEvent(self, event):
@@ -729,21 +660,35 @@ class AnimationCanvas(QWidget):
         self._transform = None  # Recalculate on paint
         scale, offset_x, offset_y, min_x, min_y, data_width, data_height = self._ensure_transform()
         
+        # Draw title
+        painter.setPen(QPen(Qt.black))
+        painter.setFont(QFont("Arial", 14, QFont.Bold))
+        title_text = f"Word: '{self.word_info.get('word', '')}' (Cell {self.word_info.get('cell', 0)})"
+        
+        audio_start = self.word_info.get('audio_start_time')
+        audio_end = self.word_info.get('audio_end_time')
+        if audio_start and audio_end:
+            duration = audio_end - audio_start
+            title_text += f" | Reading: 00:00 - {format_time(duration)}"
+        
+        # Add stroke selection info
+        if self.selected_strokes:
+            title_text += f" | Selected: {sorted(self.selected_strokes)}"
+        
+        painter.drawText(10, 25, title_text)
+        
         # Draw strokes with selection highlighting
         last_point = None
         current_stroke_idx = 0
-        stroke_start_set = set(self.stroke_starts)
         
         for i, event_data in enumerate(self.pen_events):
             screen_x, screen_y = self.transform_point(event_data["x"], event_data["y"])
             point = QPointF(screen_x, screen_y)
             pen_width = max(1, int(event_data["pressure"] * 5))
             
-            # Track current stroke, including virtual starts from slicing
-            if i in stroke_start_set:
+            # Track current stroke
+            if event_data["type"] == "press":
                 current_stroke_idx = self.get_stroke_for_event(i)
-                if i != 0:
-                    last_point = None
             
             # Determine color based on selection and timeline
             is_selected = current_stroke_idx in self.selected_strokes
@@ -759,15 +704,13 @@ class AnimationCanvas(QWidget):
             
             if event_data["type"] == "press":
                 last_point = point
-            elif event_data["type"] == "move":
-                if last_point is not None:
-                    painter.setPen(QPen(color, pen_width, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
-                    painter.drawLine(last_point, point)
+            elif event_data["type"] == "move" and last_point:
+                painter.setPen(QPen(color, pen_width, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+                painter.drawLine(last_point, point)
                 last_point = point
-            elif event_data["type"] == "release":
-                if last_point is not None:
-                    painter.setPen(QPen(color, pen_width, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
-                    painter.drawLine(last_point, point)
+            elif event_data["type"] == "release" and last_point:
+                painter.setPen(QPen(color, pen_width, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+                painter.drawLine(last_point, point)
                 last_point = None
         
         # Draw current position indicator
@@ -780,7 +723,7 @@ class AnimationCanvas(QWidget):
 
         # Draw letter assignments
         if self.letters:
-            drawing_bottom = offset_y + data_height * scale
+            drawing_bottom = offset_y + data_height * scale + 50
             y_pos = min(int(drawing_bottom + LETTER_Y_OFFSET), self.height() - 10)
             
             painter.setFont(QFont("Arial", 24, QFont.Bold))
@@ -855,7 +798,6 @@ class PenDataPlayer(QMainWindow):
         self.current_event_index = 0
         self.total_events = 0
         self.is_playing = False
-        self.ctrl_arrow_hold_start: Dict[int, float] = {}
         
         # Annotations (keyed by flattened word index)
         self.word_correctness: Dict[int, bool] = {}
@@ -872,143 +814,32 @@ class PenDataPlayer(QMainWindow):
         self.setWindowTitle("Stroke Analyzer - Pen Data Player")
         self.setGeometry(100, 100, 1400, 800)
         self.setFocusPolicy(Qt.StrongFocus)
-        self.setStyleSheet("""
-            QMainWindow {
-                background-color: #e9eef4;
-            }
-            QWidget {
-                font-size: 13px;
-                color: #203245;
-                font-family: "Trebuchet MS";
-            }
-            QWidget#leftPanel, QWidget#rightPanel {
-                background-color: #f7fafc;
-                border: 1px solid #d4deea;
-                border-radius: 14px;
-            }
-            QLabel#panelTitle {
-                font-size: 17px;
-                font-weight: 700;
-                color: #1f3148;
-                padding: 2px 4px;
-            }
-            QLabel#subtleMeta {
-                color: #5a6f86;
-                font-size: 12px;
-                padding-left: 4px;
-            }
-            QPushButton {
-                background-color: #ffffff;
-                border: 1px solid #c8d6e6;
-                border-radius: 10px;
-                padding: 7px 11px;
-                font-weight: 600;
-            }
-            QPushButton:hover {
-                background-color: #eaf3ff;
-                border-color: #82a8d4;
-            }
-            QPushButton:disabled {
-                background-color: #f1f1f1;
-                color: #9ca3af;
-                border-color: #dde1e7;
-            }
-            QPushButton#primaryAction {
-                background-color: #2f5f97;
-                color: #ffffff;
-                border: 1px solid #274f7d;
-            }
-            QPushButton#primaryAction:hover {
-                background-color: #3b73b3;
-            }
-            QTreeWidget, QComboBox {
-                background-color: #ffffff;
-                border: 1px solid #c8d6e6;
-                border-radius: 10px;
-                padding: 4px;
-            }
-            QWidget#stageShell {
-                background-color: #f0f4f9;
-                border: 1px solid #d3dce8;
-                border-radius: 14px;
-            }
-            QWidget#controlCard {
-                background-color: #f2f7fd;
-                border: 1px solid #d0dced;
-                border-radius: 12px;
-            }
-            QLabel#eventInfoLabel {
-                background-color: #ffffff;
-                border: 1px solid #cfdae8;
-                border-radius: 10px;
-                padding: 6px 8px;
-                font-weight: 600;
-            }
-            QLabel#canvasTitleLabel {
-                color: #1d3047;
-                font-size: 14px;
-                font-weight: 700;
-                padding: 2px 4px;
-            }
-            QSlider::groove:horizontal {
-                border: 1px solid #c7d2df;
-                height: 8px;
-                background: #e1e9f2;
-                border-radius: 4px;
-            }
-            QSlider::handle:horizontal {
-                background: #2f5f97;
-                border: 1px solid #244a75;
-                width: 16px;
-                margin: -5px 0;
-                border-radius: 8px;
-            }
-        """)
         
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QHBoxLayout(central_widget)
-        main_layout.setContentsMargins(14, 14, 14, 14)
-        main_layout.setSpacing(14)
         
         # Left panel
         left_panel = QWidget()
-        left_panel.setObjectName("leftPanel")
         left_layout = QVBoxLayout(left_panel)
-        left_panel.setMinimumWidth(320)
-        left_panel.setMaximumWidth(420)
-        left_layout.setContentsMargins(12, 12, 12, 12)
-        left_layout.setSpacing(10)
-
-        library_title = QLabel("Library")
-        library_title.setObjectName("panelTitle")
-        left_layout.addWidget(library_title)
         
         file_btn = QPushButton("📁 Load Participant Data")
-        file_btn.setObjectName("primaryAction")
         file_btn.clicked.connect(self.load_data_files)
         left_layout.addWidget(file_btn)
-
-        export_layout = QHBoxLayout()
-        export_layout.setSpacing(8)
+        
         self.loaded_files_label = QLabel("Loaded: 0 files")
-        self.loaded_files_label.setObjectName("subtleMeta")
+        self.loaded_files_label.setStyleSheet("color: gray; font-size: 10px;")
         left_layout.addWidget(self.loaded_files_label)
         
         self.export_btn = QPushButton("📊 Export CSV")
         self.export_btn.clicked.connect(self.export_to_csv)
         self.export_btn.setEnabled(False)
-        export_layout.addWidget(self.export_btn)
+        left_layout.addWidget(self.export_btn)
         
         self.export_json_btn = QPushButton("📦 Export Trainable JSON")
         self.export_json_btn.clicked.connect(self.export_trainable_json)
         self.export_json_btn.setEnabled(False)
-        export_layout.addWidget(self.export_json_btn)
-        left_layout.addLayout(export_layout)
-
-        tree_title = QLabel("Words By Group")
-        tree_title.setObjectName("panelTitle")
-        left_layout.addWidget(tree_title)
+        left_layout.addWidget(self.export_json_btn)
         
         self.word_tree = QTreeWidget()
         self.word_tree.setHeaderLabels(["Words by Group"])
@@ -1017,54 +848,14 @@ class PenDataPlayer(QMainWindow):
         
         # Right panel
         right_panel = QWidget()
-        right_panel.setObjectName("rightPanel")
         right_layout = QVBoxLayout(right_panel)
-        right_layout.setContentsMargins(12, 12, 12, 12)
-        right_layout.setSpacing(10)
-
-        stage_title = QLabel("Stroke Stage")
-        stage_title.setObjectName("panelTitle")
-        right_layout.addWidget(stage_title)
-
-        stage_shell = QWidget()
-        stage_shell.setObjectName("stageShell")
-        stage_shell_layout = QVBoxLayout(stage_shell)
-        stage_shell_layout.setContentsMargins(12, 12, 12, 12)
-        stage_shell_layout.setSpacing(8)
-
-        self.canvas_title_label = QLabel("Word: '' (Cell 0)")
-        self.canvas_title_label.setObjectName("canvasTitleLabel")
-        self.canvas_title_label.setAlignment(Qt.AlignCenter)
-        stage_shell_layout.addWidget(self.canvas_title_label)
         
         self.canvas = AnimationCanvas(self)
-        self.canvas.setMinimumSize(460, 240)
-        self.canvas.setMaximumSize(680, 340)
-        self.canvas.setStyleSheet("background-color: #ffffff; border: 1px solid #c7d4e4; border-radius: 12px;")
-
-        canvas_layout = QHBoxLayout()
-        canvas_layout.setContentsMargins(0, 0, 0, 0)
-        canvas_layout.addStretch()
-        canvas_layout.addWidget(self.canvas)
-        canvas_layout.addStretch()
-        stage_shell_layout.addLayout(canvas_layout)
+        right_layout.addWidget(self.canvas)
         
         self.event_info_label = QLabel("No data loaded")
-        self.event_info_label.setObjectName("eventInfoLabel")
         self.event_info_label.setAlignment(Qt.AlignCenter)
-        stage_shell_layout.addWidget(self.event_info_label)
-
-        right_layout.addWidget(stage_shell)
-
-        controls_title = QLabel("Control Deck")
-        controls_title.setObjectName("panelTitle")
-        right_layout.addWidget(controls_title)
-
-        control_card = QWidget()
-        control_card.setObjectName("controlCard")
-        control_layout = QVBoxLayout(control_card)
-        control_layout.setContentsMargins(10, 10, 10, 10)
-        control_layout.setSpacing(8)
+        right_layout.addWidget(self.event_info_label)
         
         # Slider
         slider_layout = QHBoxLayout()
@@ -1075,32 +866,34 @@ class PenDataPlayer(QMainWindow):
         self.event_slider.setInvertedAppearance(True)  # RTL - right is start, left is end
         self.event_slider.valueChanged.connect(self.slider_changed)
         slider_layout.addWidget(self.event_slider)
-        control_layout.addLayout(slider_layout)
+        right_layout.addLayout(slider_layout)
         
         # Playback controls
-        playback_layout = QHBoxLayout()
-        playback_layout.setSpacing(8)
+        control_layout = QHBoxLayout()
         self.play_btn = QPushButton("▶ Play")
         self.play_btn.clicked.connect(self.toggle_play)
         self.play_btn.setEnabled(False)
-        playback_layout.addWidget(self.play_btn)
+        control_layout.addWidget(self.play_btn)
         
         self.next_event_btn = QPushButton("◀ Event")
         self.next_event_btn.clicked.connect(self.next_event)
         self.next_event_btn.setEnabled(False)
-        playback_layout.addWidget(self.next_event_btn)
+        control_layout.addWidget(self.next_event_btn)
         
         self.prev_event_btn = QPushButton("Event ▶")
         self.prev_event_btn.clicked.connect(self.previous_event)
         self.prev_event_btn.setEnabled(False)
-        playback_layout.addWidget(self.prev_event_btn)
-
+        control_layout.addWidget(self.prev_event_btn)
+        right_layout.addLayout(control_layout)
+        
+        # Slice button (separate row for visibility)
+        slice_layout = QHBoxLayout()
         self.slice_btn = QPushButton("✂ Slice Stroke Here")
         self.slice_btn.clicked.connect(self.slice_stroke_at_current)
         self.slice_btn.setEnabled(False)
         self.slice_btn.setToolTip("Slice the current stroke at this event (must be a 'move' event)")
-        playback_layout.addWidget(self.slice_btn)
-        control_layout.addLayout(playback_layout)
+        slice_layout.addWidget(self.slice_btn)
+        right_layout.addLayout(slice_layout)
         
         # Selection controls row
         selection_layout = QHBoxLayout()
@@ -1123,7 +916,7 @@ class PenDataPlayer(QMainWindow):
         self.clear_selection_btn.setEnabled(False)
         selection_layout.addWidget(self.clear_selection_btn)
         
-        control_layout.addLayout(selection_layout)
+        right_layout.addLayout(selection_layout)
         
         # Navigation controls
         stroke_layout = QHBoxLayout()
@@ -1136,34 +929,17 @@ class PenDataPlayer(QMainWindow):
         self.prev_stroke_btn.clicked.connect(self.previous_stroke)
         self.prev_stroke_btn.setEnabled(False)
         stroke_layout.addWidget(self.prev_stroke_btn)
-        control_layout.addLayout(stroke_layout)
-
-        word_layout = QHBoxLayout()
+        
         self.next_word_btn = QPushButton("⏮⏮ Next Word")
         self.next_word_btn.clicked.connect(self.next_word)
         self.next_word_btn.setEnabled(False)
-        word_layout.addWidget(self.next_word_btn)
+        stroke_layout.addWidget(self.next_word_btn)
         
         self.prev_word_btn = QPushButton("Previous Word ⏭⏭")
         self.prev_word_btn.clicked.connect(self.previous_word)
         self.prev_word_btn.setEnabled(False)
-        word_layout.addWidget(self.prev_word_btn)
-        control_layout.addLayout(word_layout)
-
-        # Keyboard shortcuts hint (kept near navigation controls for discoverability)
-        self.shortcuts_hint_label = QLabel(
-            "<b>Shortcuts:</b> "
-            "Left/Right: next/prev stroke | "
-            "Shift+Left/Right: group-select next/prev stroke | "
-            "Ctrl+Left/Right: next/prev event | "
-            "Up/Down: prev/next word | "
-            "Enter: assign letter | "
-            "Ctrl+Space: slice | "
-            "Shift+Backspace: clear selection"
-        )
-        self.shortcuts_hint_label.setWordWrap(True)
-        self.shortcuts_hint_label.setStyleSheet("color: #4a5565; font-size: 13px; background: #e7eff9; border: 1px solid #cad7e7; border-radius: 10px; padding: 7px;")
-        control_layout.addWidget(self.shortcuts_hint_label)
+        stroke_layout.addWidget(self.prev_word_btn)
+        right_layout.addLayout(stroke_layout)
         
         # Train mode
         train_mode_layout = QHBoxLayout()
@@ -1172,9 +948,7 @@ class PenDataPlayer(QMainWindow):
         self.train_mode_combo.addItems(list(TRAIN_MODE_MAP.keys()))
         self.train_mode_combo.currentTextChanged.connect(self.on_train_mode_changed)
         train_mode_layout.addWidget(self.train_mode_combo)
-        control_layout.addLayout(train_mode_layout)
-
-        right_layout.addWidget(control_card)
+        right_layout.addLayout(train_mode_layout)
         
         # Splitter
         splitter = QSplitter(Qt.Horizontal)
@@ -1182,7 +956,6 @@ class PenDataPlayer(QMainWindow):
         splitter.addWidget(right_panel)
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 3)
-        splitter.setSizes([360, 1040])
         main_layout.addWidget(splitter)
         
         # Timer
@@ -1194,50 +967,8 @@ class PenDataPlayer(QMainWindow):
     # -------------------------------------------------------------------------
     
     def keyPressEvent(self, event):
-        # Ctrl shortcuts: event-level navigation and slicing.
-        if event.modifiers() & Qt.ControlModifier:
-            if event.key() == Qt.Key_Left:
-                # Left = next event (RTL)
-                now = time.monotonic()
-                if not event.isAutoRepeat() or Qt.Key_Left not in self.ctrl_arrow_hold_start:
-                    self.ctrl_arrow_hold_start[Qt.Key_Left] = now
-                hold_duration = now - self.ctrl_arrow_hold_start[Qt.Key_Left]
-                step = 3 if hold_duration >= 1.0 else 1
-                self.next_event(step)
-                event.accept()
-                return
-            if event.key() == Qt.Key_Right:
-                # Right = previous event (RTL)
-                now = time.monotonic()
-                if not event.isAutoRepeat() or Qt.Key_Right not in self.ctrl_arrow_hold_start:
-                    self.ctrl_arrow_hold_start[Qt.Key_Right] = now
-                hold_duration = now - self.ctrl_arrow_hold_start[Qt.Key_Right]
-                step = 3 if hold_duration >= 1.0 else 1
-                self.previous_event(step)
-                event.accept()
-                return
-            if event.key() == Qt.Key_Space:
-                if event.isAutoRepeat():
-                    event.accept()
-                    return
-                self.slice_stroke_at_current()
-                event.accept()
-                return
-
         # Check if shift is held for group selection
         add_to_selection = bool(event.modifiers() & Qt.ShiftModifier) or self.group_select_mode
-
-        if event.key() == Qt.Key_Backspace and (event.modifiers() & Qt.ShiftModifier):
-            self.clear_stroke_selection()
-            event.accept()
-            return
-
-        if event.key() in (Qt.Key_Left, Qt.Key_Right) and not self.canvas.selected_strokes and self.canvas.stroke_starts:
-            # If nothing is selected, first arrow press initializes selection to the first stroke.
-            self.canvas.select_stroke(0)
-            self._update_selection_ui()
-            event.accept()
-            return
         
         if event.key() == Qt.Key_Left:
             # Left = next stroke (RTL)
@@ -1257,13 +988,6 @@ class PenDataPlayer(QMainWindow):
             # Assign letter to selected strokes
             if self.canvas.selected_strokes:
                 self.assign_letter_to_selection()
-        event.accept()
-
-    def keyReleaseEvent(self, event):
-        if event.key() in (Qt.Key_Left, Qt.Key_Right):
-            self.ctrl_arrow_hold_start.pop(event.key(), None)
-        elif event.key() == Qt.Key_Control:
-            self.ctrl_arrow_hold_start.clear()
         event.accept()
     
     def toggle_group_select(self, checked: bool):
@@ -1285,28 +1009,6 @@ class PenDataPlayer(QMainWindow):
         has_selection = bool(self.canvas.selected_strokes)
         self.assign_letter_btn.setEnabled(has_selection and self.current_word_index >= 0)
         self.clear_selection_btn.setEnabled(has_selection)
-        self._update_canvas_title()
-
-    def _update_canvas_title(self):
-        if not hasattr(self, 'canvas_title_label'):
-            return
-        if self.current_word_index < 0 or self.current_word_index >= len(self.pen_data):
-            self.canvas_title_label.setText("Word: '' (Cell 0)")
-            return
-
-        word_data = self.pen_data[self.current_word_index]
-        title_text = f"Word: '{word_data.get('word', '')}' (Cell {word_data.get('cell', 0)})"
-
-        audio_start = word_data.get('audio_start_time')
-        audio_end = word_data.get('audio_end_time')
-        if audio_start and audio_end:
-            duration = audio_end - audio_start
-            title_text += f" | Reading: 00:00 - {format_time(duration)}"
-
-        if self.canvas.selected_strokes:
-            title_text += f" | Selected: {sorted(self.canvas.selected_strokes)}"
-
-        self.canvas_title_label.setText(title_text)
     
     def assign_letter_to_selection(self):
         """Assign a letter to the currently selected strokes"""
@@ -1484,33 +1186,20 @@ class PenDataPlayer(QMainWindow):
         """Navigate to next stroke using selection system"""
         self.canvas.select_next_stroke(self.group_select_mode)
         self._update_selection_ui()
-
-    def _clear_selection_for_event_navigation(self):
-        """Event navigation should clear stroke/letter selection."""
-        self.canvas.selected_strokes = set()
-        self._update_selection_ui()
-        self.canvas.update()
     
-    def previous_event(self, step: int = 1):
-        self._clear_selection_for_event_navigation()
-        current_idx = self.event_slider.value()
-        jump = max(1, int(step))
-        if current_idx > 0:
-            self.event_slider.setValue(max(0, current_idx - jump))
+    def previous_event(self):
+        if self.current_event_index > 0:
+            self.event_slider.setValue(self.current_event_index - 1)
     
-    def next_event(self, step: int = 1):
-        self._clear_selection_for_event_navigation()
-        current_idx = self.event_slider.value()
-        jump = max(1, int(step))
-        if current_idx < self.total_events - 1:
-            new_idx = min(self.total_events - 1, current_idx + jump)
-            self.event_slider.setValue(new_idx)
+    def next_event(self):
+        if self.current_event_index < self.total_events - 1:
+            self.event_slider.setValue(self.current_event_index + 1)
             
-            if self.is_playing and jump == 1 and new_idx < self.total_events - 1:
+            if self.is_playing and self.current_event_index < self.total_events - 1:
                 word_data = self.pen_data[self.current_word_index]
                 events = word_data["pen_events"]
-                delay_ms = int((events[new_idx + 1]["absolute_time"] - 
-                               events[new_idx]["absolute_time"]) * 1000)
+                delay_ms = int((events[self.current_event_index + 1]["absolute_time"] - 
+                               events[self.current_event_index]["absolute_time"]) * 1000)
                 self.play_timer.start(max(1, min(delay_ms, 1000)))
         else:
             self.stop_playback()
@@ -1674,7 +1363,6 @@ class PenDataPlayer(QMainWindow):
         
         # Update selection UI
         self._update_selection_ui()
-        self._update_canvas_title()
         
         self.update_info()
         self.activateWindow()
@@ -1685,16 +1373,13 @@ class PenDataPlayer(QMainWindow):
     def _get_current_stroke_starts(self) -> List[int]:
         if self.current_word_index < 0 or self.current_word_index >= len(self.pen_data):
             return []
-        word_data = self.pen_data[self.current_word_index]
-        pen_events = word_data.get("pen_events", [])
-        slice_points = get_stroke_slice_points(word_data)
-        return find_stroke_indices(pen_events, slice_points)[0]
+        pen_events = self.pen_data[self.current_word_index].get("pen_events", [])
+        return find_stroke_indices(pen_events)[0]
     
     def slider_changed(self, value: int):
         self.current_event_index = value
         self.canvas.set_event_index(value)
         self.update_info()
-        self._update_canvas_title()
     
     def update_info(self):
         if self.total_events == 0 or self.current_event_index >= self.total_events:
@@ -1773,8 +1458,7 @@ class PenDataPlayer(QMainWindow):
             return
         
         # Check we're not at first or last event of stroke
-        slice_points = get_stroke_slice_points(word_data)
-        stroke_starts, stroke_ends = find_stroke_indices(pen_events, slice_points)
+        stroke_starts, stroke_ends = find_stroke_indices(pen_events)
         
         # Find which stroke we're in
         current_stroke_idx = None
@@ -1796,16 +1480,18 @@ class PenDataPlayer(QMainWindow):
             QMessageBox.warning(self, "Cannot Slice", 
                               "Cannot slice at the first or last event of a stroke.")
             return
-
-        # Non-destructive split: keep original event types and store split metadata
+        
+        # To split a stroke, we just change the type of the current event to "release"
+        # and the next event to "press", keeping all other move events as-is
+        # This creates two separate strokes at the slice point
         slice_event = self.current_event_index
-        if "stroke_slices" not in word_data or not isinstance(word_data["stroke_slices"], list):
-            word_data["stroke_slices"] = []
-        if slice_event in word_data["stroke_slices"]:
-            QMessageBox.information(self, "Already Sliced", f"Stroke already sliced at event {slice_event}.")
-            return
-        word_data["stroke_slices"].append(slice_event)
-        word_data["stroke_slices"] = sorted(set(int(x) for x in word_data["stroke_slices"]))
+        
+        # The current move event becomes a release (end of first stroke)
+        pen_events[slice_event]["type"] = "release"
+        
+        # The next event becomes a press (start of second stroke)
+        if slice_event + 1 < len(pen_events):
+            pen_events[slice_event + 1]["type"] = "press"
         
         # No need to shift assigned_letters indices since we're not inserting events
         # But we do need to update letters' stroke_ids
@@ -1825,7 +1511,7 @@ class PenDataPlayer(QMainWindow):
         
         # Reload the word to refresh everything
         self.load_word(self.current_word_index)
-        self.event_slider.setValue(slice_event + 1)  # Move to start of newly split stroke
+        self.event_slider.setValue(slice_event + 1)  # Move to new press event
         
         QMessageBox.information(self, "Stroke Sliced", 
                                f"Stroke sliced at event {slice_event}. You can now assign letters to each part.")
@@ -1837,127 +1523,27 @@ class PenDataPlayer(QMainWindow):
     def _get_data_source(self) -> List[ParticipantData]:
         """Get participants for export"""
         return self.participants
-
-    def _sanitize_filename(self, text: str, max_len: int = 40) -> str:
-        """Create a filesystem-safe file name fragment."""
-        if text is None:
-            return "word"
-        safe = ''.join(ch if ch.isalnum() or ch in (' ', '_', '-') else '_' for ch in str(text))
-        safe = '_'.join(safe.split())
-        safe = safe.strip('._-')
-        if not safe:
-            safe = "word"
-        return safe[:max_len]
-
-    def _render_clean_word_image(self, pen_events: List[dict], width: int = 1400, height: int = 1000, padding: int = 80) -> QImage:
-        """Render a clean white canvas with only the written strokes (no overlays/UI)."""
-        image = QImage(width, height, QImage.Format_ARGB32)
-        image.fill(Qt.white)
-
-        if not pen_events:
-            return image
-
-        min_x, min_y, max_x, max_y = calculate_bounds(pen_events)
-        data_width = max_x - min_x
-        data_height = max_y - min_y
-
-        avail_w = max(1, width - 2 * padding)
-        avail_h = max(1, height - 2 * padding)
-
-        if data_width > 0 and data_height > 0:
-            scale = min(avail_w / data_width, avail_h / data_height)
-        elif data_width > 0:
-            scale = avail_w / data_width
-        elif data_height > 0:
-            scale = avail_h / data_height
-        else:
-            scale = 1.0
-
-        painter = QPainter(image)
-        painter.setRenderHint(QPainter.Antialiasing)
-
-        last_point = None
-        for event_data in pen_events:
-            x = (event_data.get("x", 0) - min_x) * scale + padding
-            y = (event_data.get("y", 0) - min_y) * scale + padding
-            point = QPointF(x, y)
-
-            pressure = float(event_data.get("pressure", 0.5) or 0.5)
-            pen_width = max(1, int(pressure * 5))
-            painter.setPen(QPen(Qt.black, pen_width, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
-
-            event_type = event_data.get("type")
-            if event_type == "press":
-                last_point = point
-            elif event_type == "move":
-                if last_point is not None:
-                    painter.drawLine(last_point, point)
-                last_point = point
-            elif event_type == "release":
-                if last_point is not None:
-                    painter.drawLine(last_point, point)
-                last_point = None
-
-        painter.end()
-        return image
     
     def export_to_csv(self):
         if not self.participants and not self.pen_data:
             QMessageBox.warning(self, "No Data", "No data loaded to export.")
             return
-
-        save_screenshots = QMessageBox.question(
-            self,
-            "Save Screenshots",
-            "Save clean screenshots for each word canvas?",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No
-        ) == QMessageBox.Yes
         
         default_name = "combined_analysis.csv" if len(self.participants) > 1 else f"participant_analysis.csv"
         file_path, _ = QFileDialog.getSaveFileName(self, "Save Analysis Data", default_name, "CSV Files (*.csv)")
         
         if not file_path:
             return
-
-        first_participant = self.participants[0] if self.participants else None
-        date_part = "unknown_date"
-        participant_part = "unknown"
-        if first_participant:
-            participant_part = str(first_participant.participant_number)
-            ts = str(first_participant.timestamp or "")
-            date_part = ts.split('_')[0] if ts else "unknown_date"
-
-        export_folder_name = f"{participant_part}_{date_part}"
-        export_root_dir = os.path.join(os.path.dirname(file_path), export_folder_name)
-        os.makedirs(export_root_dir, exist_ok=True)
-
-        csv_output_path = os.path.join(export_root_dir, os.path.basename(file_path))
-        screenshots_dir = os.path.join(export_root_dir, "screenshots")
-        if save_screenshots:
-            os.makedirs(screenshots_dir, exist_ok=True)
         
         try:
-            screenshot_count = 0
-            max_word_letters = 0
-
-            for participant in self.participants:
-                for word_data in participant.words:
-                    word_text = str(word_data.get("word", "") or "")
-                    max_word_letters = max(max_word_letters, len(word_text))
-
-            with open(csv_output_path, 'w', newline='', encoding='utf-8-sig') as csvfile:
+            with open(file_path, 'w', newline='', encoding='utf-8-sig') as csvfile:
                 writer = csv.writer(csvfile)
                 
                 header = [
-                    'Exp Step', 'Participant', 'Age', 'Gender', 'Word', 'Group', 'Cell', 'Correct', 'Written Word',
-                    'Reading End', 'Writing Start', 'Writing End', 'Strokes', 'Avg Interval'
+                    'Exp Step', 'Participant', 'Age', 'Gender', 'Word', 'Correct', 'Written Word',
+                    'Reading End', 'Writing Start', 'Writing End', 'Strokes', 'Avg Interval (ms)',
+                    'Letters'
                 ]
-
-                for i in range(1, max_word_letters + 1):
-                    header.extend([f"Written Letter {i}", f"Letter {i} Start", f"Letter {i} End"])
-
-                header.append('Screenshot File')
                 writer.writerow(header)
                 
                 flat_idx = 0
@@ -1969,23 +1555,12 @@ class PenDataPlayer(QMainWindow):
                         if not pen_events:
                             flat_idx += 1
                             continue
-
-                        screenshot_name = ""
-
-                        if save_screenshots:
-                            word_text = self._sanitize_filename(word_data.get("word", "word"))
-                            screenshot_name = f"p{participant.participant_number}_{word_idx + 1:03d}_{word_text}.png"
-                            screenshot_path = os.path.join(screenshots_dir, screenshot_name)
-                            image = self._render_clean_word_image(pen_events)
-                            image.save(screenshot_path, "PNG")
-                            screenshot_count += 1
                         
                         total_words += 1
                         audio_start = word_data.get("audio_start_time") or pen_events[0]["absolute_time"]
                         audio_end = word_data.get("audio_end_time")
-
-                        slice_points = get_stroke_slice_points(word_data)
-                        stroke_starts, stroke_ends = find_stroke_indices(pen_events, slice_points)
+                        
+                        stroke_starts, stroke_ends = find_stroke_indices(pen_events)
                         
                         # First stroke time as reference for Letters column
                         first_stroke_time = pen_events[stroke_starts[0]]["absolute_time"] if stroke_starts else audio_start
@@ -2002,9 +1577,9 @@ class PenDataPlayer(QMainWindow):
                         else:
                             avg_interval = 0
                         
-                        # Build per-letter columns: written char + start/end timing in ms.
+                        # Build Letters column: each letter with start/end time relative to audio_start (Reading Start)
                         assigned_letters = word_data.get("assigned_letters", {})
-                        letter_triplets: List[Tuple[str, str, str]] = []
+                        letters_parts = []
                         if assigned_letters:
                             sorted_indices = get_sorted_letter_indices(assigned_letters)
                             # Last letter ends at last release event (same as Writing End)
@@ -2018,26 +1593,40 @@ class PenDataPlayer(QMainWindow):
                                 start_time_ms = int((pen_events[start_idx]["absolute_time"] - audio_start) * 1000)
                                 end_time_ms = int((pen_events[end_idx]["absolute_time"] - audio_start) * 1000)
                                 
-                                letter_triplets.append((char, str(start_time_ms), str(end_time_ms)))
-
-                        letter_columns: List[str] = []
-                        for i in range(max_word_letters):
-                            if i < len(letter_triplets):
-                                letter_char, letter_start, letter_end = letter_triplets[i]
-                                letter_columns.extend([letter_char, letter_start, letter_end])
-                            else:
-                                letter_columns.extend(["", "", ""])
+                                letters_parts.append(f"{char} {start_time_ms}/{end_time_ms}")
                         
-                        # Correctness is exact-match only; empty written letters are unknown.
+                        letters_str = ", ".join(letters_parts)
+                        
+                        # Calculate is_correct and written_word for this word
                         original_word = word_data.get("word", "")
-                        written_word = ''.join(char for char, _start, _end in letter_triplets if char)
-
-                        if not written_word:
-                            correct_value = "unknown"
-                        elif written_word == original_word:
-                            correct_value = "True"
+                        
+                        # Debug: print assigned letters for this word
+                        if assigned_letters:
+                            written = build_written_word(assigned_letters)
+                            print(f"DEBUG word {word_idx + 1}: '{original_word}', assigned: {assigned_letters}, written: '{written}'")
+                        
+                        # Check if cached in dictionaries (from UI)
+                        if flat_idx in self.word_correctness and flat_idx in self.written_words:
+                            is_correct = self.word_correctness[flat_idx]
+                            written_word = self.written_words[flat_idx]
+                            print(f"  Using cached: is_correct={is_correct}, written_word='{written_word}'")
                         else:
-                            correct_value = "False"
+                            # Calculate based on logic
+                            if not assigned_letters:
+                                is_correct = True
+                                written_word = original_word
+                            elif check_partial_or_full_match(assigned_letters, original_word):
+                                is_correct = True
+                                written_word = original_word
+                                print(f"  Calculated: MATCH -> is_correct=True")
+                            else:
+                                is_correct = False
+                                if has_blocker(assigned_letters):
+                                    written_word = ""
+                                    print(f"  Calculated: NO MATCH + BLOCKER -> is_correct=False, written_word=''")
+                                else:
+                                    written_word = build_written_word(assigned_letters)
+                                    print(f"  Calculated: NO MATCH + NO BLOCKER -> is_correct=False, written_word='{written_word}'")
                         
                         row = [
                             word_idx + 1,
@@ -2045,32 +1634,21 @@ class PenDataPlayer(QMainWindow):
                             participant.age if participant.age else '',
                             participant.gender if participant.gender else '',
                             original_word,
-                            word_data.get("group", ""),
-                            word_data.get("cell", ""),
-                            correct_value,
+                            "Yes" if is_correct else "No",
                             written_word,
                             format_time(reading_end),
                             format_time(writing_start),
                             format_time(writing_end),
                             len(stroke_starts),
-                            f"{avg_interval:.1f}"
+                            f"{avg_interval:.1f}",
+                            letters_str
                         ]
-
-                        writer.writerow(row + letter_columns + [screenshot_name])
+                        
+                        writer.writerow(row)
                         flat_idx += 1
             
-            if save_screenshots:
-                QMessageBox.information(
-                    self,
-                    "Export Complete",
-                    f"Exported {total_words} words to:\n{csv_output_path}\n\n"
-                    f"Saved {screenshot_count} screenshots to:\n{screenshots_dir}"
-                )
-                print(f"✓ Exported CSV: {csv_output_path}")
-                print(f"✓ Saved screenshots: {screenshots_dir} ({screenshot_count})")
-            else:
-                QMessageBox.information(self, "Export Complete", f"Exported {total_words} words to:\n{csv_output_path}")
-                print(f"✓ Exported CSV: {csv_output_path}")
+            QMessageBox.information(self, "Export Complete", f"Exported {total_words} words to:\n{file_path}")
+            print(f"✓ Exported CSV: {file_path}")
             
         except Exception as e:
             QMessageBox.critical(self, "Export Error", f"Failed to export:\n{str(e)}")
@@ -2130,8 +1708,7 @@ class PenDataPlayer(QMainWindow):
                     pen_events = word_data.get('pen_events', [])
                     
                     # Reorganize pen_events into strokes with downsampling
-                    slice_points = get_stroke_slice_points(word_data)
-                    stroke_starts, stroke_ends = find_stroke_indices(pen_events, slice_points)
+                    stroke_starts, stroke_ends = find_stroke_indices(pen_events)
                     strokes = []
                     total_original = 0
                     total_downsampled = 0
