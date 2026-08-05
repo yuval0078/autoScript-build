@@ -30,6 +30,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           lfs: true
+          fetch-depth: 0
 
       - name: Ensure LFS archive is downloaded
         run: git lfs pull
@@ -44,16 +45,20 @@ jobs:
           import hashlib
           import json
           import shutil
+          import subprocess
           import zipfile
           from pathlib import Path, PurePosixPath
 
           repo = Path.cwd()
+          initial_commit = "183d89876b1a3e1f03a1adf780a6b28f3671f651"
           archive = repo / "portable build" / "TouchpadExperiment_Portable_20260125.zip"
           output = repo / "recovery_output"
           recovered_out = output / "recovered_source"
           current_out = output / "current_source"
-          diff_out = output / "diffs"
-          for directory in (recovered_out, current_out, diff_out):
+          initial_out = output / "initial_source"
+          diff_current = output / "diffs_current_to_portable"
+          diff_initial = output / "diffs_initial_to_portable"
+          for directory in (recovered_out, current_out, initial_out, diff_current, diff_initial):
               directory.mkdir(parents=True, exist_ok=True)
 
           if not archive.is_file():
@@ -63,6 +68,11 @@ jobs:
 
           def sha256_bytes(data: bytes) -> str:
               return hashlib.sha256(data).hexdigest()
+
+          def unified(old: bytes, new: bytes, old_name: str, new_name: str) -> str:
+              old_lines = old.decode("utf-8", errors="replace").splitlines(keepends=True)
+              new_lines = new.decode("utf-8", errors="replace").splitlines(keepends=True)
+              return "".join(difflib.unified_diff(old_lines, new_lines, fromfile=old_name, tofile=new_name))
 
           recovered = {}
           with zipfile.ZipFile(archive) as zf:
@@ -86,27 +96,40 @@ jobs:
               if root_file.is_file():
                   shutil.copy2(root_file, current_out / name)
 
-              recovered_text = recovered_bytes.decode("utf-8", errors="replace").splitlines(keepends=True)
-              current_text = current_bytes.decode("utf-8", errors="replace").splitlines(keepends=True)
-              patch = "".join(difflib.unified_diff(
-                  current_text,
-                  recovered_text,
-                  fromfile=f"current/{name}",
-                  tofile=f"portable/{name}",
-              ))
-              (diff_out / f"{name}.diff").write_text(patch, encoding="utf-8")
+              try:
+                  initial_bytes = subprocess.check_output(
+                      ["git", "show", f"{initial_commit}:{name}"],
+                      cwd=repo,
+                  )
+              except subprocess.CalledProcessError:
+                  initial_bytes = b""
+              if initial_bytes:
+                  (initial_out / name).write_bytes(initial_bytes)
 
-              additions = sum(1 for line in patch.splitlines() if line.startswith("+") and not line.startswith("+++"))
-              deletions = sum(1 for line in patch.splitlines() if line.startswith("-") and not line.startswith("---"))
+              patch_current = unified(current_bytes, recovered_bytes, f"current/{name}", f"portable/{name}")
+              patch_initial = unified(initial_bytes, recovered_bytes, f"initial/{name}", f"portable/{name}")
+              (diff_current / f"{name}.diff").write_text(patch_current, encoding="utf-8")
+              (diff_initial / f"{name}.diff").write_text(patch_initial, encoding="utf-8")
+
+              additions_initial = sum(1 for line in patch_initial.splitlines() if line.startswith("+") and not line.startswith("+++"))
+              deletions_initial = sum(1 for line in patch_initial.splitlines() if line.startswith("-") and not line.startswith("---"))
+              additions_current = sum(1 for line in patch_current.splitlines() if line.startswith("+") and not line.startswith("+++"))
+              deletions_current = sum(1 for line in patch_current.splitlines() if line.startswith("-") and not line.startswith("---"))
+
               summary.append({
                   "name": name,
                   "recovered_size": len(recovered_bytes),
                   "current_size": len(current_bytes),
+                  "initial_size": len(initial_bytes),
                   "recovered_sha256": sha256_bytes(recovered_bytes),
                   "current_sha256": sha256_bytes(current_bytes) if current_bytes else None,
+                  "initial_sha256": sha256_bytes(initial_bytes) if initial_bytes else None,
                   "matches_current": recovered_bytes == current_bytes,
-                  "diff_additions_portable": additions,
-                  "diff_deletions_portable": deletions,
+                  "matches_initial": recovered_bytes == initial_bytes,
+                  "initial_to_portable_additions": additions_initial,
+                  "initial_to_portable_deletions": deletions_initial,
+                  "current_to_portable_additions": additions_current,
+                  "current_to_portable_deletions": deletions_current,
               })
 
           (output / "comparison.json").write_text(
@@ -120,9 +143,10 @@ jobs:
           ]
           for item in summary:
               report.append(
-                  f"{item['name']}: matches_current={item['matches_current']} "
-                  f"portable_additions={item['diff_additions_portable']} "
-                  f"portable_deletions={item['diff_deletions_portable']}"
+                  f"{item['name']}: matches_initial={item['matches_initial']} "
+                  f"initial_to_portable=+{item['initial_to_portable_additions']}/-{item['initial_to_portable_deletions']} "
+                  f"matches_current={item['matches_current']} "
+                  f"current_to_portable=+{item['current_to_portable_additions']}/-{item['current_to_portable_deletions']}"
               )
           (output / "comparison-report.txt").write_text("\n".join(report) + "\n", encoding="utf-8")
           print("\n".join(report))
@@ -131,7 +155,7 @@ jobs:
       - name: Upload compact recovery comparison
         uses: actions/upload-artifact@v4
         with:
-          name: portable-1.0.3-comparison
+          name: portable-1.0.3-three-way
           path: recovery_output
           if-no-files-found: error
           retention-days: 7
