@@ -1,0 +1,128 @@
+name: Inspect portable recovery
+
+on:
+  push:
+    branches:
+      - recovery/inspect-portable-zip
+
+permissions:
+  contents: read
+
+jobs:
+  inspect-portable:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository and LFS objects
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Ensure LFS archive is downloaded
+        run: git lfs pull
+
+      - name: Extract recoverable source files
+        shell: bash
+        run: |
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import shutil
+          import zipfile
+          from pathlib import Path
+
+          repo = Path.cwd()
+          archive = repo / "portable build" / "TouchpadExperiment_Portable_20260125.zip"
+          output = repo / "recovery_output"
+          extracted = output / "extracted"
+          source_out = output / "source"
+          output.mkdir(exist_ok=True)
+          source_out.mkdir(exist_ok=True)
+
+          if not archive.is_file():
+              raise SystemExit(f"Archive not found: {archive}")
+
+          header = archive.read_bytes()[:80]
+          if header.startswith(b"version https://git-lfs.github.com/spec"):
+              raise SystemExit("The ZIP is still an LFS pointer; git lfs pull did not download it")
+
+          with zipfile.ZipFile(archive) as zf:
+              zf.extractall(extracted)
+
+          def sha256(path: Path) -> str:
+              digest = hashlib.sha256()
+              with path.open("rb") as handle:
+                  for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                      digest.update(chunk)
+              return digest.hexdigest()
+
+          recovered = []
+          for path in sorted(extracted.rglob("*.py")):
+              # Recover application source files copied by the PyInstaller spec,
+              # not Python packages bundled under nested dependency folders.
+              if path.parent.name != "_internal":
+                  continue
+              destination = source_out / path.name
+              shutil.copy2(path, destination)
+
+              root_file = repo / path.name
+              record = {
+                  "name": path.name,
+                  "archive_path": str(path.relative_to(extracted)),
+                  "size": path.stat().st_size,
+                  "sha256": sha256(path),
+                  "root_exists": root_file.is_file(),
+                  "matches_root": root_file.is_file() and path.read_bytes() == root_file.read_bytes(),
+              }
+              if root_file.is_file():
+                  record["root_sha256"] = sha256(root_file)
+                  record["root_size"] = root_file.stat().st_size
+              recovered.append(record)
+
+          # Record all top-level files and executables so we know which entry
+          # scripts may only exist inside PyInstaller archives.
+          inventory = []
+          for path in sorted(extracted.rglob("*")):
+              if path.is_file():
+                  inventory.append({
+                      "path": str(path.relative_to(extracted)),
+                      "size": path.stat().st_size,
+                  })
+
+          (output / "recovered-files.json").write_text(
+              json.dumps(recovered, indent=2, ensure_ascii=False),
+              encoding="utf-8",
+          )
+          (output / "archive-inventory.json").write_text(
+              json.dumps(inventory, indent=2, ensure_ascii=False),
+              encoding="utf-8",
+          )
+
+          report_lines = [
+              f"Archive: {archive}",
+              f"Archive size: {archive.stat().st_size}",
+              f"Recovered top-level _internal Python files: {len(recovered)}",
+              "",
+          ]
+          for item in recovered:
+              report_lines.append(
+                  f"{item['name']}: size={item['size']} matches_root={item['matches_root']} "
+                  f"sha256={item['sha256']}"
+              )
+          (output / "recovery-report.txt").write_text(
+              "\n".join(report_lines) + "\n",
+              encoding="utf-8",
+          )
+
+          print("\n".join(report_lines))
+          PY
+
+      - name: Upload recovery material
+        uses: actions/upload-artifact@v4
+        with:
+          name: portable-1.0.3-recovery
+          path: recovery_output
+          if-no-files-found: error
+          retention-days: 7
