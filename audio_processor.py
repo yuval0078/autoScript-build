@@ -7,6 +7,7 @@ Supports: m4a, mp3, wav input -> wav output
 import os
 import sys
 import subprocess
+import hashlib
 import numpy as np
 import json
 import shutil
@@ -14,6 +15,7 @@ import logging
 from pathlib import Path
 
 from app_paths import asset_path, ensure_dir, user_data_dir
+from archive_utils import unique_temp_path
 
 
 class AudioProcessor:
@@ -135,6 +137,44 @@ class AudioProcessor:
             self.log("[PYDUB] Failed to configure pydub paths")
             return
     
+    def _audio_cache_dir(self, bucket):
+        """Return a persistent cache directory for derived playback files."""
+        return ensure_dir(self.data_dir / 'temp' / 'audio_cache' / bucket)
+
+    def _source_cache_key(self, input_file):
+        """Return a stable fingerprint for a source file and its current contents."""
+        input_path = Path(input_file).resolve()
+        stats = input_path.stat()
+        mtime_ns = getattr(stats, 'st_mtime_ns', int(stats.st_mtime * 1_000_000_000))
+        token = f"{input_path}|{stats.st_size}|{mtime_ns}"
+        return hashlib.sha256(token.encode('utf-8')).hexdigest()[:24]
+
+    def get_cached_wav_file(self, input_file):
+        """Convert a source file once and reuse the cached WAV on later playbacks."""
+        input_path = Path(input_file).resolve()
+        if input_path.suffix.lower() == '.wav':
+            return str(input_path)
+
+        cache_key = self._source_cache_key(input_path)
+        output_wav = self._audio_cache_dir('sources') / f"{input_path.stem}_{cache_key}.wav"
+        if output_wav.exists() and output_wav.stat().st_size > 0:
+            self.log(f"[CACHE] Using cached WAV {output_wav.name}")
+            return str(output_wav)
+
+        self.convert_to_wav(str(input_path), str(output_wav))
+        return str(output_wav)
+
+    def get_playback_file(self, input_file, start_ms=None, end_ms=None, context="default"):
+        """Return a reusable local playback file for a full prompt or audio segment."""
+        if start_ms is not None and end_ms is not None:
+            return self.get_temp_segment_file(input_file, start_ms, end_ms, context=context)
+
+        try:
+            return self.get_cached_wav_file(input_file)
+        except Exception as e:
+            self.log(f"[CACHE] Falling back to original file for playback: {e}")
+            return str(Path(input_file).resolve())
+
     def convert_to_wav(self, input_file, output_wav):
         """Convert audio file (m4a/mp3/wav) to wav format"""
         input_path = Path(input_file)
@@ -195,37 +235,34 @@ class AudioProcessor:
             from pydub import AudioSegment
             self.log(f"[SEGMENT] Extracting segment context={context} start={start_ms} end={end_ms} file={input_file}")
 
-            temp_dir = ensure_dir(self.data_dir / 'temp')
+            start_ms = max(0, int(start_ms))
+            end_ms = max(start_ms, int(end_ms))
 
-            # Ensure we have a WAV to work with
-            temp_full_wav = str(temp_dir / f"temp_full_source_{context}.wav")
-            self.convert_to_wav(input_file, temp_full_wav)
-            
+            input_path = Path(input_file).resolve()
+            cache_key = self._source_cache_key(input_path)
+            temp_playback = self._audio_cache_dir('segments') / (
+                f"{input_path.stem}_{cache_key}_{start_ms}_{end_ms}.wav"
+            )
+            if temp_playback.exists() and temp_playback.stat().st_size > 0:
+                self.log(f"[CACHE] Using cached segment {temp_playback.name}")
+                return str(temp_playback)
+
+            temp_full_wav = self.get_cached_wav_file(str(input_path))
             sound = AudioSegment.from_wav(temp_full_wav)
             
             # Handle bounds
-            start_ms = max(0, int(start_ms))
             end_ms = min(len(sound), int(end_ms))
             
             segment = sound[start_ms:end_ms]
-            
-            # Export to context-specific temp file for playback
-            temp_playback = str(temp_dir / f"temp_playback_{context}.wav")
-            segment.export(temp_playback, format="wav")
-            
-            # Cleanup full temp
-            if os.path.exists(temp_full_wav):
-                try:
-                    os.remove(temp_full_wav)
-                except:
-                    pass
-                    
-            return temp_playback
+
+            segment.export(str(temp_playback), format="wav")
+            return str(temp_playback)
             
         except Exception as e:
             self.log(f"Error extracting segment: {e}")
             self.logger.exception("[SEGMENT] Failed to extract temp segment")
             return None
+
 
     def detect_segments(self, input_file, silence_thresh=-30, min_silence_len=200, keep_silence=100, min_word_len=300):
         """
@@ -241,7 +278,7 @@ class AudioProcessor:
         temp_dir = ensure_dir(self.data_dir / 'temp')
         
         # Convert to temp wav if needed (pydub works best with wav)
-        temp_wav = str(temp_dir / f"temp_analysis_{Path(input_file).stem}.wav")
+        temp_wav = str(unique_temp_path(temp_dir, prefix=f"analysis_{Path(input_file).stem}_"))
         self.convert_to_wav(input_file, temp_wav)
         
         try:
@@ -379,7 +416,7 @@ class AudioProcessor:
         temp_dir = ensure_dir(self.data_dir / 'temp')
         
         # Convert to WAV first (pydub works best with wav)
-        temp_wav = str(temp_dir / "temp_audio.wav")
+        temp_wav = str(unique_temp_path(temp_dir, prefix=f"slice_{Path(input_file).stem}_"))
         self.convert_to_wav(input_file, temp_wav)
         
         try:

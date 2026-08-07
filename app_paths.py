@@ -23,6 +23,18 @@ def asset_path(rel: str) -> Path:
     return app_dir() / rel
 
 
+def source_script_path(script_name: str) -> Path:
+    """Return an absolute path to a Python entry script in the source tree.
+
+    This keeps source-mode launches independent of the process working
+    directory. It is intended for root-level entry scripts such as
+    ``tablet_experiment.py`` and ``analyzer_refactored.py``.
+    """
+
+    script_path = app_dir() / script_name
+    return script_path.resolve()
+
+
 def user_data_dir(app_name: str = "TouchpadExperimentManager") -> Path:
     """Return a user-writable directory for outputs and session data."""
 

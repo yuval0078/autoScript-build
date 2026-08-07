@@ -8,7 +8,9 @@ import math
 import os
 import subprocess
 import argparse
+import hashlib
 import winsound
+from pathlib import Path
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QLabel, QPushButton, QMessageBox, QInputDialog)
 from PyQt5.QtCore import Qt, QTimer, QPointF, QEvent
@@ -111,7 +113,308 @@ def load_experiment_config(config_path: str) -> dict:
         config['__file_path__'] = os.path.abspath(config_path)
         print(f"✓ Loaded legacy configuration from {config_path}")
 
+    prepare_experiment_runtime(config)
+
     return config
+
+
+_SESSION_SEED_SUFFIX = ".autoscript_session_seed"
+
+
+def _session_seed_path(config_path: str) -> str:
+    """Return the sidecar path used to persist one session seed per extracted config."""
+    return f"{os.path.abspath(config_path)}{_SESSION_SEED_SUFFIX}"
+
+
+def write_runtime_session_seed(config_path: str, session_seed: str):
+    """Persist a session seed so launcher preloading and runner startup use the same order."""
+    with open(_session_seed_path(config_path), 'w', encoding='utf-8') as handle:
+        handle.write(str(session_seed).strip())
+
+
+def read_runtime_session_seed(config_path: str):
+    """Load a previously stored session seed, if one exists."""
+    try:
+        with open(_session_seed_path(config_path), 'r', encoding='utf-8') as handle:
+            session_seed = handle.read().strip()
+            return session_seed or None
+    except OSError:
+        return None
+
+
+def _make_word_shuffle_rng(config: dict, session_seed=None):
+    """Create a reproducible RNG for one config when a session seed is available."""
+    import random
+
+    if not session_seed:
+        return random.Random()
+
+    seed_source = f"{session_seed}::{config.get('__file_path__', '')}"
+    digest = hashlib.sha256(seed_source.encode('utf-8')).hexdigest()
+    return random.Random(int(digest[:16], 16))
+
+
+def _shuffle_words_with_spacing(word_pool, rng=None):
+    """Shuffle words while ensuring identical prompts are spaced apart."""
+    import random
+    from collections import defaultdict
+
+    rng = rng or random.Random()
+
+    if not word_pool:
+        return []
+
+    word_groups = defaultdict(list)
+    for word_data in word_pool:
+        word_groups[word_data['word']].append(word_data)
+
+    if all(len(group) == 1 for group in word_groups.values()):
+        shuffled = word_pool.copy()
+        rng.shuffle(shuffled)
+        return shuffled
+
+    result = []
+    available_groups = {word: group.copy() for word, group in word_groups.items()}
+
+    while any(available_groups.values()):
+        recent_words = set()
+        lookback = min(5, len(result))
+        if result:
+            recent_words = {result[-i]['word'] for i in range(1, lookback + 1) if i <= len(result)}
+
+        available_now = [
+            word for word, group in available_groups.items()
+            if group and word not in recent_words
+        ]
+        if not available_now:
+            available_now = [word for word, group in available_groups.items() if group]
+        if not available_now:
+            break
+
+        chosen_word = rng.choice(available_now)
+        word_data = available_groups[chosen_word].pop(0)
+        result.append(word_data)
+
+        if not available_groups[chosen_word]:
+            del available_groups[chosen_word]
+
+    return result
+
+
+def _build_word_sequence(config: dict, session_seed=None):
+    """Build the full prompt sequence once so startup and resume reuse the same order."""
+    if not config:
+        return []
+
+    words = []
+    rng = _make_word_shuffle_rng(config, session_seed=session_seed)
+    base_dir = os.path.dirname(config.get('__file_path__', '.'))
+
+    if 'groups' in config and isinstance(config['groups'], list):
+        file_map = {}
+        for f_entry in config.get('files', []):
+            fname = f_entry.get('file_name', '')
+            rel_path = f_entry.get('path', '')
+            abs_path = os.path.join(base_dir, rel_path)
+            if fname:
+                file_map[fname] = abs_path
+            orig = f_entry.get('original_name', '')
+            if orig:
+                file_map[orig] = abs_path
+            file_map[rel_path] = abs_path
+
+        word_lookup = {}
+        for grp in config.get('groups', []):
+            grp_name = grp.get('name', 'Default')
+            for word_entry in grp.get('words', []):
+                src_ref = word_entry.get('source_file')
+                active_file = file_map.get(src_ref)
+                if not active_file and src_ref and os.path.exists(os.path.join(base_dir, 'media', src_ref)):
+                    active_file = os.path.join(base_dir, 'media', src_ref)
+
+                word_lookup[word_entry.get('id')] = {
+                    'id': word_entry.get('id'),
+                    'word': word_entry.get('text', ''),
+                    'group': grp_name,
+                    'file': active_file,
+                    'start_ms': word_entry.get('start_ms'),
+                    'end_ms': word_entry.get('end_ms')
+                }
+
+        order_type = config.get('order', 'random')
+        if order_type == 'stiff':
+            for word_id in config.get('sequence', []):
+                if word_id in word_lookup:
+                    words.append(word_lookup[word_id].copy())
+                else:
+                    print(f"Warning: Sequence ID {word_id} not found in groups.")
+        elif order_type == 'random':
+            repetitions = config.get('repetitions', {})
+            pool = []
+            for grp in config.get('groups', []):
+                grp_name = grp.get('name', 'Default')
+                count = repetitions.get(grp_name, 1)
+                grp_words = []
+                for word_entry in grp.get('words', []):
+                    if word_entry.get('id') in word_lookup:
+                        grp_words.append(word_lookup[word_entry.get('id')])
+                for _ in range(count):
+                    for word_data in grp_words:
+                        pool.append(word_data.copy())
+            words = _shuffle_words_with_spacing(pool, rng=rng)
+    else:
+        words_data = config.get('words', {})
+        audio_dir = os.path.join(base_dir, 'audio')
+        repetitions = config.get('properties', {}).get('repetitions', {})
+        order = config.get('properties', {}).get('order', 'random')
+
+        unique_words = []
+        for group_name, word_list in words_data.items():
+            for word_entry in word_list:
+                file_ref = word_entry.get('file', '')
+                if file_ref.startswith(('http://', 'https://')):
+                    word_file = file_ref
+                elif os.path.isabs(file_ref):
+                    word_file = file_ref
+                else:
+                    word_file = os.path.join(audio_dir, file_ref)
+                unique_words.append({
+                    'file': word_file,
+                    'word': word_entry['word'],
+                    'group': group_name
+                })
+
+        if order == 'random':
+            word_pool = []
+            for word_data in unique_words:
+                repeat_count = repetitions.get(word_data['group'], 1)
+                for _ in range(repeat_count):
+                    word_pool.append(word_data.copy())
+            words = _shuffle_words_with_spacing(word_pool, rng=rng)
+        else:
+            max_repeats = max(repetitions.values()) if repetitions else 1
+            for rep in range(max_repeats):
+                for word_data in unique_words:
+                    group_repeats = repetitions.get(word_data['group'], 1)
+                    if rep < group_repeats:
+                        words.append(word_data.copy())
+
+    return words
+
+
+def _warm_first_prompt_audio(config: dict):
+    """Precompute the first prompt playback file so session start can be immediate."""
+    prepared_words = config.get('__prepared_words__') or []
+    if not prepared_words:
+        return
+
+    first_word = prepared_words[0]
+    source_audio = first_word.get('file')
+    if not isinstance(source_audio, str) or not source_audio:
+        return
+    if source_audio.lower().startswith(('http://', 'https://')):
+        return
+
+    if source_audio.lower().endswith('.m4a'):
+        wav_file = source_audio[:-4] + '.wav'
+        if os.path.exists(wav_file):
+            source_audio = wav_file
+
+    if not os.path.exists(source_audio):
+        return
+
+    prepared_audio_file = os.path.abspath(source_audio)
+    start_ms = first_word.get('start_ms')
+    end_ms = first_word.get('end_ms')
+    needs_processed_playback = (
+        (start_ms is not None and end_ms is not None) or
+        not prepared_audio_file.lower().endswith('.wav')
+    )
+
+    if needs_processed_playback and HAVE_AUDIO_PROCESSOR:
+        try:
+            processor = AudioProcessor(verbose=False)
+            playback_file = processor.get_playback_file(
+                prepared_audio_file,
+                start_ms,
+                end_ms,
+                context='startup'
+            )
+            if playback_file and os.path.exists(playback_file):
+                prepared_audio_file = os.path.abspath(playback_file)
+        except Exception as e:
+            print(f"⚠ Failed to warm first prompt audio: {e}")
+
+    first_word['prepared_audio_file'] = prepared_audio_file
+
+
+def prepare_experiment_runtime(config: dict):
+    """Freeze runtime word order and warm first-prompt audio ahead of calibration."""
+    if not config:
+        return config
+
+    config_path = config.get('__file_path__')
+    session_seed = read_runtime_session_seed(config_path) if config_path else None
+    config['__session_seed__'] = session_seed
+
+    prepared_seed = config.get('__prepared_words_seed__')
+    if config.get('__prepared_words__') is None or prepared_seed != session_seed:
+        config['__prepared_words__'] = _build_word_sequence(config, session_seed=session_seed)
+        config['__prepared_words_seed__'] = session_seed
+        config.pop('__preloaded_first_audio_seed__', None)
+
+    if config.get('__preloaded_first_audio_seed__') != session_seed:
+        _warm_first_prompt_audio(config)
+        config['__preloaded_first_audio_seed__'] = session_seed
+
+    return config
+
+
+def _default_session_layout(index: int = 0) -> dict:
+    """Return the fallback runner layout when no launcher plan is supplied."""
+    return {
+        'start_cell_offset': 0,
+        'same_page_as_previous': False,
+        'recalibrate_before_start': index > 0,
+        'recalibrate_during_page_refresh': False,
+    }
+
+
+def load_session_plan(plan_path: str):
+    """Load the launcher-produced session plan JSON if one was provided."""
+    if not plan_path:
+        return None
+
+    with open(plan_path, 'r', encoding='utf-8') as handle:
+        return json.load(handle)
+
+
+def apply_session_plan(configs, session_plan=None):
+    """Attach per-config page-layout metadata from the launcher session plan."""
+    plan_by_path = {}
+    session_recalibrate_between_pages = bool((session_plan or {}).get('recalibrate_between_pages', False))
+    if session_plan:
+        for entry in session_plan.get('experiments', []):
+            config_path = entry.get('config_path')
+            if config_path:
+                plan_by_path[os.path.abspath(config_path)] = dict(entry)
+
+    for index, config in enumerate(configs):
+        config_path = os.path.abspath(config.get('__file_path__', '')) if config.get('__file_path__') else ''
+        layout = _default_session_layout(index)
+        if config_path in plan_by_path:
+            layout.update({
+                'display_name': plan_by_path[config_path].get('display_name'),
+                'start_cell_offset': int(plan_by_path[config_path].get('start_cell_offset', 0) or 0),
+                'same_page_as_previous': bool(plan_by_path[config_path].get('same_page_as_previous', False)),
+                'recalibrate_before_start': bool(plan_by_path[config_path].get('recalibrate_before_start', False)),
+                'recalibrate_during_page_refresh': bool(plan_by_path[config_path].get('recalibrate_during_page_refresh', False)),
+            })
+
+        config['__session_layout__'] = layout
+        config['__session_recalibrate_between_pages__'] = session_recalibrate_between_pages
+
+    return configs
 
 
 class PenDataRecorder:
@@ -300,6 +603,7 @@ class CalibrationCanvas(QWidget):
         self.pen_x = 0
         self.pen_y = 0
         self.pen_touching = False
+        self.tablet_press_active = False
         self.touch_start_time = None
         self.touch_recorded = False  # Track if current touch already recorded
         
@@ -346,27 +650,35 @@ class CalibrationCanvas(QWidget):
         if event_type == QTabletEvent.TabletPress:
             # Pen touched - start timing
             self.pen_touching = True
+            self.tablet_press_active = True
             self.touch_start_time = time.time()
             self.touch_recorded = False
             print(f"  Press detected at ({self.pen_x:.1f}, {self.pen_y:.1f})")
             
         elif event_type == QTabletEvent.TabletMove:
-            if pressure > 0.01:
+            # A calibration touch must begin with a new TabletPress delivered to
+            # this canvas.  When a later calibration window receives focus, some
+            # tablet drivers continue sending pressured move events from the
+            # previous experiment.  Treating those moves as a new press records a
+            # phantom first corner and makes an otherwise valid rectangle fail.
+            if self.tablet_press_active and pressure > 0.01:
                 self.pen_touching = True
-                if not self.touch_start_time:
-                    self.touch_start_time = time.time()
-                    self.touch_recorded = False
-                
+
                 # Check if we've held long enough (check during move)
                 self._record_touch_if_ready()
-            else:
+            elif pressure <= 0.01:
                 self.pen_touching = False
+                self.tablet_press_active = False
+                self.touch_start_time = None
+                self.touch_recorded = False
                 
         elif event_type == QTabletEvent.TabletRelease:
-            self._record_touch_if_ready()
+            if self.tablet_press_active:
+                self._record_touch_if_ready()
             # Pen released - just reset state
             print(f"  Release detected")
             self.pen_touching = False
+            self.tablet_press_active = False
             self.touch_start_time = None
             self.touch_recorded = False
         
@@ -505,7 +817,10 @@ class CalibrationCanvas(QWidget):
         """Reset calibration and start over"""
         self.calibration_points = []
         self.current_step = 0
+        self.pen_touching = False
+        self.tablet_press_active = False
         self.touch_start_time = None
+        self.touch_recorded = False
         self.update()
 
 
@@ -513,13 +828,15 @@ class CalibrationWindow(QMainWindow):
     """Main calibration window"""
     
     def __init__(self, config=None, session_configs=None, session_config_index=0,
-                 session_results=None, test_mode=False):
+                 session_results=None, test_mode=False,
+                 show_start_screen_after_calibration=True):
         super().__init__()
         self.session_configs = list(session_configs) if session_configs else ([config] if config else [])
         self.session_config_index = session_config_index
         self.session_results = session_results if session_results is not None else []
         self.config = config or (self.session_configs[0] if self.session_configs else None)
         self.test_mode = test_mode
+        self.show_start_screen_after_calibration = show_start_screen_after_calibration
         self.resume_experiment_data = None  # For recalibration resume
         self.pending_participant_number = None
         self.pending_participant_age = None
@@ -680,7 +997,10 @@ class CalibrationWindow(QMainWindow):
     def prepare_experiment_start(self):
         """Collect required data, then open the experiment stage."""
         
-        if not (hasattr(self, 'resume_experiment_data') and self.resume_experiment_data):
+        if (
+            not (hasattr(self, 'resume_experiment_data') and self.resume_experiment_data)
+            and self.pending_participant_number is None
+        ):
             participant_number, ok = QInputDialog.getInt(
                 self,
                 'Participant Number',
@@ -739,13 +1059,17 @@ class CalibrationWindow(QMainWindow):
                 resume_data['age'],
                 resume_data['gender'],
                 auto_start=False,
+                show_start_screen=False,
                 session_configs=self.session_configs,
                 session_config_index=self.session_config_index,
                 session_results=self.session_results,
-                test_mode=self.test_mode
+                test_mode=self.test_mode,
+                start_cell_offset=resume_data.get('start_cell_offset', 0),
+                initial_page_number=resume_data.get('page_number', 1)
             )
             # Restore experiment state
             self.experiment_window.canvas.current_cell = resume_data['current_cell']
+            self.experiment_window.canvas.start_cell_offset = resume_data.get('start_cell_offset', 0)
             self.experiment_window.canvas.pen_recorder = resume_data['pen_recorder']
             self.experiment_window.canvas.all_data = resume_data['all_data']
             self.experiment_window.canvas.page_number = resume_data['page_number']
@@ -780,6 +1104,7 @@ class CalibrationWindow(QMainWindow):
             self.config,
             age,
             gender,
+            show_start_screen=self.show_start_screen_after_calibration,
             session_configs=self.session_configs,
             session_config_index=self.session_config_index,
             session_results=self.session_results,
@@ -792,7 +1117,8 @@ class ExperimentCanvas(QWidget):
     """Canvas for the main experiment with configurable grid"""
     
     def __init__(self, calibration_data, participant_number, config=None, age=None, gender=None,
-                 parent=None, session_index=0, session_total=1, test_mode=False):
+                 parent=None, session_index=0, session_total=1, test_mode=False,
+                 start_cell_offset=0, initial_page_number=1):
         super().__init__(parent)
         self.calibration_data = calibration_data
         self.participant_number = participant_number
@@ -803,6 +1129,9 @@ class ExperimentCanvas(QWidget):
         self.session_index = session_index
         self.session_total = session_total
         self.current_cell = 0
+        self.session_layout = (self.config or {}).get('__session_layout__', {}) if self.config else {}
+        self.start_cell_offset = max(0, int(self.session_layout.get('start_cell_offset', start_cell_offset) or 0))
+        self.recalibrate_during_page_refresh = bool(self.session_layout.get('recalibrate_during_page_refresh', False))
         
         # Default settings
         self.grid_rows = 5
@@ -864,7 +1193,7 @@ class ExperimentCanvas(QWidget):
         self.start_gate_after_key_definition = False
         
         # Pagination state
-        self.page_number = 1
+        self.page_number = max(1, int(initial_page_number or 1))
         self.is_paused_for_refresh = False
         
         # Timing data for current word
@@ -914,6 +1243,7 @@ class ExperimentCanvas(QWidget):
         self.setAttribute(Qt.WA_TabletTracking, True)
         self.setFocusPolicy(Qt.StrongFocus)
         self.setMouseTracking(True)
+        self._ensure_audio_backend_ready()
         
     def load_words(self):
         """Load words from all supported config formats."""
@@ -921,8 +1251,6 @@ class ExperimentCanvas(QWidget):
         if not self.config:
             print("✗ No experiment configuration provided.")
             return
-
-        base_dir = os.path.dirname(self.config.get('__file_path__', '.'))
 
         # --- A. DETECT NEW JSON FORMAT ---
         if 'groups' in self.config and isinstance(self.config['groups'], list):
@@ -943,131 +1271,15 @@ class ExperimentCanvas(QWidget):
             self.beep_before_delay = beeps.get('before', {}).get('delay_ms', 100)
             self.beep_after = beeps.get('after', {}).get('enabled', False)
             self.beep_after_delay = beeps.get('after', {}).get('delay_ms', 100)
-            
-            # 1. Build File Map
-            # Map "file_name" or "original_name" or just path -> Absolute Path
-            file_map = {} # filename -> abs_path
-            for f_entry in self.config.get('files', []):
-                fname = f_entry.get('file_name', '')
-                rel_path = f_entry.get('path', '')
-                abs_path = os.path.join(base_dir, rel_path)
-                if fname:
-                    file_map[fname] = abs_path
-                # Fallback mapping
-                orig = f_entry.get('original_name', '')
-                if orig: 
-                     file_map[orig] = abs_path
-                file_map[rel_path] = abs_path
 
-            # 2. Build Word Lookup Map (ID -> Object)
-            word_lookup = {}
-            for grp in self.config.get('groups', []):
-                grp_name = grp.get('name', 'Default')
-                for w in grp.get('words', []):
-                    # Resolve audio file
-                    src_ref = w.get('source_file')
-                    active_file = file_map.get(src_ref)
-                    if not active_file and src_ref and os.path.exists(os.path.join(base_dir, 'media', src_ref)):
-                        active_file = os.path.join(base_dir, 'media', src_ref)
+        session_seed = self.config.get('__session_seed__')
+        prepared_words = self.config.get('__prepared_words__')
+        if prepared_words is None or self.config.get('__prepared_words_seed__') != session_seed:
+            prepared_words = _build_word_sequence(self.config, session_seed=session_seed)
+            self.config['__prepared_words__'] = [word.copy() for word in prepared_words]
+            self.config['__prepared_words_seed__'] = session_seed
 
-                    w_obj = {
-                        'id': w.get('id'),
-                        'word': w.get('text', ''),
-                        'group': grp_name,
-                        'file': active_file,
-                        'start_ms': w.get('start_ms'),
-                        'end_ms': w.get('end_ms')
-                    }
-                    word_lookup[w.get('id')] = w_obj
-
-            # 3. Determine Execution Sequence
-            order_type = self.config.get('order', 'random')
-            
-            if order_type == 'stiff':
-                # Use explicit sequence of IDs
-                seq_ids = self.config.get('sequence', [])
-                for wid in seq_ids:
-                    if wid in word_lookup:
-                        self.words.append(word_lookup[wid].copy())
-                    else:
-                        print(f"Warning: Sequence ID {wid} not found in groups.")
-
-            elif order_type == 'random':
-                # Use Groups + Repetitions
-                repetitions = self.config.get('repetitions', {})
-                pool = []
-                
-                # Iterate groups to find words
-                for grp in self.config.get('groups', []):
-                    grp_name = grp.get('name', 'Default')
-                    count = repetitions.get(grp_name, 1)
-                    
-                    grp_words = []
-                    for w in grp.get('words', []):
-                         if w.get('id') in word_lookup:
-                             grp_words.append(word_lookup[w.get('id')])
-                    
-                    # Add this group's words 'count' times
-                    for _ in range(count):
-                        for w_obj in grp_words:
-                            pool.append(w_obj.copy())
-                            
-                # Shuffle with spacing
-                self.words = self._shuffle_with_spacing(pool)
-
-
-        # --- B. LEGACY FORMAT FALLBACK ---
-        else:
-            # Load from config object
-            words_data = self.config.get('words', {})
-            audio_dir = os.path.join(base_dir, 'audio')
-            repetitions = self.config.get('properties', {}).get('repetitions', {})
-            order = self.config.get('properties', {}).get('order', 'random')
-            
-            # First, load all unique words
-            unique_words = []
-            for group_name, word_list in words_data.items():
-                for word_entry in word_list:
-                    # Resolve audio reference: URL, absolute, or relative to extracted audio dir
-                    file_ref = word_entry.get('file', '')
-                    if file_ref.startswith(('http://', 'https://')):
-                        word_file = file_ref
-                    elif os.path.isabs(file_ref):
-                        word_file = file_ref
-                    else:
-                        word_file = os.path.join(audio_dir, file_ref)
-                    unique_words.append({
-                        'file': word_file,
-                        'word': word_entry['word'],
-                        'group': group_name
-                    })
-                
-            # Handle repetitions
-            if order == 'random':
-                # Random order: repeat each word X times based on group, then shuffle with spacing
-                word_pool = []
-                for word_data in unique_words:
-                    group_name = word_data['group']
-                    repeat_count = repetitions.get(group_name, 1)
-                    # Add this word multiple times
-                    for rep in range(repeat_count):
-                        word_pool.append(word_data.copy())
-
-                # Shuffle with spacing constraint: same words should be spaced apart
-                self.words = self._shuffle_with_spacing(word_pool)
-
-            else:
-                # Ordinal order: play all groups in order, then repeat entire sequence
-                # Use maximum repetition count
-                max_repeats = max(repetitions.values()) if repetitions else 1
-
-                for rep in range(max_repeats):
-                    for word_data in unique_words:
-                        group_name = word_data['group']
-                        group_repeats = repetitions.get(group_name, 1)
-                        # Only add if this repetition is within the group's repeat count
-                        if rep < group_repeats:
-                            self.words.append(word_data.copy())
+        self.words = [word.copy() for word in (prepared_words or [])]
             
         # Common Finalization
         self.grid_size = self.grid_rows # For compatibility with some methods, though we should use rows/cols
@@ -1081,55 +1293,58 @@ class ExperimentCanvas(QWidget):
         Shuffle words while ensuring same words are spaced apart.
         Uses a greedy algorithm to maximize spacing between identical words.
         """
-        import random
-        from collections import defaultdict
-        
-        if not word_pool:
-            return []
-        
-        # Group words by their text
-        word_groups = defaultdict(list)
-        for word_data in word_pool:
-            word_groups[word_data['word']].append(word_data)
-        
-        # If all words are unique, just shuffle
-        if all(len(group) == 1 for group in word_groups.values()):
-            shuffled = word_pool.copy()
-            random.shuffle(shuffled)
-            return shuffled
-        
-        # Build result list by picking words that maximize spacing
-        result = []
-        available_groups = {word: group.copy() for word, group in word_groups.items()}
-        
-        while any(available_groups.values()):
-            # Find which words are available (not recently used)
-            recent_words = set()
-            lookback = min(5, len(result))  # Look back at last 5 words
-            if result:
-                recent_words = {result[-i]['word'] for i in range(1, lookback + 1) if i <= len(result)}
-            
-            # Get words that haven't been used recently
-            available_now = [word for word, group in available_groups.items() 
-                           if group and word not in recent_words]
-            
-            # If no words available (all were recent), allow any remaining word
-            if not available_now:
-                available_now = [word for word, group in available_groups.items() if group]
-            
-            if not available_now:
-                break
-            
-            # Randomly pick from available words
-            chosen_word = random.choice(available_now)
-            word_data = available_groups[chosen_word].pop(0)
-            result.append(word_data)
-            
-            # Remove empty groups
-            if not available_groups[chosen_word]:
-                del available_groups[chosen_word]
-        
-        return result
+        return _shuffle_words_with_spacing(word_pool)
+
+    def _current_experiment_display_name(self):
+        """Return the current experiment file label shown in the session banner."""
+        display_name = self.session_layout.get('display_name') if self.session_layout else None
+        if display_name:
+            return str(display_name)
+
+        if self.config and self.config.get('__file_path__'):
+            return Path(self.config['__file_path__']).stem
+
+        return self.exp_name or 'experiment'
+
+    def _current_word_progress_text(self):
+        """Return the 1-based word progress for the current experiment."""
+        total_words = len(self.words)
+        if total_words <= 0:
+            return '0/0'
+
+        word_number = min(max(self.current_cell, 0), total_words - 1) + 1
+        return f"{word_number}/{total_words}"
+
+    def _current_session_experiment_text(self):
+        """Return the current experiment index within the session."""
+        return f"{self.session_index + 1}/{self.session_total}"
+
+    def _current_heading_prefix(self):
+        """Return the shared heading prefix for the current experiment state."""
+        return (
+            f"{self._current_experiment_display_name()} "
+            f"({self._current_session_experiment_text()}) - "
+            f"Word {self._current_word_progress_text()}"
+        )
+
+    def _absolute_cell_index(self, word_index=None):
+        """Return the absolute cell position for a word index within this experiment."""
+        if word_index is None:
+            word_index = self.current_cell
+        return self.start_cell_offset + word_index
+
+    def _current_page_cell_index(self, word_index=None):
+        """Return the visible cell index on the current page."""
+        return self._absolute_cell_index(word_index) % self.total_cells
+
+    def _is_page_boundary_after_index(self, word_index=None):
+        """Return True when a word index begins a fresh physical page."""
+        absolute_index = self._absolute_cell_index(word_index)
+        return absolute_index > 0 and absolute_index % self.total_cells == 0
+
+    def _should_recalibrate_for_page_refresh(self):
+        """Return True when the session plan requires a fresh calibration on page turns."""
+        return self.recalibrate_during_page_refresh
     
     def _is_time_mode(self):
         """Return True when prompts advance by timer instead of a participant key."""
@@ -1137,7 +1352,7 @@ class ExperimentCanvas(QWidget):
     
     def _get_page_start(self):
         """Return the global word index of the first cell on the visible page."""
-        return (self.current_cell // self.total_cells) * self.total_cells
+        return (self._absolute_cell_index() // self.total_cells) * self.total_cells
     
     def _ensure_time_mode_page_records(self):
         """Create one active word record per visible cell for time-advance mode."""
@@ -1156,13 +1371,16 @@ class ExperimentCanvas(QWidget):
         self.time_mode_strokes_by_cell = {}
         self.current_stroke_cell = None
         
-        page_end = min(page_start + self.total_cells, len(self.words))
-        for global_idx in range(page_start, page_end):
-            word_data = self.words[global_idx]
-            local_cell = global_idx % self.total_cells
+        page_end = page_start + self.total_cells
+        for global_idx, word_data in enumerate(self.words):
+            absolute_idx = self._absolute_cell_index(global_idx)
+            if absolute_idx < page_start or absolute_idx >= page_end:
+                continue
+
+            local_cell = absolute_idx % self.total_cells
             self.time_mode_word_records[local_cell] = self.pen_recorder.create_word_record({
                 'word': word_data['word'],
-                'cell': global_idx,
+                'cell': absolute_idx,
                 'group': word_data.get('group', 'unknown')
             })
             self.time_mode_strokes_by_cell[local_cell] = []
@@ -1179,7 +1397,7 @@ class ExperimentCanvas(QWidget):
         """Return the word record for the currently playing prompt."""
         if not self._is_time_mode():
             return None
-        return self._time_mode_record_for_cell(self.current_cell % self.total_cells)
+        return self._time_mode_record_for_cell(self._current_page_cell_index())
     
     def _finalize_time_mode_page(self):
         """Finish every word record on the active time-mode page."""
@@ -1225,7 +1443,7 @@ class ExperimentCanvas(QWidget):
         self.update()
     
     def begin_after_start_screen(self):
-        """Start playback after the requested 1000 ms post-Space pause."""
+        """Start playback as soon as the initial Space gate is cleared."""
         self.waiting_for_experiment_start = False
         self.starting_experiment_after_space = False
         
@@ -1235,6 +1453,15 @@ class ExperimentCanvas(QWidget):
         
         self.play_current_word()
         self.update()
+
+    def _ensure_audio_backend_ready(self):
+        """Initialize pygame's mixer before the user reaches the first start prompt."""
+        try:
+            import pygame
+            if not pygame.mixer.get_init():
+                pygame.mixer.init(frequency=44100, size=-16, channels=2, buffer=512)
+        except Exception:
+            pass
     
     def _audio_is_playing(self):
         """Return True while pygame is still playing the current prompt."""
@@ -1390,14 +1617,18 @@ class ExperimentCanvas(QWidget):
             # Start pen data recording for this word
             self.pen_recorder.start_word({
                 'word': word_data['word'],
-                'cell': self.current_cell,
+                'cell': self._absolute_cell_index(),
                 'group': word_data['group']
             })
             
             # Mark audio start time
             self.pen_recorder.set_audio_start()
         
-        audio_file = self._prepare_audio_file(word_data.get('file'))
+        prepared_audio_file = word_data.get('prepared_audio_file')
+        if prepared_audio_file and not os.path.exists(prepared_audio_file):
+            prepared_audio_file = None
+
+        audio_file = prepared_audio_file or self._prepare_audio_file(word_data.get('file'))
         if not audio_file:
             return
         abs_audio_file = audio_file
@@ -1413,15 +1644,20 @@ class ExperimentCanvas(QWidget):
             start_ms = word_data.get('start_ms')
             end_ms = word_data.get('end_ms')
             
-            if start_ms is not None and end_ms is not None and self.processor:
-                # Use AudioProcessor to create a temp file for this segment
-                # This works for both WAV and M4A source files
+            if prepared_audio_file:
+                pygame.mixer.music.load(prepared_audio_file)
+                pygame.mixer.music.play()
+                if start_ms is not None and end_ms is not None:
+                    print(f"♪ Playing segment {self.current_cell + 1}: '{word_data['word']}' ({start_ms}-{end_ms}ms)")
+                else:
+                    print(f"♪ Playing full file {self.current_cell + 1}: '{word_data['word']}'")
+            elif start_ms is not None and end_ms is not None and self.processor:
                 segment_context = f"exp_playback_{self.current_cell}_{int(start_ms)}_{int(end_ms)}"
-                temp_file = self.processor.get_temp_segment_file(
+                playback_file = self.processor.get_playback_file(
                     abs_audio_file, start_ms, end_ms, context=segment_context
                 )
-                if temp_file:
-                    pygame.mixer.music.load(temp_file)
+                if playback_file:
+                    pygame.mixer.music.load(playback_file)
                     pygame.mixer.music.play()
                     print(f"♪ Playing segment {self.current_cell + 1}: '{word_data['word']}' ({start_ms}-{end_ms}ms)")
                 else:
@@ -1463,7 +1699,7 @@ class ExperimentCanvas(QWidget):
                 self.wait_for_save_spacebar()
                 return
             
-            if self.current_cell > 0 and self.current_cell % self.total_cells == 0:
+            if self._is_page_boundary_after_index(self.current_cell):
                 if self.is_drawing:
                     self.pending_time_mode_page_refresh = True
                     return
@@ -1491,7 +1727,7 @@ class ExperimentCanvas(QWidget):
         # Save current cell data with timing information
         if self.current_strokes or self.current_cell < len(self.words):
             cell_data = {
-                'cell': self.current_cell,
+                'cell': self._absolute_cell_index(),
                 'word': self.words[self.current_cell]['word'] if self.current_cell < len(self.words) else '',
                 'strokes': self.current_strokes,
                 'reading_start_time': self.current_word_data['reading_start'],
@@ -1514,7 +1750,7 @@ class ExperimentCanvas(QWidget):
             return
             
         # Check for page refresh (if grid is full)
-        if self.current_cell > 0 and self.current_cell % self.total_cells == 0:
+        if self._is_page_boundary_after_index(self.current_cell):
             print("⚠ Page full - pausing for refresh")
             self.is_paused_for_refresh = True
             self.update()
@@ -1875,7 +2111,7 @@ class ExperimentCanvas(QWidget):
             self._handle_time_mode_pointer_event(pointer_event, virtual_x, virtual_y, pressure, timestamp, cell)
             return
 
-        if cell == -1 or cell != (self.current_cell % self.total_cells):
+        if cell == -1 or cell != self._current_page_cell_index():
             return
 
         if pointer_event == 'press':
@@ -1989,7 +2225,7 @@ class ExperimentCanvas(QWidget):
                 self.waiting_for_experiment_start = False
                 self.starting_experiment_after_space = True
                 self.update()
-                QTimer.singleShot(1000, self.begin_after_start_screen)
+                QTimer.singleShot(0, self.begin_after_start_screen)
             elif event.key() == Qt.Key_Escape:
                 self.finish_experiment()
             event.accept()
@@ -2055,11 +2291,15 @@ class ExperimentCanvas(QWidget):
         # Handle resume from pause
         if getattr(self, 'is_paused_for_refresh', False):
             if event.key() == Qt.Key_Space:
-                print("✓ Resuming experiment after refresh")
-                self.is_paused_for_refresh = False
-                self.page_number += 1
-                self.play_current_word()
-                self.update()
+                if self._should_recalibrate_for_page_refresh():
+                    print("✓ Re-calibrating before the next page")
+                    self.request_page_refresh_recalibration()
+                else:
+                    print("✓ Resuming experiment after refresh")
+                    self.is_paused_for_refresh = False
+                    self.page_number += 1
+                    self.play_current_word()
+                    self.update()
             return
 
         if self.proceed_mode == 'key' and event.key() == self.proceed_key:
@@ -2098,6 +2338,13 @@ class ExperimentCanvas(QWidget):
         parent = self.parent()
         if parent and hasattr(parent, 'start_recalibration'):
             parent.start_recalibration()
+
+    def request_page_refresh_recalibration(self):
+        """Request a recalibration that advances to a fresh page before resuming."""
+        self.is_paused_for_refresh = False
+        parent = self.parent()
+        if parent and hasattr(parent, 'start_recalibration'):
+            parent.start_recalibration(page_advance=True)
     
     def paintEvent(self, event):
         """Draw the quadrilateral and current strokes"""
@@ -2175,7 +2422,10 @@ class ExperimentCanvas(QWidget):
             painter.fillRect(self.rect(), QColor(255, 255, 255, 230))
             painter.setPen(QPen(Qt.red, 1))
             painter.setFont(QFont('Arial', 24, QFont.Bold))
-            painter.drawText(self.rect(), Qt.AlignCenter, "Please refresh paper\nand press SPACE to continue")
+            pause_text = "Please refresh paper\nand press SPACE to continue"
+            if self._should_recalibrate_for_page_refresh():
+                pause_text = "Please refresh paper\nand press SPACE to recalibrate"
+            painter.drawText(self.rect(), Qt.AlignCenter, pause_text)
             return
         
         # Draw instructions at top
@@ -2183,25 +2433,34 @@ class ExperimentCanvas(QWidget):
         painter.setFont(QFont('Arial', 14, QFont.Bold))
         
         if self.waiting_for_next_experiment_spacebar or self.waiting_for_save_spacebar:
+            heading_prefix = self._current_heading_prefix()
             if self._audio_is_playing():
-                text = "Finish writing - waiting for audio to finish"
+                text = f"{heading_prefix} - Finish writing - waiting for audio to finish"
             elif self.waiting_for_next_experiment_spacebar:
-                text = "Finish writing - press SPACE for next experiment"
+                text = f"{heading_prefix} - Finish writing - press SPACE for next experiment"
             else:
-                text = "Finish writing - press SPACE to save data"
+                text = f"{heading_prefix} - Finish writing - press SPACE to save data"
         elif self.current_cell < len(self.words):
             word = self.words[self.current_cell]['word']
+            cell_number = self._current_page_cell_index() + 1
+            heading_prefix = self._current_heading_prefix()
             key_name = "SPACE"
             if self.proceed_mode == 'key':
                 if self.proceed_key == Qt.Key_Space: key_name = "SPACE"
                 elif self.proceed_key == Qt.Key_Return: key_name = "ENTER"
                 elif self.proceed_key == Qt.Key_Right: key_name = "RIGHT ARROW"
                 elif self.proceed_key == Qt.Key_Down: key_name = "DOWN ARROW"
-                text = f"Cell {self.current_cell + 1}/{self.total_cells} - Write: '{word}' - Press {key_name} for next"
+                text = (
+                    f"{heading_prefix} - Cell {cell_number}/{self.total_cells} - "
+                    f"Write: '{word}' - Press {key_name} for next"
+                )
             else:
-                text = f"Cell {self.current_cell + 1}/{self.total_cells} - Write: '{word}' - Auto-advance enabled"
+                text = (
+                    f"{heading_prefix} - Cell {cell_number}/{self.total_cells} - "
+                    f"Write: '{word}' - Auto-advance enabled"
+                )
         else:
-            text = "Experiment Complete!"
+            text = f"{self._current_heading_prefix()} - Experiment Complete!"
         
         painter.drawText(self.rect(), Qt.AlignTop | Qt.AlignHCenter, text)
 
@@ -2221,7 +2480,9 @@ class ExperimentWindow(QMainWindow):
         session_configs=None,
         session_config_index=0,
         session_results=None,
-        test_mode=False
+        test_mode=False,
+        start_cell_offset=0,
+        initial_page_number=1
     ):
         super().__init__()
         self.calibration_data = calibration_data
@@ -2234,6 +2495,9 @@ class ExperimentWindow(QMainWindow):
         self.session_results = list(session_results) if session_results else []
         self.test_mode = test_mode
         self.next_window = None
+        layout = (self.config or {}).get('__session_layout__', {}) if self.config else {}
+        self.start_cell_offset = int(layout.get('start_cell_offset', start_cell_offset) or 0)
+        self.initial_page_number = max(1, int(initial_page_number or 1))
         
         title = "Tablet Experiment - Experiment Stage (Test Mode)" if self.test_mode else "Tablet Experiment - Experiment Stage"
         self.setWindowTitle(title)
@@ -2253,7 +2517,9 @@ class ExperimentWindow(QMainWindow):
             parent=self,
             session_index=session_config_index,
             session_total=max(1, len(self.session_configs)),
-            test_mode=self.test_mode
+            test_mode=self.test_mode,
+            start_cell_offset=self.start_cell_offset,
+            initial_page_number=self.initial_page_number
         )
         self.setCentralWidget(self.canvas)
         
@@ -2266,7 +2532,11 @@ class ExperimentWindow(QMainWindow):
             elif not self.canvas.waiting_for_proceed_key:
                 self.canvas.play_current_word()
 
-    def start_recalibration(self):
+    def _session_recalibration_enabled(self):
+        """Return True when the active session requests recalibration on every new page."""
+        return bool((self.config or {}).get('__session_recalibrate_between_pages__', False))
+
+    def start_recalibration(self, page_advance=False):
         """Start recalibration process"""
         print("⟲ Starting recalibration...")
         self.hide()
@@ -2285,9 +2555,10 @@ class ExperimentWindow(QMainWindow):
             'age': self.participant_age,
             'gender': self.participant_gender,
             'current_cell': self.canvas.current_cell,
+            'start_cell_offset': self.canvas.start_cell_offset,
             'pen_recorder': self.canvas.pen_recorder,
             'all_data': self.canvas.all_data,
-            'page_number': self.canvas.page_number,
+            'page_number': self.canvas.page_number + (1 if page_advance else 0),
             'time_mode_page_start': self.canvas.time_mode_page_start,
             'time_mode_word_records': self.canvas.time_mode_word_records,
             'time_mode_strokes_by_cell': self.canvas.time_mode_strokes_by_cell,
@@ -2311,18 +2582,43 @@ class ExperimentWindow(QMainWindow):
         next_results.append(current_data)
         
         next_config = self.session_configs[next_index]
-        # Force a fresh calibration before each experiment in multi-config sessions.
-        self.next_window = CalibrationWindow(
+        next_layout = next_config.get('__session_layout__', {}) if next_config else {}
+        same_page_as_previous = bool(next_layout.get('same_page_as_previous', False))
+        recalibrate_before_start = bool(next_layout.get('recalibrate_before_start', False))
+        if not recalibrate_before_start and not same_page_as_previous:
+            recalibrate_before_start = bool(next_config.get('__session_recalibrate_between_pages__', False))
+        next_page_number = self.canvas.page_number if same_page_as_previous else self.canvas.page_number + 1
+
+        if recalibrate_before_start:
+            self.next_window = CalibrationWindow(
+                next_config,
+                session_configs=self.session_configs,
+                session_config_index=next_index,
+                session_results=next_results,
+                test_mode=self.test_mode,
+                show_start_screen_after_calibration=False
+            )
+            self.next_window.pending_participant_number = self.participant_number
+            self.next_window.pending_participant_age = self.participant_age
+            self.next_window.pending_participant_gender = self.participant_gender
+            self.next_window.show()
+            self.hide()
+            return
+
+        self.next_window = ExperimentWindow(
+            self.calibration_data,
+            self.participant_number,
             next_config,
+            self.participant_age,
+            self.participant_gender,
+            show_start_screen=False,
             session_configs=self.session_configs,
             session_config_index=next_index,
             session_results=next_results,
-            test_mode=self.test_mode
+            test_mode=self.test_mode,
+            start_cell_offset=next_layout.get('start_cell_offset', 0),
+            initial_page_number=next_page_number
         )
-        # Keep participant identity consistent across sequential experiments.
-        self.next_window.pending_participant_number = self.participant_number
-        self.next_window.pending_participant_age = self.participant_age
-        self.next_window.pending_participant_gender = self.participant_gender
         self.next_window.show()
         self.hide()
     
@@ -2356,6 +2652,10 @@ def main():
         help="Use mouse input instead of pen/tablet input for calibration and drawing."
     )
     parser.add_argument(
+        "--session-plan",
+        help="Path to the launcher-generated session page layout plan."
+    )
+    parser.add_argument(
         "config_paths",
         nargs="+",
         help="Path(s) to experiment configuration JSON files from exported experiment ZIPs"
@@ -2367,6 +2667,13 @@ def main():
     except Exception as e:
         print(f"✗ Failed to load config: {e}")
         sys.exit(2)
+
+    try:
+        session_plan = load_session_plan(args.session_plan) if args.session_plan else None
+        apply_session_plan(configs, session_plan)
+    except Exception as e:
+        print(f"⚠ Failed to load session plan: {e}")
+        apply_session_plan(configs, None)
     
     from qt_bootstrap import ensure_qt_platform_plugin_path
     ensure_qt_platform_plugin_path()

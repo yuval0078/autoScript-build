@@ -26,7 +26,7 @@ These are only needed on the machine where you BUILD the package:
    - Create a portable ZIP file
 
 4. **Find your package:**
-   - Look for `TouchpadExperiment_Portable_YYYYMMDD.zip` in the project folder
+   - Look for `TouchpadExperiment-v1.0.3.1-portable.zip` in the project folder
    - This ZIP contains everything needed to run on any PC!
 
 ## What Gets Packaged
@@ -110,7 +110,7 @@ The project uses these packages (bundled automatically):
 ## File Structure After Build
 
 ```
-TouchpadExperiment_Portable.zip
+TouchpadExperiment-v1.0.3.1-portable.zip
 └── TouchpadExperiment/
     ├── TouchpadExperiment.exe        # Main executable
     ├── _internal/                     # Bundled dependencies
