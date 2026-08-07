@@ -603,6 +603,7 @@ class CalibrationCanvas(QWidget):
         self.pen_x = 0
         self.pen_y = 0
         self.pen_touching = False
+        self.tablet_press_active = False
         self.touch_start_time = None
         self.touch_recorded = False  # Track if current touch already recorded
         
@@ -649,27 +650,35 @@ class CalibrationCanvas(QWidget):
         if event_type == QTabletEvent.TabletPress:
             # Pen touched - start timing
             self.pen_touching = True
+            self.tablet_press_active = True
             self.touch_start_time = time.time()
             self.touch_recorded = False
             print(f"  Press detected at ({self.pen_x:.1f}, {self.pen_y:.1f})")
             
         elif event_type == QTabletEvent.TabletMove:
-            if pressure > 0.01:
+            # A calibration touch must begin with a new TabletPress delivered to
+            # this canvas.  When a later calibration window receives focus, some
+            # tablet drivers continue sending pressured move events from the
+            # previous experiment.  Treating those moves as a new press records a
+            # phantom first corner and makes an otherwise valid rectangle fail.
+            if self.tablet_press_active and pressure > 0.01:
                 self.pen_touching = True
-                if not self.touch_start_time:
-                    self.touch_start_time = time.time()
-                    self.touch_recorded = False
-                
+
                 # Check if we've held long enough (check during move)
                 self._record_touch_if_ready()
-            else:
+            elif pressure <= 0.01:
                 self.pen_touching = False
+                self.tablet_press_active = False
+                self.touch_start_time = None
+                self.touch_recorded = False
                 
         elif event_type == QTabletEvent.TabletRelease:
-            self._record_touch_if_ready()
+            if self.tablet_press_active:
+                self._record_touch_if_ready()
             # Pen released - just reset state
             print(f"  Release detected")
             self.pen_touching = False
+            self.tablet_press_active = False
             self.touch_start_time = None
             self.touch_recorded = False
         
@@ -808,7 +817,10 @@ class CalibrationCanvas(QWidget):
         """Reset calibration and start over"""
         self.calibration_points = []
         self.current_step = 0
+        self.pen_touching = False
+        self.tablet_press_active = False
         self.touch_start_time = None
+        self.touch_recorded = False
         self.update()
 
 

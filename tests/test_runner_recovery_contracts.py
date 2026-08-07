@@ -1,4 +1,4 @@
-"""Static regression checks for recovered runner 1.0.3 behavior."""
+"""Static regression checks for recovered runner behavior."""
 
 from __future__ import annotations
 

@@ -20,8 +20,8 @@ try {
     $releaseTag = $releaseInfoLines[1].Trim()
     $zipName = $releaseInfoLines[2].Trim()
 
-    if ($appVersion -notmatch '^\d+\.\d+\.\d+$') {
-        Write-Host "[ERROR] APP_VERSION must use semantic versioning (major.minor.patch)." -ForegroundColor Red
+    if ($appVersion -notmatch '^\d+\.\d+\.\d+(\.\d+)?$') {
+        Write-Host "[ERROR] APP_VERSION must contain three or four numeric components." -ForegroundColor Red
         exit 1
     }
     if ($releaseTag -ne "v$appVersion") {

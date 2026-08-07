@@ -1,20 +1,23 @@
 # Versioning and releases
 
-AutoScript uses **Semantic Versioning** in `MAJOR.MINOR.PATCH` format. The current application version is `1.0.3`, matching the version displayed by the latest portable build.
+AutoScript release identifiers contain three or four numeric components. The
+usual `MAJOR.MINOR.PATCH` form is used for feature releases, while an optional
+fourth `REVISION` component identifies a corrective rebuild of an existing
+patch release. The current application version is `1.0.3.1`.
 
 ## Single source of truth
 
 Change the version only in `project_version.py`:
 
 ```python
-APP_VERSION = "1.0.3"
+APP_VERSION = "1.0.3.1"
 ```
 
 The following values are derived automatically:
 
-- application label: `Version 1.0.3`
-- Git tag: `v1.0.3`
-- release archive: `TouchpadExperiment-v1.0.3-portable.zip`
+- application label: `Version 1.0.3.1`
+- Git tag: `v1.0.3.1`
+- release archive: `TouchpadExperiment-v1.0.3.1-portable.zip`
 
 Do not duplicate or manually edit these derived values elsewhere.
 
@@ -22,9 +25,10 @@ Do not duplicate or manually edit these derived values elsewhere.
 
 Increment:
 
-- **PATCH** for bug fixes that do not intentionally change existing behavior, for example `1.0.3` to `1.0.4`;
-- **MINOR** for backward-compatible features, for example `1.0.3` to `1.1.0`;
-- **MAJOR** for incompatible changes to workflows or data formats, for example `1.0.3` to `2.0.0`.
+- **REVISION** for a corrective rebuild of an existing patch release, for example `1.0.3` to `1.0.3.1`;
+- **PATCH** for a new bug-fix release, for example `1.0.3.1` to `1.0.4`;
+- **MINOR** for backward-compatible features, for example `1.0.3.1` to `1.1.0`;
+- **MAJOR** for incompatible changes to workflows or data formats, for example `1.0.3.1` to `2.0.0`.
 
 ## Preparing a release
 
@@ -50,10 +54,10 @@ After it succeeds, push the branch and tag:
 
 ```powershell
 git push origin main
-git push origin v1.0.3
+git push origin v1.0.3.1
 ```
 
-Then create a GitHub Release for the same tag and attach `TouchpadExperiment-v1.0.3-portable.zip`.
+Then create a GitHub Release for the same tag and attach `TouchpadExperiment-v1.0.3.1-portable.zip`.
 
 ## Repository policy
 

@@ -1,0 +1,44 @@
+name: Portable release build
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  portable-build:
+    runs-on: windows-latest
+    env:
+      QT_QPA_PLATFORM: offscreen
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build portable package
+        shell: powershell
+        run: .\build_portable.ps1
+
+      - name: Run focused unit tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Resolve archive name
+        id: release
+        shell: powershell
+        run: |
+          $archive = python -c "from project_version import PORTABLE_ARCHIVE_NAME; print(PORTABLE_ARCHIVE_NAME)"
+          "archive=$archive" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Upload portable ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: TouchpadExperiment-portable
+          path: ${{ steps.release.outputs.archive }}
+          if-no-files-found: error
+          retention-days: 14

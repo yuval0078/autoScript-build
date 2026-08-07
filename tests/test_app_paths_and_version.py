@@ -7,7 +7,7 @@ from pathlib import Path
 import project_version
 from app_paths import app_dir, source_script_path
 
-SEMANTIC_VERSION_PATTERN = re.compile(r"^\d+\.\d+\.\d+$")
+RELEASE_VERSION_PATTERN = re.compile(r"^\d+\.\d+\.\d+(?:\.\d+)?$")
 
 
 class AppPathsAndVersionTests(unittest.TestCase):
@@ -24,9 +24,9 @@ class AppPathsAndVersionTests(unittest.TestCase):
             finally:
                 os.chdir(original_cwd)
 
-    def test_project_version_uses_semantic_versioning(self):
-        self.assertRegex(project_version.APP_VERSION, SEMANTIC_VERSION_PATTERN)
-        self.assertEqual(project_version.APP_VERSION, "1.0.3")
+    def test_project_version_uses_supported_release_versioning(self):
+        self.assertRegex(project_version.APP_VERSION, RELEASE_VERSION_PATTERN)
+        self.assertEqual(project_version.APP_VERSION, "1.0.3.1")
         self.assertEqual(
             project_version.APP_VERSION_LABEL,
             f"Version {project_version.APP_VERSION}",

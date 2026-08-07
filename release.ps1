@@ -17,8 +17,8 @@ try {
     $releaseTag = $releaseInfoLines[1].Trim()
     $archiveName = $releaseInfoLines[2].Trim()
 
-    if ($appVersion -notmatch '^\d+\.\d+\.\d+$') {
-        throw "APP_VERSION must use semantic versioning (major.minor.patch)."
+    if ($appVersion -notmatch '^\d+\.\d+\.\d+(\.\d+)?$') {
+        throw "APP_VERSION must contain three or four numeric components."
     }
     if ($releaseTag -ne "v$appVersion") {
         throw "RELEASE_TAG does not match APP_VERSION."
