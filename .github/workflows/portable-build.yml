@@ -50,7 +50,25 @@ jobs:
         shell: powershell
         run: |
           $archive = python -c "from project_version import PORTABLE_ARCHIVE_NAME; print(PORTABLE_ARCHIVE_NAME)"
-          python -c 'import sys, zipfile; names = [n.replace("\\", "/") for n in zipfile.ZipFile(sys.argv[1]).namelist()]; required = ("TouchpadExperiment/TouchpadExperiment.exe", "TouchpadExperiment/ExperimentRunner.exe", "TouchpadExperiment/Analyzer.exe", "TouchpadExperiment/assets/bin/ffmpeg.exe", "TouchpadExperiment/assets/bin/ffprobe.exe"); missing = [name for name in required if name not in names]; assert not missing, f"Missing portable files: {missing}"' $archive
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = [System.IO.Compression.ZipFile]::OpenRead($archive)
+          try {
+            $names = @($zip.Entries | ForEach-Object { $_.FullName.Replace('\', '/') })
+            $required = @(
+              "TouchpadExperiment/TouchpadExperiment.exe",
+              "TouchpadExperiment/ExperimentRunner.exe",
+              "TouchpadExperiment/Analyzer.exe",
+              "TouchpadExperiment/assets/bin/ffmpeg.exe",
+              "TouchpadExperiment/assets/bin/ffprobe.exe"
+            )
+            $missing = @($required | Where-Object { $_ -notin $names })
+            if ($missing.Count -gt 0) {
+              throw "Missing portable files: $($missing -join ', ')"
+            }
+          }
+          finally {
+            $zip.Dispose()
+          }
 
       - name: Run focused unit tests
         run: python -m unittest discover -s tests -v
