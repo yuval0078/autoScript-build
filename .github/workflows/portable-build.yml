@@ -22,9 +22,34 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Stage portable FFmpeg binaries
+        shell: powershell
+        run: |
+          choco install ffmpeg -y --no-progress
+          $ffmpeg = Get-ChildItem "$env:ChocolateyInstall\lib\ffmpeg*\tools" -Recurse -File -Filter ffmpeg.exe |
+            Where-Object { $_.Length -gt 1MB } |
+            Sort-Object Length -Descending |
+            Select-Object -First 1
+          if (-not $ffmpeg) {
+            throw "Could not locate the installed FFmpeg executable."
+          }
+          $ffprobe = Join-Path $ffmpeg.DirectoryName "ffprobe.exe"
+          if (-not (Test-Path $ffprobe)) {
+            throw "Could not locate ffprobe beside FFmpeg."
+          }
+          New-Item -ItemType Directory -Force -Path "assets\bin" | Out-Null
+          Copy-Item $ffmpeg.FullName "assets\bin\ffmpeg.exe" -Force
+          Copy-Item $ffprobe "assets\bin\ffprobe.exe" -Force
+
       - name: Build portable package
         shell: powershell
         run: .\build_portable.ps1
+
+      - name: Verify bundled release files
+        shell: powershell
+        run: |
+          $archive = python -c "from project_version import PORTABLE_ARCHIVE_NAME; print(PORTABLE_ARCHIVE_NAME)"
+          python -c 'import sys, zipfile; names = [n.replace("\\", "/") for n in zipfile.ZipFile(sys.argv[1]).namelist()]; required = ("TouchpadExperiment/TouchpadExperiment.exe", "TouchpadExperiment/ExperimentRunner.exe", "TouchpadExperiment/Analyzer.exe", "TouchpadExperiment/assets/bin/ffmpeg.exe", "TouchpadExperiment/assets/bin/ffprobe.exe"); missing = [name for name in required if name not in names]; assert not missing, f"Missing portable files: {missing}"' $archive
 
       - name: Run focused unit tests
         run: python -m unittest discover -s tests -v

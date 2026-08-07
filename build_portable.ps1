@@ -77,15 +77,24 @@ try {
     New-Item -ItemType Directory -Force -Path $assetsBin | Out-Null
 
     $ffmpegPath = $null
-    try {
-        $ffmpegPath = (Get-Command ffmpeg -ErrorAction Stop).Source
+    $stagedFfmpegPath = "$assetsBin\ffmpeg.exe"
+    if (Test-Path $stagedFfmpegPath) {
+        $ffmpegPath = (Resolve-Path $stagedFfmpegPath).Path
     }
-    catch {
-        $ffmpegPath = $null
+    else {
+        try {
+            $ffmpegPath = (Get-Command ffmpeg -ErrorAction Stop).Source
+        }
+        catch {
+            $ffmpegPath = $null
+        }
     }
 
     if ($ffmpegPath -and (Test-Path $ffmpegPath)) {
-        Copy-Item $ffmpegPath "$assetsBin\ffmpeg.exe" -Force -ErrorAction SilentlyContinue
+        if ((Resolve-Path $ffmpegPath).Path -ne (Join-Path $projectRoot $stagedFfmpegPath)) {
+            Copy-Item $ffmpegPath $stagedFfmpegPath -Force
+            $ffmpegPath = (Resolve-Path $stagedFfmpegPath).Path
+        }
         $ffprobePath = "$(Split-Path $ffmpegPath -Parent)\ffprobe.exe"
         if (Test-Path $ffprobePath) {
             Copy-Item $ffprobePath "$assetsBin\ffprobe.exe" -Force -ErrorAction SilentlyContinue
