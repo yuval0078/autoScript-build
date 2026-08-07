@@ -26,7 +26,8 @@ jobs:
         shell: powershell
         run: |
           choco install ffmpeg -y --no-progress
-          $ffmpeg = Get-ChildItem "$env:ChocolateyInstall\lib\ffmpeg*\tools" -Recurse -File -Filter ffmpeg.exe |
+          $ffmpegTools = Join-Path $env:ChocolateyInstall "lib\ffmpeg\tools"
+          $ffmpeg = Get-ChildItem $ffmpegTools -Recurse -File -Filter ffmpeg.exe |
             Where-Object { $_.Length -gt 1MB } |
             Sort-Object Length -Descending |
             Select-Object -First 1
