@@ -11,6 +11,7 @@ jobs:
     runs-on: windows-latest
     env:
       QT_QPA_PLATFORM: offscreen
+      PYTHONUTF8: "1"
 
     steps:
       - name: Check out repository
