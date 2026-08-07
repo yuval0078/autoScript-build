@@ -10,6 +10,7 @@ import traceback
 import uuid
 from pathlib import Path
 from app_paths import ensure_dir, user_data_dir
+from archive_utils import safe_extract_zip
 from project_version import APP_VERSION
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton, 
                              QLabel, QFileDialog, QListWidget, QListWidgetItem, 
@@ -617,7 +618,7 @@ class NewExperimentWizard(QWidget):
         extract_dir = ensure_dir(import_root / f"{safe_stem}_{uuid.uuid4().hex[:8]}")
 
         with zipfile.ZipFile(file_path, 'r') as zip_ref:
-            zip_ref.extractall(extract_dir)
+            safe_extract_zip(zip_ref, extract_dir)
 
         json_files = sorted(extract_dir.glob("*.json"))
         if not json_files:
