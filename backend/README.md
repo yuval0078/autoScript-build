@@ -38,6 +38,21 @@ block per existing experiment from only its latest version.
 
 ## Run results API
 
+Cloud Runs have an explicit lifecycle:
+
+- `POST /api/v1/experiment-revisions/{revision_id}/runs` creates an idempotent
+  participant Run before the Runner starts.
+- `POST /api/v1/runs/{run_id}/start` marks it running and can resume an
+  `incomplete` or `failed` Run.
+- `POST /api/v1/runs/{run_id}/results` stores one immutable Block result.
+- `POST /api/v1/runs/{run_id}/finalize` derives `completed` or `incomplete`.
+- `POST /api/v1/runs/{run_id}/cancel` records an intentional cancellation.
+- `POST /api/v1/runs/{run_id}/fail` records an execution failure.
+
+The desktop Runner copies pending uploads into its durable `api_upload_queue`.
+Result uploads and finalization are retried in FIFO order after a connection
+failure.
+
 - `POST /api/v1/experiments/{id}/results` streams one raw Runner JSON file.
   `X-Filename` is optional. The body is validated against
   `schemas/data-contracts/raw-run.schema.json` and stored byte-for-byte.
@@ -47,19 +62,21 @@ block per existing experiment from only its latest version.
 - `GET /api/v1/run-results/{result_id}/download` returns the exact JSON bytes
   with `X-Checksum-SHA256`.
 - `PATCH /api/v1/runs/{run_id}/analysis` records whether analysis is completed.
-- `POST /api/v1/runs/{run_id}/artifacts/{analysis_csv|trainable_json}` stores
+- `POST /api/v1/runs/{run_id}/artifacts/{analysis_csv|trainable_json|analysis_state}` stores
   immutable Analyzer exports; exact retries are idempotent.
 - `GET /api/v1/run-artifacts/{artifact_id}/download` returns exact artifact bytes.
 - `DELETE /api/v1/runs/{run_id}` removes a participant run and all raw/derived
   objects after explicit UI confirmation.
 
-The first result for a `session_id` creates its Experiment run. A retry for the
+The legacy experiment-scoped route still creates a Run from the first result
+for older clients. A retry for the
 same session and Block index is idempotent only when its SHA-256 is identical;
 different bytes return HTTP 409. Raw results are never overwritten. Legacy 1.0
 result JSON without Block identity is accepted as a one-Block-compatible file.
 Migration `20260807_0004` adds `experiment_runs` and `run_results`; migration
 `20260807_0005` adds word/Block completeness, tri-state analysis status, and
-immutable Analyzer artifacts.
+immutable Analyzer artifacts. Migrations `20260808_0008` and `0009` add access
+tokens, explicit Run lifecycle timestamps/status, and historical Run backfill.
 
 ## Run with Docker
 
@@ -75,8 +92,37 @@ docker compose up -d --build
 - MinIO console: <http://127.0.0.1:9001>
 
 The API container applies migrations, creates the object-storage bucket, and
-bootstraps a local actor before Uvicorn starts. Authentication remains deferred;
-the development Compose stack is bound to localhost.
+bootstraps a local actor before Uvicorn starts. The development stack uses
+`AUTOSCRIPT_AUTH_MODE=local` and remains bound to localhost.
+
+## Multi-user authentication
+
+Set `AUTOSCRIPT_AUTH_MODE=token` to require authentication. Passwords are stored
+with salted PBKDF2-SHA256 hashes. Login returns a random opaque bearer token;
+only its SHA-256 hash is stored so the token can expire or be revoked.
+
+- `POST /api/v1/auth/login`, `POST /api/v1/auth/logout`, `GET /api/v1/auth/me`
+- Admin-only: `GET /api/v1/users`, `POST /api/v1/users`, and
+  `PATCH /api/v1/users/{id}`
+
+Experiments and all nested revisions, Runs, results, and artifacts are filtered
+through their owner's user ID. The desktop app prompts after an HTTP 401 and
+passes the session token only to its Runner and Analyzer child processes.
+
+## Production deployment
+
+Copy `.env.example` to `.env`, replace every `change-me` value, set a long
+`AUTOSCRIPT_BOOTSTRAP_ADMIN_PASSWORD`, and run:
+
+```powershell
+docker compose -f compose.yml -f compose.production.yml up -d --build
+```
+
+The override enables token auth, disables API documentation, hides the MinIO
+console, and binds the API to loopback for a TLS reverse proxy. Put Caddy,
+nginx, or the hosting platform's HTTPS proxy in front of port 8000. Do not
+expose PostgreSQL or MinIO publicly. Desktop clients set
+`AUTOSCRIPT_API_URL=https://your-api-host` and authenticate in the app.
 
 ## Test
 

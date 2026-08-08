@@ -17,6 +17,7 @@ class ApiHandler(BaseHTTPRequestHandler):
     result = b'{"result":"fixture"}'
     artifact = b"Participant,Word\n7,test\n"
     requests = []
+    last_authorization = None
 
     def log_message(self, format, *args):
         pass
@@ -30,6 +31,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
+        type(self).last_authorization = self.headers.get("Authorization")
         if self.path == "/api/v1/experiments":
             self.send_json(200, [{"id": "experiment-1", "name": "fixture", "versions": []}])
             return
@@ -91,6 +93,25 @@ class ApiHandler(BaseHTTPRequestHandler):
         self.send_json(404, {"detail": "Not found"})
 
     def do_POST(self):
+        type(self).last_authorization = self.headers.get("Authorization")
+        if self.path == "/api/v1/auth/login":
+            self.rfile.read(int(self.headers["Content-Length"]))
+            self.send_json(200, {"access_token": "session-token", "user": {"username": "tester"}})
+            return
+        if self.path == "/api/v1/experiment-revisions/revision-1/runs":
+            payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            type(self).requests.append(("POST", self.path, payload))
+            self.send_json(201, {"id": "run-1", "status": "created"})
+            return
+        if self.path in {"/api/v1/runs/run-1/start", "/api/v1/runs/run-1/finalize"}:
+            status_value = "running" if self.path.endswith("/start") else "completed"
+            self.send_json(200, {"id": "run-1", "status": status_value})
+            return
+        if self.path == "/api/v1/runs/run-1/results":
+            length = int(self.headers["Content-Length"])
+            type(self).uploaded = self.rfile.read(length)
+            self.send_json(201, {"id": "result-1"})
+            return
         if self.path == "/api/v1/experiments":
             payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             self.send_json(201, {"id": "created-1", "name": payload["name"], "versions": []})
@@ -304,6 +325,20 @@ class AutoScriptApiClientTests(unittest.TestCase):
         self.assertTrue(updated["analysis_completed"])
         self.api.delete_run("run-1")
         self.assertIn(("DELETE", "/api/v1/runs/run-1", None), ApiHandler.requests)
+
+    def test_login_bearer_header_and_explicit_run_lifecycle(self):
+        api = AutoScriptAPI(self.api.base_url)
+        logged_in = api.login("tester", "long-password")
+        self.assertEqual(logged_in["user"]["username"], "tester")
+        run = api.create_run("revision-1", "session-1", 7, 25, "Other")
+        self.assertEqual(run["status"], "created")
+        self.assertEqual(ApiHandler.last_authorization, "Bearer session-token")
+        self.assertEqual(api.start_run("run-1")["status"], "running")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result_path = Path(temp_dir) / "result.json"
+            result_path.write_bytes(ApiHandler.result)
+            self.assertEqual(api.upload_run_result("run-1", result_path)["id"], "result-1")
+        self.assertEqual(api.finalize_run("run-1")["status"], "completed")
 
 
 if __name__ == "__main__":

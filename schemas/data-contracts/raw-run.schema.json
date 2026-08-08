@@ -59,6 +59,9 @@
       "type": ["integer", "null"],
       "minimum": 1
     },
+    "server_run_id": {
+      "type": ["string", "null"]
+    },
     "block_name": {
       "type": "string",
       "minLength": 1

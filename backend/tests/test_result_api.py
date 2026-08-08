@@ -10,7 +10,7 @@ from sqlalchemy.pool import StaticPool
 
 from app.database import get_db
 from app.main import create_app
-from app.models import Base, ExperimentRevision, User
+from app.models import Base, ExperimentRevision, ExperimentRevisionBlock, User
 from app.services.storage import get_object_storage
 
 
@@ -192,6 +192,67 @@ class ResultApiTests(unittest.TestCase):
             f"/api/v1/experiments/{self.experiment['id']}/runs"
         ).json()[0]
         self.assertEqual(run["revision_id"], str(revision_id))
+
+    def test_explicit_run_lifecycle_is_idempotent_and_finalizes(self):
+        revision_id = uuid.uuid4()
+        with self.session_factory() as session:
+            actor = session.query(User).one()
+            revision = ExperimentRevision(
+                id=revision_id, experiment_id=uuid.UUID(self.experiment["id"]),
+                revision_number=1, name="Results Study", created_by=actor.id,
+            )
+            revision.blocks = [
+                ExperimentRevisionBlock(
+                    source_block_id=None, position=index, same_page_as_previous=False,
+                    name=f"block-{index + 1}", storage_key=f"revision/{index}.zip",
+                    original_filename=f"block-{index + 1}.zip", sha256=str(index + 1) * 64,
+                    size_bytes=10,
+                )
+                for index in range(2)
+            ]
+            session.add(revision)
+            session.commit()
+        create_payload = {
+            "session_id": "7_20260807_120000_abcdef",
+            "participant_number": 7,
+            "participant_age": 25,
+            "participant_gender": "Other",
+        }
+        created = self.client.post(
+            f"/api/v1/experiment-revisions/{revision_id}/runs", json=create_payload
+        )
+        self.assertEqual(created.status_code, 201, created.text)
+        run_id = created.json()["id"]
+        self.assertEqual(created.json()["status"], "created")
+        retried = self.client.post(
+            f"/api/v1/experiment-revisions/{revision_id}/runs", json=create_payload
+        )
+        self.assertEqual(retried.status_code, 200, retried.text)
+        started = self.client.post(f"/api/v1/runs/{run_id}/start")
+        self.assertEqual(started.json()["status"], "running")
+        for block_index in (1, 2):
+            payload = raw_result(self.experiment["id"], block_index=block_index)
+            payload.update({
+                "schema_version": "1.3",
+                "experiment_revision_id": str(revision_id),
+                "experiment_revision_number": 1,
+            })
+            content = json.dumps(payload).encode("utf-8")
+            uploaded = self.client.post(
+                f"/api/v1/runs/{run_id}/results", content=content,
+                headers={"Content-Type": "application/json", "X-Filename": f"{block_index}.json"},
+            )
+            self.assertEqual(uploaded.status_code, 201, uploaded.text)
+            if block_index == 1:
+                incomplete = self.client.post(f"/api/v1/runs/{run_id}/finalize")
+                self.assertEqual(incomplete.json()["status"], "incomplete")
+                resumed = self.client.post(f"/api/v1/runs/{run_id}/start")
+                self.assertEqual(resumed.json()["status"], "running")
+                self.assertIsNone(resumed.json()["finalized_at"])
+        finalized = self.client.post(f"/api/v1/runs/{run_id}/finalize")
+        self.assertEqual(finalized.status_code, 200, finalized.text)
+        self.assertEqual(finalized.json()["status"], "completed")
+        self.assertIsNotNone(finalized.json()["finalized_at"])
 
     def test_legacy_result_without_block_identity_is_accepted(self):
         payload = raw_result(self.experiment["id"], block_index=1, block_count=1)

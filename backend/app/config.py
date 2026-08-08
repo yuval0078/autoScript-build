@@ -1,5 +1,7 @@
 from functools import lru_cache
+from typing import Literal
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -21,6 +23,10 @@ class Settings(BaseSettings):
     minio_bucket: str = "autoscript-artifacts"
     minio_secure: bool = False
     local_actor_username: str = "local-admin"
+    auth_mode: Literal["local", "token"] = "local"
+    access_token_ttl_hours: int = Field(default=24, ge=1, le=24 * 365)
+    bootstrap_admin_username: str = "admin"
+    bootstrap_admin_password: str | None = None
     max_upload_bytes: int = 512 * 1024 * 1024
     max_uncompressed_package_bytes: int = 2 * 1024 * 1024 * 1024
 

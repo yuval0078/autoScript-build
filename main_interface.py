@@ -2,7 +2,12 @@ import sys
 from qt_bootstrap import ensure_qt_platform_plugin_path
 from project_version import APP_VERSION_LABEL, APP_NAME
 
-from PyQt5.QtWidgets import QApplication, QMainWindow, QStackedWidget, QLabel
+from PyQt5.QtWidgets import (
+    QApplication, QInputDialog, QLineEdit, QMainWindow, QMessageBox,
+    QStackedWidget, QLabel,
+)
+from PyQt5.QtCore import QTimer
+from autoscript_api import APIError, AutoScriptAPI
 
 # Import the modularized components
 from gui_menu import MainMenu
@@ -16,6 +21,7 @@ class MainInterface(QMainWindow):
     
     def __init__(self):
         super().__init__()
+        self.api_user = self._authenticate_if_required()
         # Status Bar
         self.status_msg = QLabel("Ready")
         self.statusBar().addWidget(self.status_msg)
@@ -45,6 +51,46 @@ class MainInterface(QMainWindow):
 
         # Always start on the home screen.
         self.show_main_menu()
+        QTimer.singleShot(0, self._retry_pending_uploads)
+
+    def _authenticate_if_required(self):
+        api = AutoScriptAPI(timeout=10)
+        try:
+            return api.me()
+        except APIError as exc:
+            if exc.status_code != 401:
+                return None
+        while True:
+            username, accepted = QInputDialog.getText(
+                self, "AutoScript Login", "Username:"
+            )
+            if not accepted:
+                return None
+            password, accepted = QInputDialog.getText(
+                self, "AutoScript Login", "Password:", QLineEdit.Password
+            )
+            if not accepted:
+                return None
+            try:
+                return api.login(username.strip(), password)["user"]
+            except APIError as exc:
+                retry = QMessageBox.warning(
+                    self, "Login Failed", str(exc),
+                    QMessageBox.Retry | QMessageBox.Cancel, QMessageBox.Retry,
+                )
+                if retry != QMessageBox.Retry:
+                    return None
+
+    def _retry_pending_uploads(self):
+        try:
+            from result_upload_queue import drain_upload_queue
+            uploaded, errors = drain_upload_queue(AutoScriptAPI(timeout=30))
+            if uploaded:
+                self.status_msg.setText(f"Uploaded {uploaded} queued result(s)")
+            elif errors:
+                self.status_msg.setText("Pending result uploads remain queued")
+        except Exception:
+            pass
         
     def show_new_experiment(self):
         self.stack.setCurrentWidget(self.new_experiment)

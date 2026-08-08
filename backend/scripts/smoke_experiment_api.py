@@ -73,11 +73,13 @@ def build_block(package_path, block_name):
 
 def build_result(experiment, block, block_index, block_count, session_id):
     return {
-        "schema_version": "1.2",
+        "schema_version": "1.3",
         "app_version": "1.0.3.1",
         "experiment_name": experiment["name"],
         "experiment_id": experiment["id"],
         "experiment_version": 1,
+        "experiment_revision_id": experiment["current_revision"]["id"],
+        "experiment_revision_number": experiment["current_revision"]["revision_number"],
         "block_name": block["name"],
         "block_id": block["id"],
         "block_index": block_index,
@@ -126,6 +128,7 @@ def main():
                 [uploaded[1]["id"], uploaded[0]["id"]],
                 same_page_block_ids=[uploaded[0]["id"]],
             )
+            revision = api.create_experiment_revision(experiment_id)
 
             duplicate = api.duplicate_experiment(experiment_id)
             duplicate_id = duplicate["id"]
@@ -154,6 +157,8 @@ def main():
                 raise RuntimeError("Nested Block ZIP bytes changed during storage/download.")
 
             session_id = f"7_20260807_120000_{uuid.uuid4().hex[:6]}"
+            run = api.create_run(revision["id"], session_id, 7, 25, "Other")
+            api.start_run(run["id"])
             result_files = []
             for index, block in enumerate(listed["blocks"], start=1):
                 result_path = temp_root / f"result-{index}.json"
@@ -164,11 +169,15 @@ def main():
                     ),
                     encoding="utf-8",
                 )
-                uploaded_result = api.upload_result(experiment_id, result_path)
-                retried_result = api.upload_result(experiment_id, result_path)
+                uploaded_result = api.upload_run_result(run["id"], result_path)
+                retried_result = api.upload_run_result(run["id"], result_path)
                 if uploaded_result["id"] != retried_result["id"]:
                     raise RuntimeError("Exact result retry was not idempotent.")
                 result_files.append((result_path, uploaded_result))
+
+            finalized = api.finalize_run(run["id"])
+            if finalized["status"] != "completed":
+                raise RuntimeError("Explicit Run did not finalize as completed.")
 
             runs = api.list_experiment_runs(experiment_id)
             if len(runs) != 1 or not runs[0]["complete"]:
@@ -202,7 +211,7 @@ def main():
             print(
                 f"OK: experiment={experiment_id} blocks=2 duplicate={duplicate_id} "
                 f"order=Task,Warmup same_page=Warmup run={runs[0]['id']} "
-                f"results=2 artifacts=2 analysis=complete"
+                f"results=2 lifecycle=completed artifacts=2 analysis=complete"
             )
     finally:
         if duplicate_id is not None:

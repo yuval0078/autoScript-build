@@ -11,7 +11,7 @@ import uuid
 from pathlib import Path
 from app_paths import ensure_dir, user_data_dir, asset_path, source_script_path
 from archive_utils import safe_extract_zip
-from autoscript_api import APIError, AutoScriptAPI
+from autoscript_api import APIError, AutoScriptAPI, get_session_token
 from experiment_packages import unpack_experiment_package
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
                              QLabel, QFileDialog, QMessageBox, QApplication,
@@ -932,7 +932,7 @@ class MainMenu(QWidget):
                         command.append("--test-mode")
                     command.extend(["--session-plan", str(session_plan_path)])
                     command.extend(str(path) for path in config_files)
-                    subprocess.Popen(command)
+                    subprocess.Popen(command, env=self._api_child_environment())
                 else:
                     QMessageBox.critical(self, "Error", f"ExperimentRunner.exe not found at {experiment_exe}")
             else:
@@ -945,7 +945,7 @@ class MainMenu(QWidget):
                     command.append("--test-mode")
                 command.extend(["--session-plan", str(session_plan_path)])
                 command.extend(str(path) for path in config_files)
-                subprocess.Popen(command)
+                subprocess.Popen(command, env=self._api_child_environment())
             
         except Exception as e:
             QApplication.restoreOverrideCursor()
@@ -1055,6 +1055,14 @@ class MainMenu(QWidget):
         if self.parent.new_experiment.import_experiment_zip(file_path):
             self.parent.show_new_experiment()
 
+    @staticmethod
+    def _api_child_environment():
+        environment = os.environ.copy()
+        token = get_session_token()
+        if token:
+            environment["AUTOSCRIPT_API_TOKEN"] = token
+        return environment
+
     def launch_analyzer(self, file_paths=None, extra_args=None):
         """Launch the results analyzer script"""
         file_paths = [str(Path(path).resolve()) for path in (file_paths or [])]
@@ -1066,7 +1074,10 @@ class MainMenu(QWidget):
                 analyzer_exe = exe_dir / "Analyzer.exe"
                 
                 if analyzer_exe.exists():
-                    return subprocess.Popen([str(analyzer_exe), *extra_args, *file_paths])
+                    return subprocess.Popen(
+                        [str(analyzer_exe), *extra_args, *file_paths],
+                        env=self._api_child_environment(),
+                    )
                 else:
                     QMessageBox.critical(self, "Error", f"Analyzer.exe not found at {analyzer_exe}")
             else:
@@ -1074,7 +1085,8 @@ class MainMenu(QWidget):
                 script_path = source_script_path("analyzer_refactored.py")
                 if script_path.exists():
                     return subprocess.Popen(
-                        [sys.executable, str(script_path), *extra_args, *file_paths]
+                        [sys.executable, str(script_path), *extra_args, *file_paths],
+                        env=self._api_child_environment(),
                     )
                 else:
                     QMessageBox.critical(self, "Error", f"analyzer_refactored.py not found at {script_path}")

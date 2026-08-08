@@ -46,6 +46,7 @@ class MigrationTests(unittest.TestCase):
                 table_names,
                 {
                     "alembic_version",
+                    "access_tokens",
                     "users",
                     "experiments",
                     "experiment_blocks",

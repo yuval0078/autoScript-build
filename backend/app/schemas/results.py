@@ -2,6 +2,14 @@ import uuid
 from datetime import datetime
 
 from pydantic import BaseModel
+from pydantic import Field
+
+
+class RunCreate(BaseModel):
+    session_id: str = Field(min_length=1, max_length=128)
+    participant_number: int = Field(gt=0)
+    participant_age: int = Field(gt=0)
+    participant_gender: str = Field(min_length=1, max_length=32)
 
 
 class RunArtifactResponse(BaseModel):
@@ -44,6 +52,9 @@ class ExperimentRunResponse(BaseModel):
     id: uuid.UUID
     experiment_id: uuid.UUID
     revision_id: uuid.UUID | None
+    status: str
+    started_at: datetime | None
+    finalized_at: datetime | None
     session_id: str
     participant_number: int
     participant_age: int

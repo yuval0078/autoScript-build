@@ -9,6 +9,18 @@ from pathlib import Path
 from urllib.parse import quote, urlsplit
 
 
+_SESSION_TOKEN = None
+
+
+def set_session_token(token):
+    global _SESSION_TOKEN
+    _SESSION_TOKEN = token
+
+
+def get_session_token():
+    return _SESSION_TOKEN or os.environ.get("AUTOSCRIPT_API_TOKEN")
+
+
 class APIError(RuntimeError):
     def __init__(self, message, status_code=None):
         super().__init__(message)
@@ -16,11 +28,12 @@ class APIError(RuntimeError):
 
 
 class AutoScriptAPI:
-    def __init__(self, base_url=None, timeout=60):
+    def __init__(self, base_url=None, timeout=60, token=None):
         self.base_url = (base_url or os.environ.get(
             "AUTOSCRIPT_API_URL", "http://127.0.0.1:8000"
         )).rstrip("/")
         self.timeout = timeout
+        self.token = token or os.environ.get("AUTOSCRIPT_API_TOKEN") or _SESSION_TOKEN
         parsed = urlsplit(self.base_url)
         if parsed.scheme not in {"http", "https"} or not parsed.hostname:
             raise ValueError("AUTOSCRIPT_API_URL must be an HTTP or HTTPS URL.")
@@ -54,9 +67,14 @@ class AutoScriptAPI:
             pass
         return APIError(message, response.status)
 
-    def _json_request(self, method, path, payload=None):
+    def _auth_headers(self):
+        return {"Authorization": f"Bearer {self.token}"} if self.token else {}
+
+    def _json_request(self, method, path, payload=None, auth=True):
         body = None
         headers = {"Accept": "application/json"}
+        if auth:
+            headers.update(self._auth_headers())
         if payload is not None:
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             headers["Content-Type"] = "application/json; charset=utf-8"
@@ -76,6 +94,47 @@ class AutoScriptAPI:
             raise APIError(f"Could not connect to the AutoScript API: {exc}") from exc
         finally:
             connection.close()
+
+    def login(self, username, password):
+        response = self._json_request(
+            "POST", "/api/v1/auth/login",
+            {"username": username, "password": password}, auth=False,
+        )
+        self.token = response["access_token"]
+        set_session_token(self.token)
+        return response
+
+    def me(self):
+        return self._json_request("GET", "/api/v1/auth/me")
+
+    def logout(self):
+        result = self._json_request("POST", "/api/v1/auth/logout")
+        self.token = None
+        set_session_token(None)
+        return result
+
+    def create_run(self, revision_id, session_id, participant_number, participant_age, participant_gender):
+        return self._json_request(
+            "POST", f"/api/v1/experiment-revisions/{revision_id}/runs",
+            {
+                "session_id": session_id,
+                "participant_number": int(participant_number),
+                "participant_age": int(participant_age),
+                "participant_gender": participant_gender,
+            },
+        )
+
+    def start_run(self, run_id):
+        return self._json_request("POST", f"/api/v1/runs/{run_id}/start")
+
+    def finalize_run(self, run_id):
+        return self._json_request("POST", f"/api/v1/runs/{run_id}/finalize")
+
+    def cancel_run(self, run_id):
+        return self._json_request("POST", f"/api/v1/runs/{run_id}/cancel")
+
+    def fail_run(self, run_id):
+        return self._json_request("POST", f"/api/v1/runs/{run_id}/fail")
 
     def list_experiments(self):
         return self._json_request("GET", "/api/v1/experiments")
@@ -132,6 +191,8 @@ class AutoScriptAPI:
                 self._path(f"/api/v1/experiments/{experiment_id}/blocks"),
             )
             connection.putheader("Accept", "application/json")
+            if self.token:
+                connection.putheader("Authorization", f"Bearer {self.token}")
             connection.putheader("Content-Type", "application/zip")
             connection.putheader("Content-Length", str(total))
             connection.putheader("X-Filename", quote(package_path.name, safe=""))
@@ -173,6 +234,8 @@ class AutoScriptAPI:
                 self._path(f"/api/v1/experiments/{experiment_id}/results"),
             )
             connection.putheader("Accept", "application/json")
+            if self.token:
+                connection.putheader("Authorization", f"Bearer {self.token}")
             connection.putheader("Content-Type", "application/json; charset=utf-8")
             connection.putheader("Content-Length", str(total))
             connection.putheader("X-Filename", quote(result_path.name, safe=""))
@@ -203,6 +266,41 @@ class AutoScriptAPI:
         finally:
             connection.close()
 
+    def upload_run_result(self, run_id, result_path, progress=None):
+        result_path = Path(result_path)
+        total = result_path.stat().st_size
+        connection = self._connection()
+        try:
+            connection.putrequest("POST", self._path(f"/api/v1/runs/{run_id}/results"))
+            connection.putheader("Accept", "application/json")
+            if self.token:
+                connection.putheader("Authorization", f"Bearer {self.token}")
+            connection.putheader("Content-Type", "application/json; charset=utf-8")
+            connection.putheader("Content-Length", str(total))
+            connection.putheader("X-Filename", quote(result_path.name, safe=""))
+            connection.endheaders()
+            sent = 0
+            with result_path.open("rb") as result_file:
+                while True:
+                    chunk = result_file.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    connection.send(chunk)
+                    sent += len(chunk)
+                    if progress:
+                        progress(sent, total)
+            response = connection.getresponse()
+            response_body = response.read()
+            if response.status >= 400:
+                raise self._error_from_response(response, response_body)
+            return json.loads(response_body.decode("utf-8"))
+        except APIError:
+            raise
+        except (OSError, socket.timeout, http.client.HTTPException) as exc:
+            raise APIError(f"Could not upload Run result to the AutoScript API: {exc}") from exc
+        finally:
+            connection.close()
+
     def upload_run_artifact(self, run_id, kind, artifact_path, progress=None):
         artifact_path = Path(artifact_path)
         total = artifact_path.stat().st_size
@@ -218,6 +316,8 @@ class AutoScriptAPI:
                 self._path(f"/api/v1/runs/{run_id}/artifacts/{kind}"),
             )
             connection.putheader("Accept", "application/json")
+            if self.token:
+                connection.putheader("Authorization", f"Bearer {self.token}")
             connection.putheader("Content-Type", content_type)
             connection.putheader("Content-Length", str(total))
             connection.putheader("X-Filename", quote(artifact_path.name, safe=""))
@@ -277,6 +377,8 @@ class AutoScriptAPI:
                 self._path(f"/api/v1/experiments/{experiment_id}/versions"),
             )
             connection.putheader("Accept", "application/json")
+            if self.token:
+                connection.putheader("Authorization", f"Bearer {self.token}")
             connection.putheader("Content-Type", "application/zip")
             connection.putheader("Content-Length", str(total))
             connection.putheader("X-Filename", quote(package_path.name, safe=""))
@@ -312,7 +414,10 @@ class AutoScriptAPI:
         expected_sha256 = version.get("sha256")
         connection = self._connection()
         try:
-            connection.request("GET", self._path(version["download_url"]))
+            connection.request(
+                "GET", self._path(version["download_url"]),
+                headers=self._auth_headers(),
+            )
             response = connection.getresponse()
             if response.status >= 400:
                 body = response.read()

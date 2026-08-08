@@ -160,6 +160,10 @@ class ExperimentRun(UUIDPrimaryKeyMixin, CreatedAtMixin, Base):
         ),
         CheckConstraint("participant_age > 0", name="ck_run_participant_age_positive"),
         CheckConstraint("block_count > 0", name="ck_run_block_count_positive"),
+        CheckConstraint(
+            "status IN ('created', 'running', 'completed', 'incomplete', 'failed', 'cancelled')",
+            name="ck_experiment_run_status",
+        ),
     )
 
     experiment_id: Mapped[uuid.UUID] = mapped_column(
@@ -178,6 +182,11 @@ class ExperimentRun(UUIDPrimaryKeyMixin, CreatedAtMixin, Base):
     block_count: Mapped[int] = mapped_column(Integer, nullable=False)
     source_experiment_name: Mapped[str] = mapped_column(String(200), nullable=False)
     source_experiment_id: Mapped[Optional[str]] = mapped_column(String(255))
+    status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="created", server_default="created"
+    )
+    started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    finalized_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     analysis_completed: Mapped[Optional[bool]] = mapped_column(Boolean)
     analysis_updated_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True)

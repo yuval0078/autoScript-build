@@ -9,7 +9,7 @@ from .experiment import (
     RunArtifact,
     RunResult,
 )
-from .user import User
+from .user import AccessToken, User
 
 __all__ = [
     "Base",
@@ -22,4 +22,5 @@ __all__ = [
     "RunArtifact",
     "RunResult",
     "User",
+    "AccessToken",
 ]

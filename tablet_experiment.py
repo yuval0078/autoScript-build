@@ -247,6 +247,36 @@ def ensure_shared_run_session_id(configs, participant_number) -> str:
     return session_id
 
 
+def initialize_cloud_run(configs, participant_number, age, gender, test_mode=False):
+    """Create one server Run before the first Block starts; local files remain a fallback."""
+    if test_mode or not configs:
+        return None
+    existing = next((config.get('__server_run_id__') for config in configs if config.get('__server_run_id__')), None)
+    if existing:
+        return existing
+    revision_id = configs[0].get('experiment_revision_id')
+    experiment_id = configs[0].get('experiment_id')
+    try:
+        uuid.UUID(str(revision_id))
+        uuid.UUID(str(experiment_id))
+    except (ValueError, TypeError, AttributeError):
+        return None
+    session_id = ensure_shared_run_session_id(configs, participant_number)
+    try:
+        from autoscript_api import AutoScriptAPI
+        api = AutoScriptAPI()
+        run = api.create_run(
+            revision_id, session_id, participant_number, age, gender
+        )
+        api.start_run(run['id'])
+        for config in configs:
+            config['__server_run_id__'] = run['id']
+        return run['id']
+    except Exception as exc:
+        print(f"Cloud Run initialization failed; results will use the durable queue: {exc}")
+        return None
+
+
 _SESSION_SEED_SUFFIX = ".autoscript_session_seed"
 
 
@@ -1947,6 +1977,7 @@ class ExperimentCanvas(QWidget):
             'experiment_version': self.config.get('experiment_version', 1),
             'experiment_revision_id': self.config.get('experiment_revision_id'),
             'experiment_revision_number': self.config.get('experiment_revision_number'),
+            'server_run_id': self.config.get('__server_run_id__'),
             'block_name': identity['block_name'],
             'block_id': identity['block_id'],
             'block_index': identity['block_index'],
@@ -2032,18 +2063,23 @@ class ExperimentCanvas(QWidget):
             return 0, [], skipped
 
         from autoscript_api import AutoScriptAPI
+        from result_upload_queue import drain_upload_queue, enqueue_finalize, enqueue_result
         uploaded = 0
         errors = []
         try:
             api = AutoScriptAPI()
         except Exception as exc:
             return 0, [f"Cloud connection: {exc}"], skipped
+        run_ids = set()
         for data_file, result, experiment_id in cloud_results:
-            try:
-                api.upload_result(experiment_id, data_file)
-                uploaded += 1
-            except Exception as exc:
-                errors.append(f"{result.get('block_name', data_file.stem)}: {exc}")
+            run_id = result.get('server_run_id') or result.get('config', {}).get('__server_run_id__')
+            enqueue_result(data_file, experiment_id, run_id=run_id)
+            if run_id:
+                run_ids.add(str(run_id))
+        for run_id in run_ids:
+            enqueue_finalize(run_id)
+        uploaded, queue_errors = drain_upload_queue(api)
+        errors.extend(queue_errors)
         return uploaded, errors, skipped
 
     @staticmethod
@@ -2734,6 +2770,14 @@ class ExperimentWindow(QMainWindow):
         self.test_mode = test_mode
         self.next_window = None
         ensure_shared_run_session_id(self.session_configs, self.participant_number)
+        if self.session_config_index == 0:
+            initialize_cloud_run(
+                self.session_configs,
+                self.participant_number,
+                self.participant_age,
+                self.participant_gender,
+                test_mode=self.test_mode,
+            )
         layout = (self.config or {}).get('__session_layout__', {}) if self.config else {}
         self.start_cell_offset = int(layout.get('start_cell_offset', start_cell_offset) or 0)
         self.initial_page_number = max(1, int(initial_page_number or 1))

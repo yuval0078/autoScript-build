@@ -27,6 +27,7 @@ from ..schemas import (
     ExperimentRunResponse,
     RunAnalysisUpdate,
     RunArtifactResponse,
+    RunCreate,
     RunResultResponse,
 )
 from ..services.raw_results import RawResultValidationError, validate_raw_result
@@ -92,6 +93,9 @@ def _run_response(run):
         id=run.id,
         experiment_id=run.experiment_id,
         revision_id=run.revision_id,
+        status=run.status,
+        started_at=run.started_at,
+        finalized_at=run.finalized_at,
         session_id=run.session_id,
         participant_number=run.participant_number,
         participant_age=run.participant_age,
@@ -108,6 +112,17 @@ def _run_response(run):
         complete=complete,
         results=[_result_response(result) for result in results],
         artifacts=[_artifact_response(artifact) for artifact in artifacts],
+    )
+
+
+def _run_is_complete(run):
+    results = list(run.results)
+    return (
+        len(results) == run.block_count
+        and all(result.block_completed for result in results)
+        and all(result.experiment_completed for result in results)
+        and sum(result.completed_word_count for result in results)
+        == sum(result.expected_word_count for result in results)
     )
 
 
@@ -146,6 +161,137 @@ def _owned_run(database, actor, run_id):
     if run is None:
         raise HTTPException(status_code=404, detail="Experiment run was not found.")
     return run
+
+
+@router.post(
+    "/experiment-revisions/{revision_id}/runs",
+    response_model=ExperimentRunResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_experiment_run(
+    revision_id: uuid.UUID,
+    payload: RunCreate,
+    response: Response,
+    database: Session = Depends(get_db),
+    actor: User = Depends(get_current_user),
+):
+    revision = database.scalar(
+        select(ExperimentRevision)
+        .join(Experiment)
+        .where(
+            ExperimentRevision.id == revision_id,
+            Experiment.owner_id == actor.id,
+            Experiment.archived_at.is_(None),
+        )
+        .options(selectinload(ExperimentRevision.blocks))
+    )
+    if revision is None:
+        raise HTTPException(status_code=404, detail="Experiment revision was not found.")
+    existing = database.scalar(
+        select(ExperimentRun)
+        .where(
+            ExperimentRun.experiment_id == revision.experiment_id,
+            ExperimentRun.session_id == payload.session_id,
+        )
+        .options(
+            selectinload(ExperimentRun.results),
+            selectinload(ExperimentRun.artifacts),
+        )
+    )
+    if existing is not None:
+        expected = (
+            existing.revision_id,
+            existing.participant_number,
+            existing.participant_age,
+            existing.participant_gender,
+        )
+        actual = (
+            revision.id,
+            payload.participant_number,
+            payload.participant_age,
+            payload.participant_gender,
+        )
+        if expected != actual:
+            raise HTTPException(status_code=409, detail="Run creation metadata conflicts with the existing session.")
+        response.status_code = status.HTTP_200_OK
+        return _run_response(existing)
+    run = ExperimentRun(
+        id=uuid.uuid4(), experiment_id=revision.experiment_id, revision_id=revision.id,
+        session_id=payload.session_id,
+        participant_number=payload.participant_number,
+        participant_age=payload.participant_age,
+        participant_gender=payload.participant_gender,
+        block_count=len(revision.blocks),
+        source_experiment_name=revision.name,
+        source_experiment_id=str(revision.experiment_id),
+        status="created", created_by=actor.id,
+    )
+    database.add(run)
+    database.commit()
+    database.refresh(run)
+    return _run_response(run)
+
+
+def _transition_run(run, target):
+    terminal = {"completed", "incomplete", "failed", "cancelled"}
+    if run.status == target:
+        return
+    if target == "running" and run.status in {"incomplete", "failed"}:
+        run.status = "running"
+        run.finalized_at = None
+        return
+    if run.status in terminal and run.status != target:
+        raise HTTPException(status_code=409, detail=f"Run is already {run.status}.")
+    now = datetime.now(timezone.utc)
+    if target == "running" and run.started_at is None:
+        run.started_at = now
+    if target in terminal:
+        run.finalized_at = now
+    run.status = target
+
+
+@router.post("/runs/{run_id}/start", response_model=ExperimentRunResponse)
+def start_run(
+    run_id: uuid.UUID, database: Session = Depends(get_db),
+    actor: User = Depends(get_current_user),
+):
+    run = _owned_run(database, actor, run_id)
+    _transition_run(run, "running")
+    database.commit()
+    return _run_response(run)
+
+
+@router.post("/runs/{run_id}/finalize", response_model=ExperimentRunResponse)
+def finalize_run(
+    run_id: uuid.UUID, database: Session = Depends(get_db),
+    actor: User = Depends(get_current_user),
+):
+    run = _owned_run(database, actor, run_id)
+    _transition_run(run, "completed" if _run_is_complete(run) else "incomplete")
+    database.commit()
+    return _run_response(run)
+
+
+@router.post("/runs/{run_id}/cancel", response_model=ExperimentRunResponse)
+def cancel_run(
+    run_id: uuid.UUID, database: Session = Depends(get_db),
+    actor: User = Depends(get_current_user),
+):
+    run = _owned_run(database, actor, run_id)
+    _transition_run(run, "cancelled")
+    database.commit()
+    return _run_response(run)
+
+
+@router.post("/runs/{run_id}/fail", response_model=ExperimentRunResponse)
+def fail_run(
+    run_id: uuid.UUID, database: Session = Depends(get_db),
+    actor: User = Depends(get_current_user),
+):
+    run = _owned_run(database, actor, run_id)
+    _transition_run(run, "failed")
+    database.commit()
+    return _run_response(run)
 
 
 def _safe_json_filename(value):
@@ -254,6 +400,105 @@ def _ensure_consistent_run(run, metadata):
         )
 
 
+def _persist_received_result(
+    database, storage, actor, experiment, run, metadata,
+    upload_path, sha256, size_bytes, filename, response, auto_finalize=False,
+):
+    _ensure_consistent_run(run, metadata)
+    existing = next(
+        (result for result in run.results if result.block_index == metadata.block_index),
+        None,
+    )
+    if existing is not None:
+        if existing.sha256 != sha256:
+            raise HTTPException(
+                status_code=409,
+                detail="A different immutable result already exists for this Run and Block index.",
+            )
+        response.status_code = status.HTTP_200_OK
+        return _result_response(existing)
+    if run.status in {"completed", "incomplete", "failed", "cancelled"}:
+        raise HTTPException(status_code=409, detail=f"Run is already {run.status}.")
+
+    block_id = None
+    if metadata.source_block_id:
+        try:
+            candidate_id = uuid.UUID(metadata.source_block_id)
+        except (ValueError, TypeError, AttributeError):
+            candidate_id = None
+        if candidate_id is not None and any(block.id == candidate_id for block in experiment.blocks):
+            block_id = candidate_id
+    result = RunResult(
+        id=uuid.uuid4(), run_id=run.id, block_id=block_id,
+        block_index=metadata.block_index, block_count=metadata.block_count,
+        block_name=metadata.block_name, block_completed=metadata.block_completed,
+        experiment_completed=metadata.experiment_completed,
+        completed_word_count=metadata.completed_word_count,
+        expected_word_count=metadata.expected_word_count,
+        schema_version=metadata.schema_version, app_version=metadata.app_version,
+        result_timestamp=metadata.timestamp,
+        original_filename=_safe_json_filename(filename), sha256=sha256,
+        size_bytes=size_bytes, created_by=actor.id, storage_key="pending",
+    )
+    storage_key = (
+        f"experiments/{experiment.id}/runs/{run.id}/results/"
+        f"{result.id}/{sha256}.json"
+    )
+    result.storage_key = storage_key
+    try:
+        storage.put_file(storage_key, upload_path, "application/json")
+        database.add(result)
+        if run.started_at is None:
+            run.started_at = datetime.now(timezone.utc)
+        candidate_results = [
+            item for item in run.results if item.block_index != result.block_index
+        ] + [result]
+        legacy_complete = (
+            auto_finalize
+            and len(candidate_results) == run.block_count
+            and all(item.block_completed for item in candidate_results)
+            and all(item.experiment_completed for item in candidate_results)
+            and sum(item.completed_word_count for item in candidate_results)
+            == sum(item.expected_word_count for item in candidate_results)
+        )
+        run.status = "completed" if legacy_complete else "running"
+        if legacy_complete:
+            run.finalized_at = datetime.now(timezone.utc)
+        database.commit()
+        database.refresh(result)
+        return _result_response(result)
+    except Exception:
+        database.rollback()
+        storage.remove_object(storage_key)
+        raise
+
+
+@router.post(
+    "/runs/{run_id}/results",
+    response_model=RunResultResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def upload_run_result(
+    run_id: uuid.UUID,
+    request: Request,
+    response: Response,
+    x_filename: str | None = Header(default=None, alias="X-Filename"),
+    database: Session = Depends(get_db),
+    storage=Depends(get_object_storage),
+    actor: User = Depends(get_current_user),
+):
+    run = _owned_run(database, actor, run_id)
+    experiment = _owned_experiment(database, actor, run.experiment_id, lock=True)
+    upload_path, sha256, size_bytes, metadata = await _receive_result(request)
+    try:
+        return _persist_received_result(
+            database, storage, actor, experiment, run, metadata,
+            upload_path, sha256, size_bytes, x_filename, response,
+        )
+    finally:
+        upload_path.unlink(missing_ok=True)
+
+
 @router.post(
     "/experiments/{experiment_id}/results",
     response_model=RunResultResponse,
@@ -270,7 +515,6 @@ async def upload_result(
 ):
     experiment = _owned_experiment(database, actor, experiment_id, lock=True)
     upload_path, sha256, size_bytes, metadata = await _receive_result(request)
-    storage_key = None
     try:
         run = database.scalar(
             select(ExperimentRun)
@@ -303,79 +547,17 @@ async def upload_result(
                 block_count=metadata.block_count,
                 source_experiment_name=metadata.experiment_name,
                 source_experiment_id=metadata.source_experiment_id,
+                status="running",
+                started_at=datetime.now(timezone.utc),
                 created_by=actor.id,
             )
             database.add(run)
             database.flush()
-        else:
-            _ensure_consistent_run(run, metadata)
-
-        existing = next(
-            (
-                result
-                for result in run.results
-                if result.block_index == metadata.block_index
-            ),
-            None,
+        return _persist_received_result(
+            database, storage, actor, experiment, run, metadata,
+            upload_path, sha256, size_bytes, x_filename, response,
+            auto_finalize=True,
         )
-        if existing is not None:
-            if existing.sha256 != sha256:
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        "A different immutable result already exists for this "
-                        "session and Block index."
-                    ),
-                )
-            response.status_code = status.HTTP_200_OK
-            return _result_response(existing)
-
-        block_id = None
-        if metadata.source_block_id:
-            try:
-                candidate_id = uuid.UUID(metadata.source_block_id)
-            except (ValueError, TypeError, AttributeError):
-                candidate_id = None
-            if candidate_id is not None and any(
-                block.id == candidate_id for block in experiment.blocks
-            ):
-                block_id = candidate_id
-
-        result = RunResult(
-            id=uuid.uuid4(),
-            run_id=run.id,
-            block_id=block_id,
-            block_index=metadata.block_index,
-            block_count=metadata.block_count,
-            block_name=metadata.block_name,
-            block_completed=metadata.block_completed,
-            experiment_completed=metadata.experiment_completed,
-            completed_word_count=metadata.completed_word_count,
-            expected_word_count=metadata.expected_word_count,
-            schema_version=metadata.schema_version,
-            app_version=metadata.app_version,
-            result_timestamp=metadata.timestamp,
-            original_filename=_safe_json_filename(x_filename),
-            sha256=sha256,
-            size_bytes=size_bytes,
-            created_by=actor.id,
-            storage_key="pending",
-        )
-        storage_key = (
-            f"experiments/{experiment.id}/runs/{run.id}/results/"
-            f"{result.id}/{sha256}.json"
-        )
-        result.storage_key = storage_key
-        storage.put_file(storage_key, upload_path, "application/json")
-        database.add(result)
-        database.commit()
-        database.refresh(result)
-        return _result_response(result)
-    except Exception:
-        database.rollback()
-        if storage_key is not None:
-            storage.remove_object(storage_key)
-        raise
     finally:
         upload_path.unlink(missing_ok=True)
 

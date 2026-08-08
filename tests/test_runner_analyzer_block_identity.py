@@ -10,11 +10,37 @@ from analyzer_refactored import ParticipantData, _result_identity
 from tablet_experiment import (
     ExperimentCanvas,
     ensure_shared_run_session_id,
+    initialize_cloud_run,
     get_block_run_identity,
 )
 
 
 class RunnerBlockIdentityTests(unittest.TestCase):
+    def test_cloud_run_is_created_once_and_shared_by_all_blocks(self):
+        experiment_id = str(uuid.uuid4())
+        revision_id = str(uuid.uuid4())
+        configs = [
+            {"experiment_id": experiment_id, "experiment_revision_id": revision_id},
+            {"experiment_id": experiment_id, "experiment_revision_id": revision_id},
+        ]
+        calls = []
+
+        class FakeAPI:
+            def create_run(self, revision, session, number, age, gender):
+                calls.append(("create", revision, session, number, age, gender))
+                return {"id": "run-1"}
+
+            def start_run(self, run_id):
+                calls.append(("start", run_id))
+
+        with patch("autoscript_api.AutoScriptAPI", return_value=FakeAPI()):
+            first = initialize_cloud_run(configs, 12, 30, "Other")
+            second = initialize_cloud_run(configs, 12, 30, "Other")
+        self.assertEqual(first, "run-1")
+        self.assertEqual(second, "run-1")
+        self.assertEqual([call[0] for call in calls], ["create", "start"])
+        self.assertTrue(all(config["__server_run_id__"] == "run-1" for config in configs))
+
     def test_legacy_config_is_one_block_experiment(self):
         identity = get_block_run_identity(
             {"name": "Legacy package"},
@@ -119,18 +145,24 @@ class RunnerBlockIdentityTests(unittest.TestCase):
 
         class FakeAPI:
             def upload_result(self, target_experiment_id, result_path):
-                uploaded.append((target_experiment_id, Path(result_path)))
+                uploaded.append((target_experiment_id, Path(result_path).read_text(encoding="utf-8")))
 
         with tempfile.TemporaryDirectory() as temp_dir:
             result_path = Path(temp_dir) / "result.json"
             result_path.write_text("{}", encoding="utf-8")
-            with patch("autoscript_api.AutoScriptAPI", return_value=FakeAPI()):
+            queue_dir = Path(temp_dir) / "queue"
+            queue_dir.mkdir()
+            with patch("autoscript_api.AutoScriptAPI", return_value=FakeAPI()), patch(
+                "result_upload_queue.queue_root", return_value=queue_dir
+            ):
                 count, errors, skipped = canvas._upload_saved_results(
                     [(result_path, {"experiment_id": experiment_id})]
                 )
 
             self.assertTrue(result_path.exists())
-            self.assertEqual(uploaded, [(experiment_id, result_path)])
+            self.assertEqual(uploaded[0][0], experiment_id)
+            self.assertEqual(uploaded[0][1], "{}")
+            self.assertEqual(list(queue_dir.iterdir()), [])
             self.assertEqual((count, errors, skipped), (1, [], 0))
 
     def test_local_legacy_and_test_runs_are_not_uploaded(self):
