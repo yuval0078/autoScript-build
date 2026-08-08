@@ -353,6 +353,8 @@ class ComponentArtifactContractTests(unittest.TestCase):
         self.assertIn("AUTOSCRIPT_UPDATE_SIGNING_KEY", workflow)
         self.assertIn("create_signed_update_catalog.py", workflow)
         self.assertIn("--draft", workflow)
+        self.assertIn("gh release list", workflow)
+        self.assertNotIn("gh release view $tag", workflow)
         self.assertNotIn("git push", workflow)
         self.assertNotIn("--latest", workflow)
 

@@ -212,8 +212,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           $tag = "${{ steps.catalog.outputs.tag }}"
-          gh release view $tag *> $null
-          if ($LASTEXITCODE -eq 0) { throw "Release tag $tag already exists" }
+          $existingReleases = gh release list --limit 100 --json tagName | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw "Could not inspect existing releases" }
+          if ($existingReleases | Where-Object { $_.tagName -eq $tag }) {
+            throw "Release tag $tag already exists"
+          }
           $assets = @(
             Get-ChildItem "release-assets" -Recurse -File |
               Where-Object {
