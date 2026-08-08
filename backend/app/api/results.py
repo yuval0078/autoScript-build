@@ -36,6 +36,7 @@ router = APIRouter(prefix="/api/v1", tags=["results"])
 ARTIFACT_TYPES = {
     "analysis_csv": (".csv", "text/csv; charset=utf-8"),
     "trainable_json": (".json", "application/json"),
+    "analysis_state": (".json", "application/json"),
 }
 
 

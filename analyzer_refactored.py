@@ -492,6 +492,95 @@ def _participant_offsets(participants: List[ParticipantData]) -> List[int]:
     return offsets
 
 
+def build_analysis_state(
+    participants: List[ParticipantData],
+    participant_indices: List[int],
+    written_words: Dict[int, str],
+    word_correctness: Dict[int, bool],
+    train_mode: Dict[int, str],
+):
+    """Serialize the editable Analyzer workspace for one participant run."""
+    offsets = _participant_offsets(participants)
+    sources = []
+    for participant_index in participant_indices:
+        participant = participants[participant_index]
+        flat_index = offsets[participant_index]
+        words = []
+        for word_data in participant.words:
+            annotation = {
+                "letters": word_data.get("letters", []),
+                "assigned_letters": word_data.get("assigned_letters", {}),
+                "stroke_slices": word_data.get("stroke_slices", []),
+                "trainability": train_mode.get(flat_index, "trainable"),
+            }
+            if flat_index in written_words:
+                annotation["written_word"] = written_words[flat_index]
+            if flat_index in word_correctness:
+                annotation["correct"] = word_correctness[flat_index]
+            words.append(annotation)
+            flat_index += 1
+        sources.append(
+            {
+                "session_id": participant.session_id,
+                "block_id": participant.block_id,
+                "block_index": participant.block_index,
+                "block_name": participant.block_name,
+                "words": words,
+            }
+        )
+    return {"schema_version": "1.0", "sources": sources}
+
+
+def apply_analysis_state(
+    participants: List[ParticipantData],
+    state: dict,
+    written_words: Dict[int, str],
+    word_correctness: Dict[int, bool],
+    train_mode: Dict[int, str],
+):
+    """Merge a saved workspace into loaded raw results; absent/old state is safe."""
+    if not isinstance(state, dict) or not isinstance(state.get("sources"), list):
+        return 0
+    offsets = _participant_offsets(participants)
+    restored = 0
+    for source in state["sources"]:
+        if not isinstance(source, dict):
+            continue
+        match = None
+        for index, participant in enumerate(participants):
+            if source.get("session_id") != participant.session_id:
+                continue
+            source_block_id = source.get("block_id")
+            if source_block_id and source_block_id == participant.block_id:
+                match = index
+                break
+            if source.get("block_index") == participant.block_index:
+                match = index
+                break
+        if match is None:
+            continue
+        saved_words = source.get("words", [])
+        participant = participants[match]
+        for word_index, annotation in enumerate(saved_words[:len(participant.words)]):
+            if not isinstance(annotation, dict):
+                continue
+            word_data = participant.words[word_index]
+            for key in ("letters", "assigned_letters", "stroke_slices"):
+                if key in annotation:
+                    word_data[key] = annotation[key]
+            flat_index = offsets[match] + word_index
+            if "written_word" in annotation:
+                written_words[flat_index] = annotation["written_word"]
+            if "correct" in annotation:
+                word_correctness[flat_index] = bool(annotation["correct"])
+            if annotation.get("trainability"):
+                train_mode[flat_index] = annotation["trainability"]
+            participant._stroke_cache.pop(word_index, None)
+            participant._bounds_cache.pop(word_index, None)
+            restored += 1
+    return restored
+
+
 def build_trainable_payload(
     participants: List[ParticipantData],
     participant_indices: List[int],
@@ -1149,12 +1238,80 @@ class PenDataPlayer(QMainWindow):
         self.group_select_mode = False
         self.analysis_context = None
         self.analysis_context_saved = False
+        self._pending_analysis_states = []
         
         self._init_ui()
+        self.analysis_save_timer = QTimer(self)
+        self.analysis_save_timer.setInterval(15000)
+        self.analysis_save_timer.timeout.connect(self._autosave_cloud_analysis_state)
 
     def set_analysis_context(self, context):
         self.analysis_context = context if isinstance(context, dict) else None
         self.analysis_context_saved = False
+        self._pending_analysis_states = []
+        for run in (self.analysis_context or {}).get('runs', []):
+            state_path = run.get('analysis_state_path')
+            if not state_path:
+                continue
+            try:
+                with open(state_path, 'r', encoding='utf-8') as state_file:
+                    self._pending_analysis_states.append(json.load(state_file))
+            except (OSError, ValueError) as exc:
+                print(f"Could not load saved analysis state {state_path}: {exc}")
+        if self.analysis_context:
+            self.analysis_save_timer.start()
+
+    def _restore_pending_analysis_states(self):
+        restored = 0
+        for state in self._pending_analysis_states:
+            restored += apply_analysis_state(
+                self.participants,
+                state,
+                self.written_words,
+                self.word_correctness,
+                self.train_mode,
+            )
+        self._pending_analysis_states = []
+        if restored:
+            print(f"Restored Analyzer edit state for {restored} word(s).")
+
+    def _save_cloud_analysis_state(self, api=None):
+        if not self.analysis_context or not self.participants:
+            return
+        if self.current_word_index >= 0:
+            self._save_letters_to_word_data()
+        if api is None:
+            from autoscript_api import AutoScriptAPI
+            api = AutoScriptAPI(base_url=self.analysis_context.get('api_url'), timeout=60)
+        output_root = os.path.abspath(self.analysis_context['output_dir'])
+        os.makedirs(output_root, exist_ok=True)
+        for run in self.analysis_context.get('runs', []):
+            participant_indices = [
+                index for index, participant in enumerate(self.participants)
+                if participant.session_id == run.get('session_id')
+            ]
+            if not participant_indices:
+                continue
+            run_dir = os.path.join(output_root, str(run['id']))
+            os.makedirs(run_dir, exist_ok=True)
+            state_path = os.path.join(run_dir, 'analysis_state.json')
+            state = build_analysis_state(
+                self.participants,
+                participant_indices,
+                self.written_words,
+                self.word_correctness,
+                self.train_mode,
+            )
+            state.update({"run_id": run['id'], "session_id": run.get('session_id')})
+            with open(state_path, 'w', encoding='utf-8') as state_file:
+                json.dump(state, state_file, ensure_ascii=False, indent=2)
+            api.upload_run_artifact(run['id'], 'analysis_state', state_path)
+
+    def _autosave_cloud_analysis_state(self):
+        try:
+            self._save_cloud_analysis_state()
+        except Exception as exc:
+            print(f"Analyzer edit-state autosave failed: {exc}")
 
     def _finalize_cloud_analysis(self, completed):
         if not self.analysis_context:
@@ -1170,6 +1327,7 @@ class PenDataPlayer(QMainWindow):
         )
         output_root = os.path.abspath(self.analysis_context['output_dir'])
         os.makedirs(output_root, exist_ok=True)
+        self._save_cloud_analysis_state(api)
         for run in self.analysis_context.get('runs', []):
             session_id = run.get('session_id')
             participant_indices = [
@@ -1932,6 +2090,7 @@ class PenDataPlayer(QMainWindow):
         
         if self.participants:
             self._rebuild_flattened_data()
+            self._restore_pending_analysis_states()
             self._populate_tree()
             self._update_loaded_label()
             self.export_btn.setEnabled(True)

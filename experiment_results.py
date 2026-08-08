@@ -429,7 +429,13 @@ class ExperimentResultsPage(QWidget):
             downloaded = []
             context_runs = []
             for run in runs:
-                context_runs.append({"id": run["id"], "session_id": run["session_id"]})
+                context_run = {"id": run["id"], "session_id": run["session_id"]}
+                state_artifact = self._latest_artifact(run, "analysis_state")
+                if state_artifact is not None:
+                    state_path = workspace / f"{run['id']}_analysis_state.json"
+                    self.api.download_run_artifact(state_artifact, state_path)
+                    context_run["analysis_state_path"] = str(state_path)
+                context_runs.append(context_run)
                 for result in sorted(
                     run.get("results", []), key=lambda item: item.get("block_index", 0)
                 ):

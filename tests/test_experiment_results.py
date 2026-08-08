@@ -8,6 +8,8 @@ from unittest.mock import patch
 from analyzer_refactored import (
     ParticipantData,
     PenDataPlayer,
+    apply_analysis_state,
+    build_analysis_state,
     build_trainable_payload,
     write_analysis_csv,
 )
@@ -103,7 +105,27 @@ class AnalyzerArtifactTests(unittest.TestCase):
         self.assertEqual(rows[1][7], participant.session_id)
         self.assertEqual(rows[1][15], "a")
 
-    def test_cloud_finalize_uploads_both_artifacts_before_status(self):
+    def test_analysis_edit_state_round_trips_all_editable_word_fields(self):
+        participant = self.participant()
+        state = build_analysis_state(
+            [participant], [0], {0: "a"}, {0: True}, {0: "low-quality"}
+        )
+        restored = self.participant()
+        restored.words[0].pop("letters")
+        restored.words[0].pop("assigned_letters")
+        restored.words[0]["stroke_slices"] = []
+        written, correctness, train_mode = {}, {}, {}
+        count = apply_analysis_state(
+            [restored], state, written, correctness, train_mode
+        )
+        self.assertEqual(count, 1)
+        self.assertEqual(restored.words[0]["assigned_letters"], {"0": "a"})
+        self.assertEqual(restored.words[0]["letters"][0]["char"], "a")
+        self.assertEqual(written[0], "a")
+        self.assertTrue(correctness[0])
+        self.assertEqual(train_mode[0], "low-quality")
+
+    def test_cloud_finalize_uploads_edit_state_and_exports_before_status(self):
         participant = self.participant()
         calls = []
 
@@ -137,7 +159,7 @@ class AnalyzerArtifactTests(unittest.TestCase):
 
         self.assertEqual(
             [call[2] for call in calls if call[0] == "artifact"],
-            ["analysis_csv", "trainable_json"],
+            ["analysis_state", "analysis_csv", "trainable_json"],
         )
         self.assertEqual(calls[-1], ("status", "run-1", True))
 
