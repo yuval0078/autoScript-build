@@ -66,7 +66,10 @@ class ResultUploadQueueTests(unittest.TestCase):
 
             self.assertEqual(uploaded, 0)
             self.assertTrue(errors)
-            self.assertEqual(calls, [("cancel", "run-1"), ("fail", "run-2")])
+            # Transitions for independent Runs have no cross-Run ordering
+            # contract. On Windows their timestamps may tie, so verify exact
+            # delivery without making UUID filename order part of the API.
+            self.assertCountEqual(calls, [("cancel", "run-1"), ("fail", "run-2")])
             self.assertEqual(list(root.glob("*.queue.json")), [])
             self.assertEqual(len(list((root / "quarantine").glob("*.queue.json"))), 1)
 
