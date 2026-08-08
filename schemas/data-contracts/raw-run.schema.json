@@ -1,7 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://autoscript.local/schemas/data-contracts/raw-run.schema.json",
-  "title": "Runner result JSON as currently emitted",
+  "title": "Runner block result JSON",
+  "description": "A result for one executed block. Block identity is present in v1.1; v1.0 files without it remain valid for backwards compatibility.",
   "type": "object",
   "required": [
     "schema_version",
@@ -22,7 +23,11 @@
   ],
   "properties": {
     "schema_version": {
-      "const": "1.0"
+      "enum": [
+        "1.0",
+        "1.1",
+        "1.2"
+      ]
     },
     "app_version": {
       "type": "string",
@@ -45,6 +50,39 @@
         "string",
         "null"
       ]
+    },
+    "block_name": {
+      "type": "string",
+      "minLength": 1
+    },
+    "block_id": {
+      "type": [
+        "string",
+        "integer",
+        "null"
+      ]
+    },
+    "block_index": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "block_count": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "block_completed": {
+      "type": "boolean"
+    },
+    "experiment_completed": {
+      "type": "boolean"
+    },
+    "completed_word_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "expected_word_count": {
+      "type": "integer",
+      "minimum": 0
     },
     "session_experiment_index": {
       "type": "integer",
@@ -92,6 +130,45 @@
       }
     }
   },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "schema_version": {
+            "enum": [
+              "1.1",
+              "1.2"
+            ]
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "block_name",
+          "block_id",
+          "block_index",
+          "block_count"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "schema_version": {
+            "const": "1.2"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "block_completed",
+          "experiment_completed",
+          "completed_word_count",
+          "expected_word_count"
+        ]
+      }
+    }
+  ],
   "$defs": {
     "wordRecord": {
       "type": "object",

@@ -28,6 +28,42 @@
         "words"
       ],
       "properties": {
+        "experiment_name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "experiment_id": {
+          "type": [
+            "string",
+            "integer",
+            "null"
+          ]
+        },
+        "block_name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "block_id": {
+          "type": [
+            "string",
+            "integer",
+            "null"
+          ]
+        },
+        "block_index": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "block_count": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "participant_number": {
           "type": [
             "integer",

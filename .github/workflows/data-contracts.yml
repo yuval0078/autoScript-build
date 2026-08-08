@@ -19,5 +19,12 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Install JSON Schema validator
+        run: python -m pip install "jsonschema>=4.23,<5"
+
       - name: Verify schemas match current emitters
-        run: python -m unittest tests.test_data_contract_schemas -v
+        run: >-
+          python -m unittest
+          tests.test_data_contract_schemas
+          tests.test_data_contract_fixtures
+          -v

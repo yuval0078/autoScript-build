@@ -93,6 +93,16 @@ def _manifest_to_legacy_config(config_path: str, manifest: dict) -> dict:
         'experiment_version': manifest.get('experiment_version')
     }
 
+    for identity_key in (
+        'experiment_name',
+        'block_name',
+        'block_id',
+        'block_index',
+        'block_count',
+    ):
+        if identity_key in manifest:
+            legacy_config[identity_key] = manifest[identity_key]
+
     return legacy_config
 
 
@@ -116,6 +126,125 @@ def load_experiment_config(config_path: str) -> dict:
     prepare_experiment_runtime(config)
 
     return config
+
+
+def _first_identity_value(*values):
+    """Return the first identity value that is present and non-empty."""
+    for value in values:
+        if value is not None and value != '':
+            return value
+    return None
+
+
+def _positive_identity_int(value, fallback):
+    """Coerce a 1-based index/count, falling back for missing legacy metadata."""
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return fallback
+    return parsed if parsed >= 1 else fallback
+
+
+def get_block_run_identity(config: dict, session_index=0, session_total=1) -> dict:
+    """Resolve parent-experiment and block identity for old and new configs.
+
+    New launchers inject the six public identity keys at the top level. The
+    nested contexts are accepted for early bundles, while a legacy ZIP whose
+    config only has ``name`` is treated as a one-block experiment.
+    """
+    config = config if isinstance(config, dict) else {}
+    experiment_context = config.get('__experiment__')
+    if not isinstance(experiment_context, dict):
+        experiment_context = {}
+    block_context = config.get('__block__')
+    if not isinstance(block_context, dict):
+        block_context = {}
+    properties = config.get('properties')
+    if not isinstance(properties, dict):
+        properties = {}
+
+    legacy_name = _first_identity_value(
+        config.get('name'),
+        properties.get('experiment_name'),
+    )
+    if legacy_name is None and config.get('__file_path__'):
+        legacy_name = Path(str(config['__file_path__'])).stem
+    legacy_name = str(legacy_name or 'experiment')
+
+    block_name = _first_identity_value(
+        config.get('block_name'),
+        config.get('__block_name__'),
+        block_context.get('name'),
+        legacy_name,
+    )
+    experiment_name = _first_identity_value(
+        config.get('experiment_name'),
+        config.get('__experiment_name__'),
+        config.get('parent_experiment_name'),
+        experiment_context.get('name'),
+        block_name,
+    )
+    experiment_id = _first_identity_value(
+        config.get('experiment_id'),
+        config.get('__experiment_id__'),
+        config.get('parent_experiment_id'),
+        experiment_context.get('id'),
+        experiment_name,
+    )
+    block_id = _first_identity_value(
+        config.get('block_id'),
+        config.get('__block_id__'),
+        block_context.get('id'),
+    )
+
+    default_index = max(1, int(session_index or 0) + 1)
+    default_count = max(default_index, int(session_total or 1))
+    block_index = _positive_identity_int(
+        _first_identity_value(
+            config.get('block_index'),
+            config.get('__block_index__'),
+            block_context.get('index'),
+        ),
+        default_index,
+    )
+    block_count = _positive_identity_int(
+        _first_identity_value(
+            config.get('block_count'),
+            config.get('__block_count__'),
+            experiment_context.get('block_count'),
+        ),
+        default_count,
+    )
+    block_count = max(block_count, block_index)
+
+    return {
+        'experiment_name': str(experiment_name),
+        'experiment_id': experiment_id,
+        'block_name': str(block_name),
+        'block_id': block_id,
+        'block_index': block_index,
+        'block_count': block_count,
+    }
+
+
+def ensure_shared_run_session_id(configs, participant_number) -> str:
+    """Assign one run/session id to every block config in an experiment run."""
+    usable_configs = [config for config in (configs or []) if isinstance(config, dict)]
+    existing = next(
+        (
+            config.get('__run_session_id__')
+            for config in usable_configs
+            if config.get('__run_session_id__')
+        ),
+        None,
+    )
+    session_id = existing or (
+        f"{participant_number}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_"
+        f"{uuid.uuid4().hex[:6]}"
+    )
+    for config in usable_configs:
+        config['__run_session_id__'] = session_id
+    return session_id
 
 
 _SESSION_SEED_SUFFIX = ".autoscript_session_seed"
@@ -1171,6 +1300,13 @@ class ExperimentCanvas(QWidget):
             self.beep_before_delay = beeps.get('before', {}).get('delay_ms', 100)
             self.beep_after = beeps.get('after', {}).get('enabled', False)
             self.beep_after_delay = beeps.get('after', {}).get('delay_ms', 100)
+
+        self.run_identity = get_block_run_identity(
+            self.config,
+            session_index=self.session_index,
+            session_total=self.session_total,
+        )
+        self.exp_name = self.run_identity['block_name']
             
         self.grid_size = self.grid_rows # For compatibility with some methods, though we should use rows/cols
         self.total_cells = self.grid_rows * self.grid_cols
@@ -1285,7 +1421,12 @@ class ExperimentCanvas(QWidget):
         self.grid_size = self.grid_rows # For compatibility with some methods, though we should use rows/cols
         self.total_cells = self.grid_rows * self.grid_cols
         
-        print(f"✓ Loaded {len(self.words)} words for experiment")
+        self.exp_name = get_block_run_identity(
+            self.config,
+            session_index=self.session_index,
+            session_total=self.session_total,
+        )['block_name']
+        print(f"✓ Loaded {len(self.words)} words for block")
     
     
     def _shuffle_with_spacing(self, word_pool):
@@ -1296,7 +1437,7 @@ class ExperimentCanvas(QWidget):
         return _shuffle_words_with_spacing(word_pool)
 
     def _current_experiment_display_name(self):
-        """Return the current experiment file label shown in the session banner."""
+        """Return the current block label shown in the session banner."""
         display_name = self.session_layout.get('display_name') if self.session_layout else None
         if display_name:
             return str(display_name)
@@ -1307,7 +1448,7 @@ class ExperimentCanvas(QWidget):
         return self.exp_name or 'experiment'
 
     def _current_word_progress_text(self):
-        """Return the 1-based word progress for the current experiment."""
+        """Return the 1-based word progress for the current block."""
         total_words = len(self.words)
         if total_words <= 0:
             return '0/0'
@@ -1316,11 +1457,16 @@ class ExperimentCanvas(QWidget):
         return f"{word_number}/{total_words}"
 
     def _current_session_experiment_text(self):
-        """Return the current experiment index within the session."""
-        return f"{self.session_index + 1}/{self.session_total}"
+        """Return the current block index/count (legacy method name)."""
+        identity = get_block_run_identity(
+            self.config,
+            session_index=self.session_index,
+            session_total=self.session_total,
+        )
+        return f"{identity['block_index']}/{identity['block_count']}"
 
     def _current_heading_prefix(self):
-        """Return the shared heading prefix for the current experiment state."""
+        """Return the shared heading prefix for the current block state."""
         return (
             f"{self._current_experiment_display_name()} "
             f"({self._current_session_experiment_text()}) - "
@@ -1778,7 +1924,7 @@ class ExperimentCanvas(QWidget):
         return safe or 'experiment'
     
     def collect_experiment_data(self):
-        """Finalize this experiment and return the JSON-ready result data."""
+        """Finalize this block and return the JSON-ready result data."""
         if self.completed_data is not None:
             return self.completed_data
         
@@ -1788,18 +1934,36 @@ class ExperimentCanvas(QWidget):
             self.pen_recorder.end_word()
         
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        identity = get_block_run_identity(
+            self.config,
+            session_index=self.session_index,
+            session_total=self.session_total,
+        )
         self.completed_data = {
-            'schema_version': '1.0',
+            'schema_version': '1.2',
             'app_version': APP_VERSION,
-            'experiment_name': self.exp_name,
-            'experiment_id': self.config.get('experiment_id', self.exp_name),
+            'experiment_name': identity['experiment_name'],
+            'experiment_id': identity['experiment_id'],
             'experiment_version': self.config.get('experiment_version', 1),
-            'session_experiment_index': self.session_index + 1,
-            'session_experiment_count': self.session_total,
+            'block_name': identity['block_name'],
+            'block_id': identity['block_id'],
+            'block_index': identity['block_index'],
+            'block_count': identity['block_count'],
+            'block_completed': len(self.pen_recorder.all_word_data) >= len(self.words),
+            'experiment_completed': (
+                len(self.pen_recorder.all_word_data) >= len(self.words)
+                and identity['block_count'] == 1
+            ),
+            'completed_word_count': len(self.pen_recorder.all_word_data),
+            'expected_word_count': len(self.words),
+            'session_experiment_index': identity['block_index'],
+            'session_experiment_count': identity['block_count'],
             'participant_number': self.participant_number,
             'participant_age': self.participant_age,
             'participant_gender': self.participant_gender,
-            'session_id': f"{self.participant_number}_{timestamp}_{uuid.uuid4().hex[:6]}",
+            'session_id': self.config.get('__run_session_id__') or (
+                f"{self.participant_number}_{timestamp}_{uuid.uuid4().hex[:6]}"
+            ),
             'timestamp': timestamp,
             'calibration': self.calibration_data,
             'config': self.config,
@@ -1845,6 +2009,56 @@ class ExperimentCanvas(QWidget):
                 pygame.mixer.music.stop()
         except Exception:
             pass
+
+    def _upload_saved_results(self, saved_results):
+        """Upload cloud-run results without risking the already saved local files."""
+        if self.test_mode:
+            return 0, [], len(saved_results)
+
+        cloud_results = []
+        skipped = 0
+        for data_file, result in saved_results:
+            experiment_id = result.get('experiment_id')
+            try:
+                uuid.UUID(str(experiment_id))
+            except (ValueError, TypeError, AttributeError):
+                skipped += 1
+                continue
+            cloud_results.append((data_file, result, str(experiment_id)))
+
+        if not cloud_results:
+            return 0, [], skipped
+
+        from autoscript_api import AutoScriptAPI
+        uploaded = 0
+        errors = []
+        try:
+            api = AutoScriptAPI()
+        except Exception as exc:
+            return 0, [f"Cloud connection: {exc}"], skipped
+        for data_file, result, experiment_id in cloud_results:
+            try:
+                api.upload_result(experiment_id, data_file)
+                uploaded += 1
+            except Exception as exc:
+                errors.append(f"{result.get('block_name', data_file.stem)}: {exc}")
+        return uploaded, errors, skipped
+
+    @staticmethod
+    def _cloud_save_status(uploaded, errors, skipped):
+        if errors:
+            detail = "\n".join(errors[:3])
+            if len(errors) > 3:
+                detail += f"\n...and {len(errors) - 3} more"
+            return (
+                f"\n\nCloud: uploaded {uploaded}; {len(errors)} failed. "
+                f"The local files are safe.\n{detail}"
+            )
+        if uploaded:
+            return f"\n\nCloud: uploaded {uploaded} result file(s)."
+        if skipped:
+            return "\n\nLocal/legacy run: results were kept locally."
+        return ""
     
     def _save_single_result(self, combined_data, dialog_parent):
         """Save one experiment result using the existing file-save flow."""
@@ -1878,14 +2092,24 @@ class ExperimentCanvas(QWidget):
             return
         
         try:
+            combined_data['experiment_completed'] = bool(
+                combined_data.get('block_completed', False)
+            )
             data_file = Path(save_path)
             with open(str(data_file), 'w', encoding='utf-8') as f:
                 json.dump(combined_data, f, ensure_ascii=False, indent=2)
+
+            uploaded, errors, skipped = self._upload_saved_results(
+                [(data_file, combined_data)]
+            )
             
             msg = QMessageBox(dialog_parent)
             msg.setIcon(QMessageBox.Information)
             msg.setWindowTitle("Experiment Complete")
-            msg.setText(f"Experiment finished!\n\nData saved to:\n{str(data_file)}")
+            msg.setText(
+                f"Experiment finished!\n\nData saved to:\n{str(data_file)}"
+                + self._cloud_save_status(uploaded, errors, skipped)
+            )
             msg.setWindowModality(Qt.ApplicationModal)
             msg.setWindowFlag(Qt.WindowStaysOnTopHint, True)
             msg.exec_()
@@ -1902,7 +2126,7 @@ class ExperimentCanvas(QWidget):
         self._cleanup_and_quit()
     
     def _save_session_results(self, session_results, dialog_parent):
-        """Save every experiment in a multi-experiment session as separate files."""
+        """Save every block result in a multi-block experiment separately."""
         from pathlib import Path
         from PyQt5.QtWidgets import QFileDialog
         from app_paths import ensure_dir, user_data_dir
@@ -1915,7 +2139,7 @@ class ExperimentCanvas(QWidget):
         )
         
         if not parent_dir:
-            if not self._confirm_discard(dialog_parent, "Are you sure you want to exit without saving this experiment session?"):
+            if not self._confirm_discard(dialog_parent, "Are you sure you want to exit without saving this experiment run?"):
                 self.finish_experiment()
             else:
                 print("⚠ Experiment session data discarded by user")
@@ -1927,8 +2151,14 @@ class ExperimentCanvas(QWidget):
         
         saved_files = []
         try:
+            experiment_completed = (
+                len(session_results) == self.session_total
+                and all(result.get('block_completed', False) for result in session_results)
+            )
+            for result in session_results:
+                result['experiment_completed'] = experiment_completed
             for index, result in enumerate(session_results, start=1):
-                stem = self._result_file_stem(result.get('config'), result.get('experiment_name'))
+                stem = self._result_file_stem(result.get('config'), result.get('block_name'))
                 filename = f"{stem}_p{self.participant_number}_{result.get('timestamp')}.json"
                 data_file = session_dir / filename
                 if data_file.exists():
@@ -1947,17 +2177,23 @@ class ExperimentCanvas(QWidget):
             error_msg.exec_()
             return
         
+        uploaded, errors, skipped = self._upload_saved_results(
+            list(zip(saved_files, session_results))
+        )
         msg = QMessageBox(dialog_parent)
         msg.setIcon(QMessageBox.Information)
         msg.setWindowTitle("Session Complete")
-        msg.setText(f"Saved {len(saved_files)} experiment files to:\n{str(session_dir)}")
+        msg.setText(
+            f"Saved {len(saved_files)} block result files to:\n{str(session_dir)}"
+            + self._cloud_save_status(uploaded, errors, skipped)
+        )
         msg.setWindowModality(Qt.ApplicationModal)
         msg.setWindowFlag(Qt.WindowStaysOnTopHint, True)
         msg.exec_()
         self._cleanup_and_quit()
     
     def finish_experiment(self):
-        """Finalize and save this experiment or full multi-experiment session."""
+        """Finalize and save this block or the full multi-block experiment."""
         dialog_parent = self.window()
         current_data = self.collect_experiment_data()
         self._stop_runtime_activity()
@@ -2437,7 +2673,7 @@ class ExperimentCanvas(QWidget):
             if self._audio_is_playing():
                 text = f"{heading_prefix} - Finish writing - waiting for audio to finish"
             elif self.waiting_for_next_experiment_spacebar:
-                text = f"{heading_prefix} - Finish writing - press SPACE for next experiment"
+                text = f"{heading_prefix} - Finish writing - press SPACE for next block"
             else:
                 text = f"{heading_prefix} - Finish writing - press SPACE to save data"
         elif self.current_cell < len(self.words):
@@ -2460,7 +2696,7 @@ class ExperimentCanvas(QWidget):
                     f"Write: '{word}' - Auto-advance enabled"
                 )
         else:
-            text = f"{self._current_heading_prefix()} - Experiment Complete!"
+            text = f"{self._current_heading_prefix()} - Block Complete!"
         
         painter.drawText(self.rect(), Qt.AlignTop | Qt.AlignHCenter, text)
 
@@ -2495,6 +2731,7 @@ class ExperimentWindow(QMainWindow):
         self.session_results = list(session_results) if session_results else []
         self.test_mode = test_mode
         self.next_window = None
+        ensure_shared_run_session_id(self.session_configs, self.participant_number)
         layout = (self.config or {}).get('__session_layout__', {}) if self.config else {}
         self.start_cell_offset = int(layout.get('start_cell_offset', start_cell_offset) or 0)
         self.initial_page_number = max(1, int(initial_page_number or 1))
@@ -2571,7 +2808,7 @@ class ExperimentWindow(QMainWindow):
         self.recalib_window.show()
     
     def finish_current_and_start_next(self):
-        """Finalize the current experiment and continue to the next session config."""
+        """Finalize the current block and continue to the next block config."""
         next_index = self.session_config_index + 1
         if next_index >= len(self.session_configs):
             self.canvas.finish_experiment()

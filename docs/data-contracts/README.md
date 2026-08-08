@@ -1,6 +1,6 @@
 # AutoScript current data contracts
 
-This directory documents the files that the desktop scripts produce **right now**. Stage 1 does not change Builder, Runner, or Analyzer output and does not require fields that the scripts do not currently write.
+This directory documents the files that the desktop scripts produce **right now**, including the Experiment/Block identity added for the API-backed workflow. Legacy fields and file shapes remain supported where noted.
 
 The schemas are observational contracts for the current files. Proposed database identifiers and future normalized formats are documented separately and must not be confused with the current JSON structure.
 
@@ -20,7 +20,10 @@ The JSON currently contains:
 
 ```text
 app_version
+schema_version
+package_type
 name
+block_name
 grid
 order
 sequence
@@ -38,13 +41,18 @@ Important current behavior:
 - `active_block_sequence` is serialized from Python tuples, so every item is a two-element JSON array: `[group_name, repetition_index]`.
 - `files[].owner_group` contains a group **name**, not a group ID.
 - `groups[].words[].source_file` contains the copied media filename, not a database ID.
-- The package currently has no `schema_version`, stable experiment ID, experiment-version ID, checksums, or creation timestamp.
+- New packages identify themselves with `schema_version: "2.0"` and
+  `package_type: "block"`. Stable cloud Experiment and Block IDs live in the
+  bundle manifest/API metadata rather than being required in a standalone
+  Block ZIP, preserving compatibility with older ZIPs.
 
 Schema: `schemas/data-contracts/experiment-package.schema.json`.
 
 ## 2. Runner raw result
 
-`tablet_experiment.py` currently saves one object per completed experiment with these top-level fields:
+`tablet_experiment.py` saves one object per completed Block. All Blocks in the
+same Experiment run share a `session_id`; multi-Block runs therefore produce
+one JSON file per Block with these top-level fields:
 
 ```text
 schema_version
@@ -52,6 +60,14 @@ app_version
 experiment_name
 experiment_id
 experiment_version
+block_name
+block_id
+block_index
+block_count
+block_completed
+experiment_completed
+completed_word_count
+expected_word_count
 session_experiment_index
 session_experiment_count
 participant_number
@@ -66,12 +82,17 @@ words
 
 Current details:
 
-- `schema_version` is the string `"1.0"`.
-- `experiment_id` falls back to the experiment name when the loaded configuration does not provide one.
+- Newly emitted files use `schema_version: "1.2"`. Version 1.0 files without
+  Block identity remain schema-valid and loadable by the Analyzer.
+- `experiment_id` is the cloud Experiment UUID for cloud runs and falls back
+  to the local/legacy experiment identity when no cloud record exists.
 - In the manifest compatibility path, `experiment_id` and `experiment_version` can be `null` when the manifest omits them.
 - `experiment_version` otherwise falls back to `1`.
 - `timestamp` uses local time in `YYYYMMDD_HHMMSS` form, not ISO 8601.
 - `session_id` is `<participant>_<timestamp>_<six hex characters>`.
+- `block_completed` compares `completed_word_count` with
+  `expected_word_count`. `experiment_completed` is true only when every
+  expected word in every Block was saved for the run.
 - `calibration` is `{"corners": [[x, y], ...]}` with four corner pairs.
 - `config` contains the loaded configuration object. In the legacy loading path it may include runtime-only keys such as `__file_path__`.
 - Every word contains `word`, `cell`, `group`, timing fields, and `pen_events`.
@@ -86,10 +107,17 @@ Schema: `schemas/data-contracts/raw-run.schema.json`.
 - one participant: one participant object;
 - multiple participants: an array of participant objects.
 
-A participant object contains:
+A participant object contains source identity plus participant metadata:
 
 ```text
 participant_number
+experiment_name
+experiment_id
+block_name
+block_id
+block_index
+block_count
+session_id
 participant_age
 participant_gender
 timestamp
@@ -152,9 +180,10 @@ Screenshot File
 
 The number of CSV columns is therefore data-dependent. See `docs/data-contracts/analysis-csv.md`.
 
-## What the server may add without rewriting these files
+## Server metadata and immutable storage
 
-The first backend can store the existing files unchanged in object storage and keep new relational metadata in PostgreSQL:
+The backend stores existing files unchanged in object storage and keeps
+relational metadata in PostgreSQL:
 
 - server experiment record ID;
 - server experiment-version record ID;
@@ -173,8 +202,8 @@ These are **database fields**, not claims about the current JSON output. A later
 | --- | --- | --- |
 | Experiment ZIP | `name`; word `id` values | No stable experiment-version identity |
 | Raw result | `session_id`; `experiment_id`; `experiment_version` | `experiment_id` commonly equals the name |
-| Trainable JSON | participant number and timestamp | No source run ID and no original-word identity |
-| CSV | participant, experiment step, word, cell | No immutable run/export ID |
+| Trainable JSON | experiment, Block, session, participant, and timestamp | No server run UUID inside the file |
+| CSV | experiment, Block, session, participant, word, and cell | No server run UUID inside the file |
 
 ## Server-side versioning rules for the current files
 
@@ -184,17 +213,16 @@ These rules operate around the current files; they do not alter their internal s
 2. **Logical experiment identity is server metadata.** A user selects whether an uploaded ZIP starts a new experiment or becomes a new version of an existing experiment; the server must not infer this solely from `name`.
 3. **Published versions are immutable.** Editing an experiment means uploading a new ZIP and creating a new server-side version record. An existing version record is never repointed to different bytes.
 4. **A run is linked to the selected server version before or during upload.** The raw file's `experiment_id` and `experiment_version` remain preserved as source metadata, but the database relationship is authoritative.
-5. **Raw results are immutable artifacts.** Repeated upload of the same `session_id` is accepted only when the checksum is identical; a different checksum is treated as a conflict requiring review.
+5. **Raw results are immutable artifacts.** Repeated upload for the same
+   `session_id` and Block index is accepted only when the checksum is identical;
+   different bytes are treated as a conflict requiring review.
 6. **Analyzer outputs are derived artifacts.** A new CSV or trainable JSON export creates a new artifact record linked to its source raw result; it does not overwrite the source data.
 
-## Stage 1 boundary
+## Current API boundary
 
-Stage 1 is complete when:
-
-1. the four actual outputs are documented;
-2. the three JSON outputs have schemas matching current emitted structure;
-3. current omissions and unstable fields are explicit;
-4. future database IDs are kept separate from the current file contracts;
-5. immutability and versioning are defined around the current artifacts.
-
-No desktop serialization code is changed in this stage.
+Experiment definitions, ordered Blocks, page-sharing layout, Experiment runs,
+and immutable raw Block results now flow through the local API. The Runner also
+keeps the user-selected local JSON copies. Analyzer CSV/trainable exports are
+persisted as immutable per-run artifacts. Each run stores a tri-state analysis
+status: not started (`null`), explicitly not completed (`false`), or completed
+(`true`).

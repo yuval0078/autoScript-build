@@ -1,10 +1,9 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://autoscript.local/schemas/data-contracts/experiment-package.schema.json",
-  "title": "Builder experiment JSON as currently emitted inside the ZIP",
+  "title": "AutoScript Block JSON (legacy Experiment ZIP compatible)",
   "type": "object",
   "required": [
-    "app_version",
     "name",
     "grid",
     "order",
@@ -17,9 +16,24 @@
     "groups"
   ],
   "properties": {
+    "schema_version": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Optional for legacy packages; new Block packages should set it."
+    },
+    "package_type": {
+      "const": "block",
+      "description": "Optional discriminator for new Block packages."
+    },
+    "block_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Stable Block identifier; optional for legacy packages."
+    },
     "app_version": {
       "type": "string",
-      "minLength": 1
+      "minLength": 1,
+      "description": "Builder version that created the Block. Optional for legacy packages."
     },
     "name": {
       "type": "string",
@@ -155,9 +169,7 @@
       "required": [
         "file_name",
         "path",
-        "original_name",
-        "owner_group",
-        "auto_slice_word"
+        "original_name"
       ],
       "properties": {
         "file_name": {
@@ -176,10 +188,12 @@
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "description": "Group that owns this media file. Optional for legacy packages."
         },
         "auto_slice_word": {
-          "type": "boolean"
+          "type": "boolean",
+          "description": "Whether this media file should be sliced automatically. Optional for legacy packages."
         }
       },
       "additionalProperties": true

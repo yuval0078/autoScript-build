@@ -94,6 +94,7 @@ class CurrentDataContractTests(unittest.TestCase):
     def test_schema_files_are_valid_json(self):
         filenames = [
             "common.schema.json",
+            "experiment-bundle.schema.json",
             "experiment-package.schema.json",
             "raw-run.schema.json",
             "trainable-export.schema.json",
@@ -111,7 +112,7 @@ class CurrentDataContractTests(unittest.TestCase):
                 encoding="utf-8"
             )
         )
-        self.assertEqual(set(schema["required"]), set(emitted_keys))
+        self.assertTrue(set(schema["required"]).issubset(emitted_keys))
 
     def test_runner_schema_required_keys_match_completed_data(self):
         tree = parse_source("tablet_experiment.py")
@@ -119,7 +120,13 @@ class CurrentDataContractTests(unittest.TestCase):
         schema = json.loads(
             (SCHEMA_ROOT / "raw-run.schema.json").read_text(encoding="utf-8")
         )
-        self.assertEqual(set(schema["required"]), set(emitted_keys))
+        self.assertLessEqual(set(schema["required"]), set(emitted_keys))
+        block_required = set(schema["allOf"][0]["then"]["required"])
+        self.assertEqual(
+            block_required,
+            {"block_name", "block_id", "block_index", "block_count"},
+        )
+        self.assertLessEqual(block_required, set(emitted_keys))
 
     def test_trainable_schema_matches_analyzer_participant_and_word_objects(self):
         tree = parse_source("analyzer_refactored.py")
@@ -130,10 +137,9 @@ class CurrentDataContractTests(unittest.TestCase):
                 encoding="utf-8"
             )
         )
-        self.assertEqual(
-            set(schema["$defs"]["participant"]["required"]),
-            set(participant_keys),
-        )
+        participant_schema = schema["$defs"]["participant"]
+        self.assertLessEqual(set(participant_schema["required"]), set(participant_keys))
+        self.assertLessEqual(set(participant_keys), set(participant_schema["properties"]))
         self.assertEqual(
             set(schema["$defs"]["trainableWord"]["required"]),
             set(word_keys),
@@ -145,6 +151,13 @@ class CurrentDataContractTests(unittest.TestCase):
             find_csv_header(tree),
             [
                 "Exp Step",
+                "Experiment",
+                "Experiment ID",
+                "Block",
+                "Block ID",
+                "Block Index",
+                "Block Count",
+                "Session ID",
                 "Participant",
                 "Age",
                 "Gender",

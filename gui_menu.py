@@ -11,12 +11,15 @@ import uuid
 from pathlib import Path
 from app_paths import ensure_dir, user_data_dir, asset_path, source_script_path
 from archive_utils import safe_extract_zip
+from autoscript_api import APIError, AutoScriptAPI
+from experiment_packages import unpack_experiment_package
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
                              QLabel, QFileDialog, QMessageBox, QApplication,
                              QDialog, QToolButton, QMenu, QGridLayout,
-                             QCheckBox)
-from PyQt5.QtCore import Qt
-from PyQt5.QtGui import QFont
+                             QCheckBox, QInputDialog, QFrame, QScrollArea,
+                             QLineEdit, QSizePolicy)
+from PyQt5.QtCore import Qt, QSize
+from PyQt5.QtGui import QFont, QIcon, QPixmap, QPainter, QColor
 
 
 def _normalize_experiment_payload(payload):
@@ -211,8 +214,24 @@ def build_session_layout(experiments, joined_boundaries=None, recalibrate_betwee
     }
 
 
+def build_block_session_layout(
+    blocks,
+    recalibrate_between_blocks=False,
+    joined_boundaries=None,
+):
+    """Build a fixed-order Block plan with optional boundary-only recalibration."""
+    plan = build_session_layout(
+        blocks,
+        joined_boundaries=joined_boundaries,
+        recalibrate_between_pages=recalibrate_between_blocks,
+    )
+    for entry in plan.get("experiments", []):
+        entry["recalibrate_during_page_refresh"] = False
+    return plan
+
+
 class CombineToggleButton(QPushButton):
-    """Boundary button that toggles same-page fitting between adjacent experiments."""
+    """Boundary button that toggles same-page fitting between adjacent Blocks."""
 
     def __init__(self, boundary_index, parent=None):
         super().__init__(parent)
@@ -248,7 +267,7 @@ class CombineToggleButton(QPushButton):
             )
         else:
             self.setText('+')
-            self.setToolTip('Keep these experiments on the same page')
+            self.setToolTip('Keep these Blocks on the same page')
             self.setStyleSheet(
                 'font-size: 18px; font-weight: bold; color: #2e7d32; '
                 'background-color: white; border: 2px solid #2e7d32; border-radius: 14px;'
@@ -256,28 +275,35 @@ class CombineToggleButton(QPushButton):
 
 
 class ArrangeExperimentsDialog(QDialog):
-    """Dialog for ordering multiple selected experiment packages."""
+    """Dialog for ordering local/legacy Blocks before a run."""
     
-    def __init__(self, experiments, parent=None):
+    def __init__(self, experiments, parent=None, joined_boundaries=None):
         super().__init__(parent)
-        self.setWindowTitle("Arrange Experiments")
+        self.setWindowTitle("Arrange Blocks")
         self.experiments = [dict(exp) for exp in experiments]
         self.joined_boundaries = set()
+        for boundary_index in sorted(set(joined_boundaries or set())):
+            if _can_join_boundary(
+                self.experiments,
+                self.joined_boundaries,
+                boundary_index,
+            ):
+                self.joined_boundaries.add(boundary_index)
         self.selected_index = 0
         self.has_page_refreshes = False
         
         layout = QVBoxLayout(self)
-        layout.addWidget(QLabel("Choose the order for this session:"))
+        layout.addWidget(QLabel("Choose the Block order for this experiment:"))
 
         self.session_summary = QLabel()
         self.session_summary.setWordWrap(True)
         self.session_summary.setStyleSheet("color: #46505a; font-size: 12px;")
         layout.addWidget(self.session_summary)
 
-        self.recalibrate_toggle = QCheckBox("Re-calibrate between pages")
+        self.recalibrate_toggle = QCheckBox("Re-calibrate between Blocks")
         self.recalibrate_toggle.setChecked(True)
         self.recalibrate_toggle.setToolTip(
-            "If enabled, every page change opens a fresh calibration before the next page starts."
+            "If enabled, a fresh calibration opens before the next Block starts."
         )
         self.recalibrate_toggle.toggled.connect(self._refresh_preview)
         layout.addWidget(self.recalibrate_toggle)
@@ -382,17 +408,18 @@ class ArrangeExperimentsDialog(QDialog):
         self.order_layout.setColumnStretch(1, 1)
 
     def _refresh_preview(self):
-        preview = build_session_layout(
+        preview = build_block_session_layout(
             self.experiments,
-            self.joined_boundaries,
-            recalibrate_between_pages=self.recalibrate_toggle.isChecked()
+            recalibrate_between_blocks=self.recalibrate_toggle.isChecked(),
+            joined_boundaries=self.joined_boundaries,
         )
         refresh_count = preview.get('refresh_count', 0)
         page_count = preview.get('page_count', 0)
         self.has_page_refreshes = refresh_count > 0
         self.recalibrate_toggle.setVisible(refresh_count > 0)
         self.session_summary.setText(
-            f"Session preview: {page_count} page{'s' if page_count != 1 else ''}, "
+            f"Session preview: {len(self.experiments)} Blocks, "
+            f"{page_count} page{'s' if page_count != 1 else ''}, "
             f"{refresh_count} refresh{'es' if refresh_count != 1 else ''}."
         )
     
@@ -418,72 +445,296 @@ class ArrangeExperimentsDialog(QDialog):
         return [dict(exp) for exp in self.experiments]
 
     def session_plan(self):
-        return build_session_layout(
+        return build_block_session_layout(
             self.experiments,
-            self.joined_boundaries,
-            recalibrate_between_pages=self.recalibrate_toggle.isChecked() and self.has_page_refreshes
+            recalibrate_between_blocks=(
+                self.recalibrate_toggle.isChecked() and self.has_page_refreshes
+            ),
+            joined_boundaries=self.joined_boundaries,
         )
 
 
 class MainMenu(QWidget):
-    """Main menu widget for the Touchpad Experiment Manager"""
+    """Cloud experiment library and application home screen."""
     
     def __init__(self, parent):
         super().__init__()
         self.parent = parent
+        self.api = AutoScriptAPI(timeout=10)
+        self.experiments = []
+        self.experiment_cards = []
+
         layout = QVBoxLayout(self)
-        layout.setAlignment(Qt.AlignCenter)
-        layout.setSpacing(20)
-        
-        # Title
-        title = QLabel("Touchpad Writing Experiment")
-        title.setStyleSheet("font-size: 32px; font-weight: bold; color: #1a1a1a; margin-bottom: 40px;")
-        title.setAlignment(Qt.AlignCenter)
-        layout.addWidget(title)
-        
-        # Buttons Container
-        btn_container = QWidget()
-        btn_layout = QVBoxLayout(btn_container)
-        btn_layout.setSpacing(15)
-        
-        # Load Experiment
-        self.btn_load = QToolButton()
-        self.btn_load.setFixedSize(300, 60)
-        self.btn_load.setText("Run Experiment")
-        self.btn_load.setStyleSheet("font-size: 18px; font-weight: bold; background-color: #4CAF50; color: white; border-radius: 8px;")
-        self.btn_load.setPopupMode(QToolButton.MenuButtonPopup)
-        self.btn_load.clicked.connect(self.load_experiment_zip)
-        load_menu = QMenu(self.btn_load)
-        test_run_action = load_menu.addAction("Test-Run Experiment")
-        test_run_action.triggered.connect(lambda checked=False: self.load_experiment_zip(test_mode=True))
-        self.btn_load.setMenu(load_menu)
-        btn_layout.addWidget(self.btn_load)
-        
-        # New Experiment
-        self.btn_new = QPushButton("Create a New Experiment")
-        self.btn_new.setFixedSize(300, 60)
-        self.btn_new.setStyleSheet("font-size: 18px; font-weight: bold; background-color: #FF9800; color: white; border-radius: 8px;")
-        self.btn_new.clicked.connect(parent.show_new_experiment)
-        btn_layout.addWidget(self.btn_new)
+        layout.setContentsMargins(38, 28, 38, 28)
+        layout.setSpacing(16)
 
-        self.btn_edit = QPushButton("Upload Experiment To Edit")
-        self.btn_edit.setFixedSize(300, 60)
-        self.btn_edit.setStyleSheet("font-size: 18px; font-weight: bold; background-color: #795548; color: white; border-radius: 8px;")
-        self.btn_edit.clicked.connect(self.upload_experiment_to_edit)
-        btn_layout.addWidget(self.btn_edit)
-        
-        # Analyze Results
-        self.btn_analyze = QPushButton("Analyze Results")
-        self.btn_analyze.setFixedSize(300, 60)
-        self.btn_analyze.setStyleSheet("font-size: 18px; font-weight: bold; background-color: #2196F3; color: white; border-radius: 8px;")
-        self.btn_analyze.clicked.connect(self.launch_analyzer)
-        btn_layout.addWidget(self.btn_analyze)
+        header = QHBoxLayout()
+        title_area = QVBoxLayout()
+        title = QLabel("Experiments")
+        title.setStyleSheet("font-size: 30px; font-weight: 700; color: #172230;")
+        subtitle = QLabel("Cloud experiments are ready to edit, run, download, or analyze.")
+        subtitle.setStyleSheet("color: #657585; font-size: 13px;")
+        title_area.addWidget(title)
+        title_area.addWidget(subtitle)
+        header.addLayout(title_area)
+        header.addStretch()
 
-        layout.addWidget(btn_container, 0, Qt.AlignCenter)
+        open_local = QToolButton()
+        open_local.setText("▣")
+        open_local.setToolTip("Open local or legacy ZIP")
+        open_local.setFixedSize(42, 42)
+        open_local.setStyleSheet(self._icon_button_style("#536578"))
+        open_local.clicked.connect(self.load_experiment_zip)
+        header.addWidget(open_local)
+
+        refresh = QToolButton()
+        refresh.setText("↻")
+        refresh.setToolTip("Refresh experiments")
+        refresh.setFixedSize(42, 42)
+        refresh.setStyleSheet(self._icon_button_style("#356b9b"))
+        refresh.clicked.connect(self.refresh_experiments)
+        header.addWidget(refresh)
+
+        new_experiment = QPushButton("+  New Experiment")
+        new_experiment.setToolTip("Create a new experiment")
+        new_experiment.setMinimumHeight(42)
+        new_experiment.setStyleSheet(
+            "QPushButton { background: #2d74b8; color: white; border: 0; border-radius: 8px; "
+            "font-size: 14px; font-weight: 650; padding: 10px 18px; } "
+            "QPushButton:hover { background: #245f98; }"
+        )
+        new_experiment.clicked.connect(parent.open_new_experiment)
+        header.addWidget(new_experiment)
+        layout.addLayout(header)
+
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("Search experiments…")
+        self.search.setClearButtonEnabled(True)
+        self.search.setMinimumHeight(40)
+        self.search.setStyleSheet(
+            "QLineEdit { border: 1px solid #cfd8e2; border-radius: 8px; padding: 8px 12px; "
+            "background: white; font-size: 14px; } QLineEdit:focus { border-color: #4d88bd; }"
+        )
+        self.search.textChanged.connect(self._filter_experiments)
+        layout.addWidget(self.search)
+
+        self.status_label = QLabel("Loading experiments…")
+        self.status_label.setStyleSheet("color: #667483; padding: 4px;")
+        layout.addWidget(self.status_label)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        self.list_container = QWidget()
+        self.list_layout = QVBoxLayout(self.list_container)
+        self.list_layout.setContentsMargins(0, 0, 8, 0)
+        self.list_layout.setSpacing(9)
+        self.list_layout.addStretch()
+        scroll.setWidget(self.list_container)
+        layout.addWidget(scroll, 1)
+
+        self.refresh_experiments()
+
+    @staticmethod
+    def _icon_button_style(color):
+        return (
+            f"QToolButton {{ color: {color}; background: white; border: 1px solid #d7dfe8; "
+            "border-radius: 7px; font-size: 19px; font-weight: 650; }} "
+            "QToolButton:hover { background: #eef5fb; border-color: #9db5cc; }"
+        )
+
+    def _action_button(self, text, tooltip, callback, color="#315f88"):
+        button = QToolButton()
+        if text == "▶⚙":
+            pixmap = QPixmap(34, 24)
+            pixmap.fill(Qt.transparent)
+            painter = QPainter(pixmap)
+            painter.setRenderHint(QPainter.Antialiasing)
+            font = QFont("Segoe UI Symbol", 15)
+            painter.setFont(font)
+            painter.setPen(QColor("#198a43"))
+            painter.drawText(0, 0, 20, 24, Qt.AlignCenter, "▶")
+            painter.setPen(QColor("#c58a00"))
+            painter.drawText(16, 1, 18, 22, Qt.AlignCenter, "⚙")
+            painter.end()
+            button.setIcon(QIcon(pixmap))
+            button.setIconSize(QSize(34, 24))
+        else:
+            button.setText(text)
+        button.setToolTip(tooltip)
+        button.setFixedSize(39, 37)
+        button.setStyleSheet(self._icon_button_style(color))
+        button.clicked.connect(callback)
+        return button
+
+    def _clear_cards(self):
+        while self.list_layout.count() > 1:
+            item = self.list_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self.experiment_cards = []
+
+    def refresh_experiments(self):
+        self.status_label.setText("Refreshing cloud experiments…")
+        QApplication.processEvents()
+        try:
+            self.experiments = self.api.list_experiments()
+        except APIError as exc:
+            self.experiments = []
+            self._clear_cards()
+            self.status_label.setText(f"Cloud API unavailable: {exc}")
+            return
+
+        self._clear_cards()
+        for experiment in self.experiments:
+            card = self._build_experiment_card(experiment)
+            self.list_layout.insertWidget(self.list_layout.count() - 1, card)
+            self.experiment_cards.append((experiment, card))
+        count = len(self.experiments)
+        self.status_label.setText(
+            "No experiments in the cloud yet."
+            if count == 0
+            else ("1 experiment" if count == 1 else f"{count} experiments")
+        )
+        self._filter_experiments(self.search.text())
+
+    def _build_experiment_card(self, experiment):
+        card = QFrame()
+        card.setObjectName("experimentCard")
+        card.setStyleSheet(
+            "QFrame#experimentCard { background: white; border: 1px solid #dce3ea; "
+            "border-radius: 9px; } QFrame#experimentCard:hover { border-color: #9eb7ce; }"
+        )
+        row = QHBoxLayout(card)
+        row.setContentsMargins(16, 11, 12, 11)
+        row.setSpacing(7)
+
+        text_area = QVBoxLayout()
+        name = QLabel(experiment["name"])
+        name.setStyleSheet("font-size: 16px; font-weight: 650; color: #172230;")
+        blocks = experiment.get("blocks")
+        if blocks is None:
+            blocks = experiment.get("versions", [])
+        count = len(blocks)
+        meta = QLabel(f"{count} Block" if count == 1 else f"{count} Blocks")
+        meta.setStyleSheet("font-size: 12px; color: #6b7987;")
+        text_area.addWidget(name)
+        text_area.addWidget(meta)
+        row.addLayout(text_area, 1)
+
+        actions = (
+            ("↓", "Download experiment ZIP", self._download_cloud_experiment, "#2463a8"),
+            ("✎", "Edit experiment", self._edit_cloud_experiment, "#6b4ca5"),
+            ("⧉", "Duplicate experiment", self._duplicate_cloud_experiment, "#5c6570"),
+            ("✕", "Delete experiment", self._delete_cloud_experiment, "#c62828"),
+            ("▶", "Run experiment", lambda exp: self._run_cloud_experiment(exp, False), "#198a43"),
+            ("▶⚙", "Test-run experiment", lambda exp: self._run_cloud_experiment(exp, True), "#b07a00"),
+            ("⌕", "View and analyze results", self._analyze_cloud_experiment, "#16788c"),
+        )
+        for text, tooltip, handler, color in actions:
+            row.addWidget(
+                self._action_button(
+                    text,
+                    tooltip,
+                    lambda checked=False, exp=experiment, action=handler: action(exp),
+                    color,
+                )
+            )
+        return card
+
+    def _filter_experiments(self, query):
+        normalized = query.strip().casefold()
+        visible = 0
+        for experiment, card in self.experiment_cards:
+            matches = normalized in experiment["name"].casefold()
+            card.setVisible(matches)
+            visible += int(matches)
+        if normalized:
+            self.status_label.setText(f"{visible} matching experiments")
+
+    def _download_cloud_experiment(self, experiment):
+        save_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Download Experiment",
+            f"{experiment['name']}.zip",
+            "ZIP Files (*.zip)",
+        )
+        if not save_path:
+            return
+        try:
+            self.api.download_experiment(
+                experiment,
+                Path(save_path).with_suffix(".zip"),
+            )
+        except APIError as exc:
+            QMessageBox.critical(self, "Download Failed", str(exc))
+
+    def _edit_cloud_experiment(self, experiment):
+        self.parent.open_experiment_builder(experiment)
+
+    def _duplicate_cloud_experiment(self, experiment):
+        try:
+            duplicate = self.api.duplicate_experiment(experiment["id"])
+            self.refresh_experiments()
+            QMessageBox.information(
+                self,
+                "Experiment Duplicated",
+                f"Created ‘{duplicate['name']}’.",
+            )
+        except APIError as exc:
+            QMessageBox.critical(self, "Duplicate Failed", str(exc))
+
+    def _delete_cloud_experiment(self, experiment):
+        answer = QMessageBox.warning(
+            self,
+            "Delete Experiment",
+            f"Permanently delete ‘{experiment['name']}’ and all of its Blocks?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        try:
+            self.api.delete_experiment(experiment["id"])
+            self.refresh_experiments()
+        except APIError as exc:
+            QMessageBox.critical(self, "Delete Failed", str(exc))
+
+    def _run_cloud_experiment(self, experiment, test_mode=False):
+        try:
+            downloads = ensure_dir(user_data_dir() / "server_downloads")
+            safe_name = "".join(
+                character if character.isalnum() or character in "-_" else "_"
+                for character in experiment["name"]
+            ) or "experiment"
+            package_path = downloads / f"{safe_name}_{experiment['id'][:8]}.zip"
+            self.api.download_experiment(experiment, package_path)
+            self.load_experiment_zip(
+                test_mode=test_mode,
+                file_paths=[str(package_path)],
+                parent_experiment=experiment,
+            )
+        except APIError as exc:
+            QMessageBox.critical(self, "Run Failed", str(exc))
+
+    def _analyze_cloud_experiment(self, experiment):
+        self.parent.open_experiment_results(experiment)
     
-    def load_experiment_zip(self, checked=False, test_mode=False):
-        """Load and launch one or more experiments from ZIP packages."""
-        file_paths, _ = QFileDialog.getOpenFileNames(self, "Load Experiment Package", "", "ZIP Files (*.zip)")
+    def load_experiment_zip(
+        self,
+        checked=False,
+        test_mode=False,
+        file_paths=None,
+        parent_experiment=None,
+    ):
+        """Load a cloud Experiment bundle or legacy one-Block ZIP and launch it."""
+        if file_paths is None:
+            file_paths, _ = QFileDialog.getOpenFileNames(
+                self,
+                "Open Experiment or legacy Block package",
+                "",
+                "ZIP Files (*.zip)",
+            )
         if not file_paths:
             return
             
@@ -516,42 +767,101 @@ class MainMenu(QWidget):
             QApplication.setOverrideCursor(Qt.WaitCursor)
             experiments = []
             session_seed = uuid.uuid4().hex
-            
-            for index, file_path in enumerate(file_paths):
-                if len(file_paths) == 1:
-                    extract_dir = work_dir
-                else:
-                    safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in Path(file_path).stem)
-                    extract_dir = ensure_dir(work_dir / f"{index + 1:02d}_{safe_name}")
-                
-                with zipfile.ZipFile(file_path, 'r') as zip_ref:
-                    safe_extract_zip(zip_ref, extract_dir)
-                    
-                json_files = list(extract_dir.glob("*.json"))
-                if not json_files:
-                    raise FileNotFoundError(f"No configuration JSON found in {Path(file_path).name}")
 
-                config_file = json_files[0]
-                total_words, rows, cols = self._calculate_experiment_info(config_file)
-                experiments.append({
-                    'display_name': Path(file_path).stem,
-                    'config_path': str(config_file),
-                    'word_count': total_words,
-                    'rows': rows,
-                    'cols': cols,
-                    'cells': rows * cols,
-                })
+            resolved_packages = []
+            for package_index, file_path in enumerate(file_paths, start=1):
+                destination = work_dir / f"package_{package_index:03d}"
+                resolved_packages.append(
+                    unpack_experiment_package(file_path, destination)
+                )
 
-            if len(experiments) > 1:
+            total_blocks = sum(len(package.blocks) for package in resolved_packages)
+            if parent_experiment is not None:
+                session_name = parent_experiment["name"]
+                session_id = parent_experiment["id"]
+            elif len(resolved_packages) == 1:
+                session_name = resolved_packages[0].name
+                session_id = resolved_packages[0].experiment_id or session_name
+            else:
+                session_name = "Local Experiment"
+                session_id = session_seed
+
+            block_number = 0
+            for package in resolved_packages:
+                for block in package.blocks:
+                    block_number += 1
+                    config_file = block.config_path
+                    config = dict(block.config)
+                    config.update({
+                        "experiment_name": session_name,
+                        "experiment_id": session_id,
+                        "block_name": block.name,
+                        "block_id": block.block_id or config.get("block_id") or block.sha256,
+                        "block_index": block_number,
+                        "block_count": total_blocks,
+                    })
+                    with config_file.open("w", encoding="utf-8") as handle:
+                        json.dump(config, handle, ensure_ascii=False, indent=2)
+
+                    total_words, rows, cols = self._calculate_experiment_info(config_file)
+                    experiments.append({
+                        'display_name': block.name,
+                        'config_path': str(config_file),
+                        'word_count': total_words,
+                        'rows': rows,
+                        'cols': cols,
+                        'cells': rows * cols,
+                        'same_page_as_previous': bool(
+                            block.same_page_as_previous
+                        ),
+                    })
+
+            joined_boundaries = {
+                index - 1
+                for index, experiment in enumerate(experiments)
+                if index > 0 and experiment.get("same_page_as_previous", False)
+            }
+            if len(experiments) > 1 and parent_experiment is None:
                 QApplication.restoreOverrideCursor()
-                arrange_dialog = ArrangeExperimentsDialog(experiments, self)
+                arrange_dialog = ArrangeExperimentsDialog(
+                    experiments,
+                    self,
+                    joined_boundaries=joined_boundaries,
+                )
                 if arrange_dialog.exec_() != QDialog.Accepted:
                     return
                 experiments = arrange_dialog.ordered_experiments()
                 session_plan = arrange_dialog.session_plan()
                 QApplication.setOverrideCursor(Qt.WaitCursor)
             else:
-                session_plan = build_session_layout(experiments, recalibrate_between_pages=False)
+                recalibrate_between_blocks = False
+                if len(experiments) > 1:
+                    QApplication.restoreOverrideCursor()
+                    answer = QMessageBox.question(
+                        self,
+                        "Re-calibrate Between Blocks",
+                        "This experiment contains multiple Blocks.\n\n"
+                        "Re-calibrate before each next Block?",
+                        QMessageBox.Yes | QMessageBox.No,
+                        QMessageBox.Yes,
+                    )
+                    recalibrate_between_blocks = answer == QMessageBox.Yes
+                    QApplication.setOverrideCursor(Qt.WaitCursor)
+
+                session_plan = build_block_session_layout(
+                    experiments,
+                    recalibrate_between_blocks=recalibrate_between_blocks,
+                    joined_boundaries=joined_boundaries,
+                )
+
+            for final_block_index, experiment in enumerate(experiments, start=1):
+                config_path = Path(experiment["config_path"])
+                with config_path.open("r", encoding="utf-8") as handle:
+                    config = json.load(handle)
+                config["block_index"] = final_block_index
+                config["block_count"] = len(experiments)
+                with config_path.open("w", encoding="utf-8") as handle:
+                    json.dump(config, handle, ensure_ascii=False, indent=2)
 
             config_files = [Path(exp['config_path']) for exp in experiments]
             session_plan_path = work_dir / "_autoscript_session_plan.json"
@@ -574,11 +884,8 @@ class MainMenu(QWidget):
                     rows = experiment['rows']
                     cols = experiment['cols']
                     layout_entry = plan_lookup.get(experiment['config_path'], {})
-                    page_note = "same page" if layout_entry.get('same_page_as_previous') else "new page"
-                    start_cell = layout_entry.get('start_cell_offset', 0) + 1
                     summaries.append(
-                        f"- {experiment['display_name']}: {total_words} words, {rows}x{cols}, "
-                        f"starts at cell {start_cell}, {page_note}"
+                        f"- {experiment['display_name']}: {total_words} words, {rows}x{cols}"
                     )
                 
                 QApplication.restoreOverrideCursor()
@@ -587,10 +894,10 @@ class MainMenu(QWidget):
                 page_count = session_plan.get('page_count', 0)
                 recalibration_label = "on" if session_plan.get('recalibrate_between_pages') else "off"
                 msg = (
-                    "Experiment Session Loaded:\n\n"
+                    f"Experiment Loaded: {session_name}\n\n"
                     + "\n".join(summaries)
-                    + f"\n\nSession total: {page_count} pages, {refresh_count} refreshes."
-                    + f"\nRe-calibrate between pages: {recalibration_label}."
+                    + f"\n\n{len(experiments)} Blocks, {page_count} pages, {refresh_count} refreshes."
+                    + f"\nRe-calibrate between Blocks: {recalibration_label}."
                     + f"\n\nClick OK to start in {run_label}."
                 )
                 QMessageBox.information(self, "Experiment Info", msg)
@@ -628,6 +935,95 @@ class MainMenu(QWidget):
             QApplication.restoreOverrideCursor()
             QMessageBox.critical(self, "Error", f"Failed to load experiment: {e}")
 
+    def load_experiment_from_server(self, checked=False, test_mode=False):
+        """Select and download an immutable server version, then use the normal loader."""
+        try:
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            try:
+                api = AutoScriptAPI()
+                experiments = [
+                    experiment
+                    for experiment in api.list_experiments()
+                    if experiment.get("versions")
+                ]
+            finally:
+                QApplication.restoreOverrideCursor()
+
+            if not experiments:
+                QMessageBox.information(
+                    self,
+                    "No Server Experiments",
+                    "No published experiment versions are available on the server.",
+                )
+                return
+
+            experiment_labels = [
+                f"{experiment['name']} ({len(experiment['versions'])} versions)"
+                for experiment in experiments
+            ]
+            selected_label, accepted = QInputDialog.getItem(
+                self,
+                "Load from Server",
+                "Experiment:",
+                experiment_labels,
+                0,
+                False,
+            )
+            if not accepted:
+                return
+            experiment = experiments[experiment_labels.index(selected_label)]
+
+            versions = experiment["versions"]
+            version_labels = [
+                f"Version {version['version_number']} — {version['created_at']} — "
+                f"{version['sha256'][:12]}"
+                for version in versions
+            ]
+            selected_version_label, accepted = QInputDialog.getItem(
+                self,
+                "Load from Server",
+                "Version:",
+                version_labels,
+                0,
+                False,
+            )
+            if not accepted:
+                return
+            version = versions[version_labels.index(selected_version_label)]
+
+            safe_name = "".join(
+                character if character.isalnum() or character in "-_" else "_"
+                for character in experiment["name"]
+            ).strip("_\n\r ") or "experiment"
+            download_path = (
+                ensure_dir(user_data_dir() / "server_downloads")
+                / f"{safe_name}_v{version['version_number']}_{version['id'][:8]}.zip"
+            )
+
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            original_text = self.btn_load.text()
+            try:
+                def update_progress(received, total):
+                    if total:
+                        self.btn_load.setText(
+                            f"Downloading… {int((received / total) * 100)}%"
+                        )
+                        QApplication.processEvents()
+
+                api.download_version(version, download_path, progress=update_progress)
+            finally:
+                self.btn_load.setText(original_text)
+                QApplication.restoreOverrideCursor()
+
+            self.load_experiment_zip(
+                test_mode=test_mode,
+                file_paths=[str(download_path)],
+            )
+        except (APIError, OSError, ValueError) as exc:
+            QMessageBox.critical(self, "Server Load Failed", str(exc))
+        except Exception as exc:
+            QMessageBox.critical(self, "Server Load Failed", str(exc))
+
     def _calculate_experiment_info(self, config_file):
         """Return total word count and grid dimensions for a config JSON."""
         with open(config_file, 'r', encoding='utf-8') as f:
@@ -643,8 +1039,10 @@ class MainMenu(QWidget):
         if self.parent.new_experiment.import_experiment_zip(file_path):
             self.parent.show_new_experiment()
 
-    def launch_analyzer(self):
+    def launch_analyzer(self, file_paths=None, extra_args=None):
         """Launch the results analyzer script"""
+        file_paths = [str(Path(path).resolve()) for path in (file_paths or [])]
+        extra_args = [str(argument) for argument in (extra_args or [])]
         try:
             if getattr(sys, 'frozen', False):
                 # Running as packaged executable - launch Analyzer.exe
@@ -652,16 +1050,19 @@ class MainMenu(QWidget):
                 analyzer_exe = exe_dir / "Analyzer.exe"
                 
                 if analyzer_exe.exists():
-                    subprocess.Popen([str(analyzer_exe)])
+                    return subprocess.Popen([str(analyzer_exe), *extra_args, *file_paths])
                 else:
                     QMessageBox.critical(self, "Error", f"Analyzer.exe not found at {analyzer_exe}")
             else:
                 # Running as script - launch as subprocess
                 script_path = source_script_path("analyzer_refactored.py")
                 if script_path.exists():
-                    subprocess.Popen([sys.executable, str(script_path)])
+                    return subprocess.Popen(
+                        [sys.executable, str(script_path), *extra_args, *file_paths]
+                    )
                 else:
                     QMessageBox.critical(self, "Error", f"analyzer_refactored.py not found at {script_path}")
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to launch analyzer: {e}")
+        return None
 
