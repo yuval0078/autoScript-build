@@ -43,6 +43,7 @@ class RunResultResponse(BaseModel):
 class ExperimentRunResponse(BaseModel):
     id: uuid.UUID
     experiment_id: uuid.UUID
+    revision_id: uuid.UUID | None
     session_id: str
     participant_number: int
     participant_age: int

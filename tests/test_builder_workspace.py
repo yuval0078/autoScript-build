@@ -36,6 +36,7 @@ class FakeApi:
         self.uploads = []
         self.reorders = []
         self.deleted = []
+        self.revisions = []
 
     def create_experiment(self, name):
         return {"id": "experiment-1", "name": name, "blocks": []}
@@ -73,6 +74,10 @@ class FakeApi:
 
     def delete_block(self, block_id):
         self.deleted.append(block_id)
+
+    def create_experiment_revision(self, experiment_id):
+        self.revisions.append(experiment_id)
+        return {"id": "revision-1", "revision_number": 1}
 
 
 class BuilderWorkspaceTests(unittest.TestCase):
@@ -121,6 +126,7 @@ class BuilderWorkspaceTests(unittest.TestCase):
             [("experiment-1", ["uploaded-1", "uploaded-2"], [])],
         )
         self.assertEqual(parent.saved_id, "experiment-1")
+        self.assertEqual(workspace.api.revisions, ["experiment-1"])
         workspace.deleteLater()
 
     def test_cloud_experiment_blocks_are_loaded_by_position(self):

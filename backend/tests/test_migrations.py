@@ -51,6 +51,8 @@ class MigrationTests(unittest.TestCase):
                     "experiment_blocks",
                     "experiment_runs",
                     "experiment_versions",
+                    "experiment_revisions",
+                    "experiment_revision_blocks",
                     "run_artifacts",
                     "run_results",
                 },

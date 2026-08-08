@@ -74,6 +74,8 @@ class RunnerBlockIdentityTests(unittest.TestCase):
             "block_index": 2,
             "block_count": 3,
             "experiment_version": 5,
+            "experiment_revision_id": "revision-9",
+            "experiment_revision_number": 3,
             "__run_session_id__": "12_20260807_120000_abcdef",
         }
         recorder = SimpleNamespace(current_word_data=None, all_word_data=[])
@@ -93,7 +95,9 @@ class RunnerBlockIdentityTests(unittest.TestCase):
 
         result = ExperimentCanvas.collect_experiment_data(canvas)
 
-        self.assertEqual(result["schema_version"], "1.2")
+        self.assertEqual(result["schema_version"], "1.3")
+        self.assertEqual(result["experiment_revision_id"], "revision-9")
+        self.assertEqual(result["experiment_revision_number"], 3)
         self.assertTrue(result["block_completed"])
         self.assertEqual(result["completed_word_count"], 0)
         self.assertEqual(result["expected_word_count"], 0)

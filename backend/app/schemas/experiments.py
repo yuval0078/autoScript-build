@@ -95,6 +95,26 @@ class ExperimentVersionResponse(BaseModel):
     download_url: str
 
 
+class ExperimentRevisionBlockResponse(BaseModel):
+    id: uuid.UUID
+    source_block_id: uuid.UUID | None
+    position: int
+    same_page_as_previous: bool
+    name: str
+    sha256: str
+    size_bytes: int
+
+
+class ExperimentRevisionResponse(BaseModel):
+    id: uuid.UUID
+    experiment_id: uuid.UUID
+    revision_number: int
+    name: str
+    created_at: datetime
+    blocks: list[ExperimentRevisionBlockResponse]
+    download_url: str
+
+
 class ExperimentResponse(BaseModel):
     id: uuid.UUID
     name: str
@@ -103,4 +123,5 @@ class ExperimentResponse(BaseModel):
     created_at: datetime
     blocks: list[ExperimentBlockResponse]
     versions: list[ExperimentVersionResponse]
+    current_revision: ExperimentRevisionResponse | None
     download_url: str

@@ -1,5 +1,6 @@
 import json
 import unittest
+import uuid
 from copy import deepcopy
 
 from fastapi.testclient import TestClient
@@ -9,7 +10,7 @@ from sqlalchemy.pool import StaticPool
 
 from app.database import get_db
 from app.main import create_app
-from app.models import Base, User
+from app.models import Base, ExperimentRevision, User
 from app.services.storage import get_object_storage
 
 
@@ -166,6 +167,31 @@ class ResultApiTests(unittest.TestCase):
         second_payload["participant_age"] = 26
         conflict, _ = self.upload(second_payload)
         self.assertEqual(conflict.status_code, 409, conflict.text)
+
+    def test_run_is_pinned_to_declared_experiment_revision(self):
+        revision_id = uuid.uuid4()
+        with self.session_factory() as session:
+            actor = session.query(User).one()
+            session.add(ExperimentRevision(
+                id=revision_id,
+                experiment_id=uuid.UUID(self.experiment["id"]),
+                revision_number=1,
+                name="Results Study",
+                created_by=actor.id,
+            ))
+            session.commit()
+        payload = raw_result(self.experiment["id"], block_count=1)
+        payload.update({
+            "schema_version": "1.3",
+            "experiment_revision_id": str(revision_id),
+            "experiment_revision_number": 1,
+        })
+        uploaded, _ = self.upload(payload)
+        self.assertEqual(uploaded.status_code, 201, uploaded.text)
+        run = self.client.get(
+            f"/api/v1/experiments/{self.experiment['id']}/runs"
+        ).json()[0]
+        self.assertEqual(run["revision_id"], str(revision_id))
 
     def test_legacy_result_without_block_identity_is_accepted(self):
         payload = raw_result(self.experiment["id"], block_index=1, block_count=1)

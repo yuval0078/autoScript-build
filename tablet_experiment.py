@@ -1940,11 +1940,13 @@ class ExperimentCanvas(QWidget):
             session_total=self.session_total,
         )
         self.completed_data = {
-            'schema_version': '1.2',
+            'schema_version': '1.3',
             'app_version': APP_VERSION,
             'experiment_name': identity['experiment_name'],
             'experiment_id': identity['experiment_id'],
             'experiment_version': self.config.get('experiment_version', 1),
+            'experiment_revision_id': self.config.get('experiment_revision_id'),
+            'experiment_revision_number': self.config.get('experiment_revision_number'),
             'block_name': identity['block_name'],
             'block_id': identity['block_id'],
             'block_index': identity['block_index'],

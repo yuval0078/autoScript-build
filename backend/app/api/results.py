@@ -18,6 +18,7 @@ from ..models import (
     Experiment,
     ExperimentBlock,
     ExperimentRun,
+    ExperimentRevision,
     RunArtifact,
     RunResult,
     User,
@@ -90,6 +91,7 @@ def _run_response(run):
     return ExperimentRunResponse(
         id=run.id,
         experiment_id=run.experiment_id,
+        revision_id=run.revision_id,
         session_id=run.session_id,
         participant_number=run.participant_number,
         participant_age=run.participant_age,
@@ -234,6 +236,7 @@ def _ensure_consistent_run(run, metadata):
         run.block_count,
         run.source_experiment_name,
         run.source_experiment_id,
+        str(run.revision_id) if run.revision_id else None,
     )
     actual = (
         metadata.participant_number,
@@ -242,6 +245,7 @@ def _ensure_consistent_run(run, metadata):
         metadata.block_count,
         metadata.experiment_name,
         metadata.source_experiment_id,
+        metadata.experiment_revision_id,
     )
     if expected != actual:
         raise HTTPException(
@@ -277,8 +281,21 @@ async def upload_result(
             .options(selectinload(ExperimentRun.results))
         )
         if run is None:
+            revision_id = None
+            if metadata.experiment_revision_id:
+                try:
+                    revision_id = uuid.UUID(metadata.experiment_revision_id)
+                except (ValueError, TypeError, AttributeError) as exc:
+                    raise HTTPException(status_code=422, detail="Invalid Experiment revision ID.") from exc
+                revision = database.scalar(select(ExperimentRevision).where(
+                    ExperimentRevision.id == revision_id,
+                    ExperimentRevision.experiment_id == experiment.id,
+                ))
+                if revision is None:
+                    raise HTTPException(status_code=409, detail="Experiment revision does not belong to this Experiment.")
             run = ExperimentRun(
                 experiment_id=experiment.id,
+                revision_id=revision_id,
                 session_id=metadata.session_id,
                 participant_number=metadata.participant_number,
                 participant_age=metadata.participant_age,

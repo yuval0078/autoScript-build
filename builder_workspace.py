@@ -620,6 +620,7 @@ class ExperimentBuilderWorkspace(QWidget):
                 final_block_ids,
                 same_page_block_ids=same_page_block_ids,
             )
+            self.api.create_experiment_revision(self.experiment_id)
 
             self._remote_block_ids = set(final_block_ids)
             self._dirty = False

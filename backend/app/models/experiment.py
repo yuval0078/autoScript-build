@@ -53,6 +53,12 @@ class Experiment(UUIDPrimaryKeyMixin, CreatedAtMixin, Base):
         passive_deletes=True,
         order_by="ExperimentRun.created_at.desc()",
     )
+    revisions: Mapped[list["ExperimentRevision"]] = relationship(
+        back_populates="experiment",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        order_by="ExperimentRevision.revision_number",
+    )
 
 
 class ExperimentBlock(UUIDPrimaryKeyMixin, CreatedAtMixin, Base):
@@ -70,18 +76,10 @@ class ExperimentBlock(UUIDPrimaryKeyMixin, CreatedAtMixin, Base):
     )
 
     experiment_id: Mapped[uuid.UUID] = mapped_column(
-        Uuid(as_uuid=True),
-        ForeignKey("experiments.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
+        Uuid(as_uuid=True), ForeignKey("experiments.id", ondelete="CASCADE"), nullable=False, index=True
     )
     position: Mapped[int] = mapped_column(Integer, nullable=False)
-    same_page_as_previous: Mapped[bool] = mapped_column(
-        Boolean,
-        nullable=False,
-        default=False,
-        server_default="false",
-    )
+    same_page_as_previous: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     schema_version: Mapped[Optional[str]] = mapped_column(String(32))
     app_version: Mapped[Optional[str]] = mapped_column(String(32))
@@ -90,17 +88,60 @@ class ExperimentBlock(UUIDPrimaryKeyMixin, CreatedAtMixin, Base):
     sha256: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
     created_by: Mapped[uuid.UUID] = mapped_column(
-        Uuid(as_uuid=True),
-        ForeignKey("users.id", ondelete="RESTRICT"),
-        nullable=False,
+        Uuid(as_uuid=True), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
     )
-
     experiment: Mapped[Experiment] = relationship(back_populates="blocks")
     creator = relationship("User")
-    run_results: Mapped[list["RunResult"]] = relationship(
-        back_populates="block",
-        passive_deletes=True,
+    run_results: Mapped[list["RunResult"]] = relationship(back_populates="block", passive_deletes=True)
+
+
+class ExperimentRevision(UUIDPrimaryKeyMixin, CreatedAtMixin, Base):
+    """Immutable snapshot of an Experiment's ordered runnable Blocks."""
+
+    __tablename__ = "experiment_revisions"
+    __table_args__ = (
+        UniqueConstraint("experiment_id", "revision_number", name="uq_experiment_revision_number"),
+        CheckConstraint("revision_number > 0", name="ck_experiment_revision_positive"),
     )
+
+    experiment_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("experiments.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    revision_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    created_by: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
+    )
+    experiment: Mapped[Experiment] = relationship(back_populates="revisions")
+    creator = relationship("User")
+    blocks: Mapped[list["ExperimentRevisionBlock"]] = relationship(
+        back_populates="revision", cascade="all, delete-orphan", passive_deletes=True,
+        order_by="ExperimentRevisionBlock.position",
+    )
+    runs: Mapped[list["ExperimentRun"]] = relationship(back_populates="revision")
+
+
+class ExperimentRevisionBlock(UUIDPrimaryKeyMixin, CreatedAtMixin, Base):
+    __tablename__ = "experiment_revision_blocks"
+    __table_args__ = (
+        UniqueConstraint("revision_id", "position", name="uq_revision_blocks_position"),
+        CheckConstraint("position >= 0", name="ck_revision_block_position_nonnegative"),
+        CheckConstraint("size_bytes >= 0", name="ck_revision_block_size_nonnegative"),
+    )
+    revision_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("experiment_revisions.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    source_block_id: Mapped[Optional[uuid.UUID]] = mapped_column(Uuid(as_uuid=True))
+    position: Mapped[int] = mapped_column(Integer, nullable=False)
+    same_page_as_previous: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    schema_version: Mapped[Optional[str]] = mapped_column(String(32))
+    app_version: Mapped[Optional[str]] = mapped_column(String(32))
+    storage_key: Mapped[str] = mapped_column(String(512), nullable=False, unique=True)
+    original_filename: Mapped[str] = mapped_column(String(255), nullable=False)
+    sha256: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    revision: Mapped[ExperimentRevision] = relationship(back_populates="blocks")
 
 
 class ExperimentRun(UUIDPrimaryKeyMixin, CreatedAtMixin, Base):
@@ -127,6 +168,9 @@ class ExperimentRun(UUIDPrimaryKeyMixin, CreatedAtMixin, Base):
         nullable=False,
         index=True,
     )
+    revision_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("experiment_revisions.id", ondelete="RESTRICT"), index=True
+    )
     session_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
     participant_number: Mapped[int] = mapped_column(Integer, nullable=False)
     participant_age: Mapped[int] = mapped_column(Integer, nullable=False)
@@ -145,6 +189,7 @@ class ExperimentRun(UUIDPrimaryKeyMixin, CreatedAtMixin, Base):
     )
 
     experiment: Mapped[Experiment] = relationship(back_populates="runs")
+    revision: Mapped[Optional[ExperimentRevision]] = relationship(back_populates="runs")
     creator = relationship("User")
     results: Mapped[list["RunResult"]] = relationship(
         back_populates="run",

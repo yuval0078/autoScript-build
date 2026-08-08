@@ -22,6 +22,7 @@ class RawResultMetadata:
     app_version: str
     experiment_name: str
     source_experiment_id: str | None
+    experiment_revision_id: str | None
     block_name: str
     source_block_id: str | None
     block_index: int
@@ -124,6 +125,10 @@ def validate_raw_result(result_path) -> RawResultMetadata:
         experiment_name=payload["experiment_name"],
         source_experiment_id=(
             None if source_experiment_id is None else str(source_experiment_id)
+        ),
+        experiment_revision_id=(
+            None if payload.get("experiment_revision_id") is None
+            else str(payload["experiment_revision_id"])
         ),
         block_name=payload.get("block_name") or payload["experiment_name"],
         source_block_id=None if source_block_id is None else str(source_block_id),

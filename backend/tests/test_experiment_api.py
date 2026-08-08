@@ -328,7 +328,37 @@ class ExperimentApiTests(unittest.TestCase):
             first_copy.json()["blocks"][0]["id"],
             baseline.json()["id"],
         )
-        self.assertEqual(len(self.storage.objects), 6)
+        self.assertEqual(len(self.storage.objects), 10)
+        self.assertEqual(first_copy.json()["current_revision"]["revision_number"], 1)
+
+    def test_revision_snapshot_remains_downloadable_after_live_block_changes(self):
+        experiment = self.create_experiment("Revision Study")
+        first_bytes = block_package("first")
+        first = self.upload_block(experiment["id"], "first", package=first_bytes)
+        revision = self.client.post(f"/api/v1/experiments/{experiment['id']}/revisions")
+        self.assertEqual(revision.status_code, 201, revision.text)
+        self.assertEqual(revision.json()["revision_number"], 1)
+        history = self.client.get(
+            f"/api/v1/experiments/{experiment['id']}/revisions"
+        )
+        self.assertEqual(history.status_code, 200, history.text)
+        self.assertEqual([item["revision_number"] for item in history.json()], [1])
+        self.assertEqual(
+            self.client.get(revision.json()["download_url"]).content,
+            first_bytes,
+        )
+        self.client.delete(f"/api/v1/blocks/{first.json()['id']}")
+        self.upload_block(experiment["id"], "second")
+        second_revision = self.client.post(f"/api/v1/experiments/{experiment['id']}/revisions")
+        self.assertEqual(second_revision.json()["revision_number"], 2)
+        history = self.client.get(
+            f"/api/v1/experiments/{experiment['id']}/revisions"
+        ).json()
+        self.assertEqual([item["revision_number"] for item in history], [2, 1])
+        self.assertEqual(
+            self.client.get(revision.json()["download_url"]).content,
+            first_bytes,
+        )
 
     def test_multi_block_experiment_download_is_a_manifest_bundle(self):
         experiment = self.create_experiment("Bundle Study")
@@ -338,7 +368,9 @@ class ExperimentApiTests(unittest.TestCase):
         }
         uploaded_blocks = {}
         for name in packages:
-            response = self.upload_block(experiment["id"], name)
+            response = self.upload_block(
+                experiment["id"], name, package=packages[name]
+            )
             self.assertEqual(response.status_code, 201, response.text)
             uploaded_blocks[name] = response.json()
 

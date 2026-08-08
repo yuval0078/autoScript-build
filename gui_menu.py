@@ -792,14 +792,30 @@ class MainMenu(QWidget):
                     block_number += 1
                     config_file = block.config_path
                     config = dict(block.config)
+                    revision_block_id = None
+                    if parent_experiment is not None and parent_experiment.get("current_revision"):
+                        revision_blocks = sorted(
+                            parent_experiment["current_revision"].get("blocks", []),
+                            key=lambda item: item.get("position", 0),
+                        )
+                        if block_number <= len(revision_blocks):
+                            revision_block = revision_blocks[block_number - 1]
+                            revision_block_id = (
+                                revision_block.get("source_block_id")
+                                or revision_block.get("id")
+                            )
                     config.update({
                         "experiment_name": session_name,
                         "experiment_id": session_id,
                         "block_name": block.name,
-                        "block_id": block.block_id or config.get("block_id") or block.sha256,
+                        "block_id": revision_block_id or block.block_id or config.get("block_id") or block.sha256,
                         "block_index": block_number,
                         "block_count": total_blocks,
                     })
+                    if parent_experiment is not None and parent_experiment.get("current_revision"):
+                        revision = parent_experiment["current_revision"]
+                        config["experiment_revision_id"] = revision["id"]
+                        config["experiment_revision_number"] = revision["revision_number"]
                     with config_file.open("w", encoding="utf-8") as handle:
                         json.dump(config, handle, ensure_ascii=False, indent=2)
 

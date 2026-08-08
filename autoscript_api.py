@@ -117,6 +117,11 @@ class AutoScriptAPI:
             f"/api/v1/experiments/{experiment_id}/duplicate",
         )
 
+    def create_experiment_revision(self, experiment_id):
+        return self._json_request(
+            "POST", f"/api/v1/experiments/{experiment_id}/revisions"
+        )
+
     def upload_block(self, experiment_id, package_path, block_name, position=0, progress=None):
         package_path = Path(package_path)
         total = package_path.stat().st_size

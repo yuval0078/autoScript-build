@@ -22,6 +22,8 @@ from ..models import (
     Experiment,
     ExperimentBlock,
     ExperimentRun,
+    ExperimentRevision,
+    ExperimentRevisionBlock,
     ExperimentVersion,
     RunArtifact,
     RunResult,
@@ -32,6 +34,7 @@ from ..schemas import (
     ExperimentBlockResponse,
     ExperimentCreate,
     ExperimentResponse,
+    ExperimentRevisionResponse,
     ExperimentUpdate,
     ExperimentVersionResponse,
 )
@@ -84,6 +87,7 @@ def _experiment_response(experiment):
         reverse=True,
     )
     blocks = sorted(experiment.blocks, key=lambda block: block.position)
+    current_revision = max(experiment.revisions, key=lambda item: item.revision_number, default=None)
     return ExperimentResponse(
         id=experiment.id,
         name=experiment.name,
@@ -92,8 +96,33 @@ def _experiment_response(experiment):
         created_at=experiment.created_at,
         blocks=[_block_response(block) for block in blocks],
         versions=[_version_response(version) for version in versions],
+        current_revision=_revision_response(current_revision) if current_revision else None,
         download_url=f"/api/v1/experiments/{experiment.id}/download",
     )
+
+
+def _revision_response(revision):
+    blocks = sorted(revision.blocks, key=lambda block: block.position)
+    return {
+        "id": revision.id,
+        "experiment_id": revision.experiment_id,
+        "revision_number": revision.revision_number,
+        "name": revision.name,
+        "created_at": revision.created_at,
+        "blocks": [
+            {
+                "id": block.id,
+                "source_block_id": block.source_block_id,
+                "position": block.position,
+                "same_page_as_previous": block.same_page_as_previous,
+                "name": block.name,
+                "sha256": block.sha256,
+                "size_bytes": block.size_bytes,
+            }
+            for block in blocks
+        ],
+        "download_url": f"/api/v1/experiment-revisions/{revision.id}/download",
+    }
 
 
 def _experiment_query(actor, experiment_id, *, lock=False):
@@ -107,6 +136,7 @@ def _experiment_query(actor, experiment_id, *, lock=False):
         .options(
             selectinload(Experiment.blocks),
             selectinload(Experiment.versions),
+            selectinload(Experiment.revisions).selectinload(ExperimentRevision.blocks),
             selectinload(Experiment.runs).selectinload(ExperimentRun.results),
             selectinload(Experiment.runs).selectinload(ExperimentRun.artifacts),
         )
@@ -201,6 +231,11 @@ def _storage_key_is_referenced(database, storage_key):
             )
         )
         or database.scalar(
+            select(func.count(ExperimentRevisionBlock.id)).where(
+                ExperimentRevisionBlock.storage_key == storage_key
+            )
+        )
+        or database.scalar(
             select(func.count(ExperimentVersion.id)).where(
                 ExperimentVersion.storage_key == storage_key
             )
@@ -260,6 +295,7 @@ def list_experiments(
         .options(
             selectinload(Experiment.blocks),
             selectinload(Experiment.versions),
+            selectinload(Experiment.revisions).selectinload(ExperimentRevision.blocks),
         )
         .order_by(Experiment.created_at.desc())
     ).all()
@@ -302,6 +338,7 @@ def delete_experiment(
         for item in [
             *experiment.blocks,
             *experiment.versions,
+            *(block for revision in experiment.revisions for block in revision.blocks),
             *(result for run in experiment.runs for result in run.results),
             *(artifact for run in experiment.runs for artifact in run.artifacts),
         ]
@@ -312,6 +349,79 @@ def delete_experiment(
         if not _storage_key_is_referenced(database, storage_key):
             storage.remove_object(storage_key)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+def _create_revision_snapshot(database, storage, actor, experiment):
+    blocks = sorted(experiment.blocks, key=lambda block: block.position)
+    if not blocks:
+        raise HTTPException(status_code=409, detail="Experiment has no Blocks to revise.")
+    next_number = max((item.revision_number for item in experiment.revisions), default=0) + 1
+    revision = ExperimentRevision(
+        id=uuid.uuid4(), experiment_id=experiment.id, revision_number=next_number,
+        name=experiment.name, created_by=actor.id,
+    )
+    database.add(revision)
+    database.flush()
+    copied_keys = []
+    try:
+        for block in blocks:
+            revision_block_id = uuid.uuid4()
+            destination_key = (
+                f"experiments/{experiment.id}/revisions/{revision.id}/blocks/"
+                f"{revision_block_id}/{block.sha256}.zip"
+            )
+            storage.copy_object(block.storage_key, destination_key)
+            copied_keys.append(destination_key)
+            revision.blocks.append(ExperimentRevisionBlock(
+                id=revision_block_id, source_block_id=block.id, position=block.position,
+                same_page_as_previous=block.same_page_as_previous, name=block.name,
+                schema_version=block.schema_version, app_version=block.app_version,
+                storage_key=destination_key, original_filename=block.original_filename,
+                sha256=block.sha256, size_bytes=block.size_bytes,
+            ))
+        database.commit()
+        database.refresh(revision)
+        return revision
+    except Exception:
+        database.rollback()
+        for key in copied_keys:
+            storage.remove_object(key)
+        raise
+
+
+@router.post(
+    "/experiments/{experiment_id}/revisions",
+    response_model=ExperimentRevisionResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_experiment_revision(
+    experiment_id: uuid.UUID,
+    database: Session = Depends(get_db),
+    storage=Depends(get_object_storage),
+    actor: User = Depends(get_current_user),
+):
+    experiment = _owned_experiment(database, actor, experiment_id, lock=True)
+    return _revision_response(_create_revision_snapshot(database, storage, actor, experiment))
+
+
+@router.get(
+    "/experiments/{experiment_id}/revisions",
+    response_model=list[ExperimentRevisionResponse],
+)
+def list_experiment_revisions(
+    experiment_id: uuid.UUID,
+    database: Session = Depends(get_db),
+    actor: User = Depends(get_current_user),
+):
+    experiment = _owned_experiment(database, actor, experiment_id)
+    return [
+        _revision_response(revision)
+        for revision in sorted(
+            experiment.revisions,
+            key=lambda item: item.revision_number,
+            reverse=True,
+        )
+    ]
 
 
 @router.post(
@@ -369,7 +479,8 @@ def duplicate_experiment(
                     created_by=actor.id,
                 )
             )
-        database.commit()
+        _create_revision_snapshot(database, storage, actor, duplicate)
+        database.expire(duplicate, ["revisions"])
     except Exception:
         database.rollback()
         for storage_key in copied_keys:
@@ -543,6 +654,68 @@ def _safe_bundle_block_name(value):
     return (value or "block")[:80]
 
 
+def _revision_download_response(revision, storage):
+    blocks = sorted(revision.blocks, key=lambda block: block.position)
+    if len(blocks) == 1:
+        block = blocks[0]
+        return StreamingResponse(
+            storage.iter_object(block.storage_key), media_type="application/zip",
+            headers={
+                "Content-Disposition": f"attachment; filename*=UTF-8''{quote(revision.name + '.zip')}",
+                "Content-Length": str(block.size_bytes),
+                "X-Checksum-SHA256": block.sha256,
+                "X-AutoScript-Package-Type": "block",
+                "X-AutoScript-Revision-ID": str(revision.id),
+            },
+        )
+    descriptor, raw_path = tempfile.mkstemp(prefix="autoscript-revision-", suffix=".zip")
+    os.close(descriptor)
+    bundle_path = Path(raw_path)
+    with zipfile.ZipFile(bundle_path, "w", compression=zipfile.ZIP_STORED) as bundle:
+        manifest_blocks = []
+        for index, block in enumerate(blocks, start=1):
+            nested_name = f"blocks/{index:03d}_{_safe_bundle_block_name(block.name)}.zip"
+            manifest_blocks.append({
+                "id": str(block.source_block_id or block.id), "name": block.name, "path": nested_name,
+                "sha256": block.sha256,
+                "same_page_as_previous": block.same_page_as_previous,
+            })
+            with bundle.open(nested_name, "w") as nested_file:
+                for chunk in storage.iter_object(block.storage_key):
+                    nested_file.write(chunk)
+        bundle.writestr("experiment.json", json.dumps({
+            "schema_version": "1.0", "package_type": "experiment",
+            "name": revision.name, "id": str(revision.experiment_id),
+            "revision_id": str(revision.id),
+            "revision_number": revision.revision_number,
+            "blocks": manifest_blocks,
+        }, ensure_ascii=False, indent=2).encode("utf-8"))
+    return FileResponse(
+        bundle_path, media_type="application/zip", filename=f"{revision.name}.zip",
+        headers={"X-AutoScript-Package-Type": "experiment-bundle", "X-AutoScript-Revision-ID": str(revision.id)},
+        background=BackgroundTask(_remove_temp_file, bundle_path),
+    )
+
+
+@router.get("/experiment-revisions/{revision_id}/download")
+def download_experiment_revision(
+    revision_id: uuid.UUID,
+    database: Session = Depends(get_db),
+    storage=Depends(get_object_storage),
+    actor: User = Depends(get_current_user),
+):
+    revision = database.scalar(
+        select(ExperimentRevision).join(Experiment).where(
+            ExperimentRevision.id == revision_id,
+            Experiment.owner_id == actor.id,
+            Experiment.archived_at.is_(None),
+        ).options(selectinload(ExperimentRevision.blocks))
+    )
+    if revision is None:
+        raise HTTPException(status_code=404, detail="Experiment revision was not found.")
+    return _revision_download_response(revision, storage)
+
+
 @router.get("/experiments/{experiment_id}/download")
 def download_experiment(
     experiment_id: uuid.UUID,
@@ -551,7 +724,13 @@ def download_experiment(
     actor: User = Depends(get_current_user),
 ):
     experiment = _owned_experiment(database, actor, experiment_id)
-    blocks = sorted(experiment.blocks, key=lambda block: block.position)
+    revision = max(experiment.revisions, key=lambda item: item.revision_number, default=None)
+    if revision is not None:
+        return _revision_download_response(revision, storage)
+    blocks = sorted(
+        experiment.blocks,
+        key=lambda block: block.position,
+    )
     if not blocks:
         raise HTTPException(status_code=409, detail="Experiment has no blocks to download.")
     download_name = f"{experiment.name}.zip"

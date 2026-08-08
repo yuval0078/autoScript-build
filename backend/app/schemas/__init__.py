@@ -3,6 +3,7 @@ from .experiments import (
     ExperimentBlockResponse,
     ExperimentCreate,
     ExperimentResponse,
+    ExperimentRevisionResponse,
     ExperimentUpdate,
     ExperimentVersionResponse,
 )
@@ -18,6 +19,7 @@ __all__ = [
     "ExperimentBlockResponse",
     "ExperimentCreate",
     "ExperimentResponse",
+    "ExperimentRevisionResponse",
     "ExperimentUpdate",
     "ExperimentVersionResponse",
     "ExperimentRunResponse",
