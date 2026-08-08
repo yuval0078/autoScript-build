@@ -4,7 +4,9 @@ import json
 import sys
 import tempfile
 import unittest
+import uuid
 import zipfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -14,7 +16,7 @@ from sqlalchemy.pool import StaticPool
 
 from app.database import get_db
 from app.main import create_app
-from app.models import Base, User
+from app.models import Base, Experiment, StagedBlockAsset, User
 from app.services.storage import get_object_storage
 
 
@@ -29,14 +31,18 @@ def block_package(
     include_app_version=True,
     include_auto_slice_word=True,
     include_owner_group=True,
+    order="stiff",
+    repetitions=1,
+    grid_rows=1,
+    grid_cols=1,
 ):
     config = {
         "app_version": "1.0.3.1",
         "name": name,
-        "grid": {"rows": 1, "cols": 1},
-        "order": "stiff",
+        "grid": {"rows": grid_rows, "cols": grid_cols},
+        "order": order,
         "sequence": ["word-1"],
-        "repetitions": {"group-a": 1},
+        "repetitions": {"group-a": repetitions},
         "active_block_sequence": [["group-a", 1]],
         "proceed_condition": {"type": "key", "delay_ms": 0},
         "beeps": {
@@ -83,6 +89,8 @@ def block_package(
 class FakeStorage:
     def __init__(self):
         self.objects = {}
+        self.copy_attempts = 0
+        self.fail_copy_at = None
 
     def bucket_exists(self):
         return True
@@ -97,6 +105,9 @@ class FakeStorage:
         self.objects.pop(object_name, None)
 
     def copy_object(self, source_object_name, destination_object_name):
+        self.copy_attempts += 1
+        if self.copy_attempts == self.fail_copy_at:
+            raise RuntimeError("simulated object-storage copy failure")
         self.objects[destination_object_name] = self.objects[source_object_name]
 
 
@@ -168,6 +179,36 @@ class ExperimentApiTests(unittest.TestCase):
             },
         )
 
+    def stage_block(self, name, *, package=None, request_id=None):
+        return self.client.post(
+            "/api/v1/staged-blocks",
+            content=package if package is not None else block_package(name),
+            headers={
+                "Content-Type": "application/zip",
+                "X-Filename": f"{name}.zip",
+                "X-Block-Name": name,
+                "X-Idempotency-Key": str(request_id or uuid.uuid4()),
+            },
+        )
+
+    def publish_create(self, name, staged_ids, *, request_id=None, joins=None):
+        joins = set(joins or [])
+        return self.client.post(
+            "/api/v1/experiments/publish",
+            json={
+                "request_id": str(request_id or uuid.uuid4()),
+                "name": name,
+                "blocks": [
+                    {
+                        "source": "staged",
+                        "id": staged_id,
+                        "same_page_as_previous": index in joins,
+                    }
+                    for index, staged_id in enumerate(staged_ids)
+                ],
+            },
+        )
+
     def test_create_rename_and_duplicate_name_conflict(self):
         experiment = self.create_experiment()
         self.assertEqual(experiment["name"], "Study")
@@ -195,6 +236,9 @@ class ExperimentApiTests(unittest.TestCase):
         second = self.upload_block(experiment["id"], "second", position=0)
         self.assertEqual(first.status_code, 201, first.text)
         self.assertEqual(second.status_code, 201, second.text)
+        self.assertEqual(first.json()["expected_word_count"], 1)
+        self.assertEqual(first.json()["grid_rows"], 1)
+        self.assertEqual(first.json()["grid_cols"], 1)
 
         listed = self.client.get("/api/v1/experiments").json()[0]
         self.assertEqual(
@@ -258,6 +302,253 @@ class ExperimentApiTests(unittest.TestCase):
             self.client.get(uploaded.json()["download_url"]).content,
             package,
         )
+
+    def test_upload_persists_random_repetition_and_grid_metrics(self):
+        experiment = self.create_experiment("Metrics Study")
+        package = block_package(
+            "repeated",
+            order="random",
+            repetitions=3,
+            grid_rows=2,
+            grid_cols=4,
+        )
+        uploaded = self.upload_block(
+            experiment["id"], "repeated", package=package
+        )
+        self.assertEqual(uploaded.status_code, 201, uploaded.text)
+        self.assertEqual(uploaded.json()["expected_word_count"], 3)
+        self.assertEqual(uploaded.json()["grid_rows"], 2)
+        self.assertEqual(uploaded.json()["grid_cols"], 4)
+
+    def test_atomic_create_publish_is_idempotent_and_exposes_current_revision(self):
+        first_bytes = block_package("first", grid_rows=1, grid_cols=2)
+        second_bytes = block_package("second", grid_rows=1, grid_cols=2)
+        first = self.stage_block("first", package=first_bytes)
+        second = self.stage_block("second", package=second_bytes)
+        self.assertEqual(first.status_code, 201, first.text)
+        self.assertEqual(second.status_code, 201, second.text)
+
+        request_id = uuid.uuid4()
+        created = self.publish_create(
+            "Atomic Study",
+            [first.json()["id"], second.json()["id"]],
+            request_id=request_id,
+            joins={1},
+        )
+        self.assertEqual(created.status_code, 201, created.text)
+        body = created.json()
+        self.assertEqual(body["current_revision_id"], body["current_revision"]["id"])
+        self.assertEqual(body["current_revision"]["revision_number"], 1)
+        self.assertEqual(
+            [block["same_page_as_previous"] for block in body["blocks"]],
+            [False, True],
+        )
+        self.assertEqual(
+            self.client.get(f"/api/v1/experiments/{body['id']}").json(), body
+        )
+
+        copies_before_retry = self.storage.copy_attempts
+        retried = self.publish_create(
+            "Atomic Study",
+            [first.json()["id"], second.json()["id"]],
+            request_id=request_id,
+            joins={1},
+        )
+        self.assertEqual(retried.status_code, 201, retried.text)
+        self.assertEqual(retried.json()["current_revision_id"], body["current_revision_id"])
+        self.assertEqual(self.storage.copy_attempts, copies_before_retry)
+        revisions = self.client.get(
+            f"/api/v1/experiments/{body['id']}/revisions"
+        ).json()
+        self.assertEqual(len(revisions), 1)
+
+        divergent = self.publish_create(
+            "Changed Name",
+            [first.json()["id"], second.json()["id"]],
+            request_id=request_id,
+            joins={1},
+        )
+        self.assertEqual(divergent.status_code, 409, divergent.text)
+
+    def test_failed_atomic_create_does_not_leave_an_empty_experiment(self):
+        staged = self.stage_block("only")
+        self.assertEqual(staged.status_code, 201, staged.text)
+        self.storage.fail_copy_at = self.storage.copy_attempts + 1
+        failed = self.publish_create("Never Visible", [staged.json()["id"]])
+        self.assertEqual(failed.status_code, 503, failed.text)
+        self.assertEqual(self.client.get("/api/v1/experiments").json(), [])
+        with self.session_factory() as session:
+            self.assertIsNone(
+                session.query(Experiment).filter_by(name="Never Visible").first()
+            )
+            asset = session.get(StagedBlockAsset, uuid.UUID(staged.json()["id"]))
+            self.assertIsNotNone(asset)
+            self.assertIsNone(asset.consumed_at)
+
+    def test_failed_update_preserves_live_blocks_and_old_revision_download(self):
+        baseline_bytes = block_package("baseline")
+        baseline_stage = self.stage_block("baseline", package=baseline_bytes)
+        created = self.publish_create(
+            "Safe Update", [baseline_stage.json()["id"]]
+        ).json()
+        experiment_id = created["id"]
+        initial_revision_id = created["current_revision_id"]
+        old_revision_url = created["current_revision"]["download_url"]
+        replacement = self.stage_block("replacement")
+
+        request_id = uuid.uuid4()
+        update_payload = {
+            "request_id": str(request_id),
+            "expected_current_revision_id": initial_revision_id,
+            "name": "Safe Update",
+            "blocks": [
+                {
+                    "source": "staged",
+                    "id": replacement.json()["id"],
+                    "same_page_as_previous": False,
+                }
+            ],
+        }
+        self.storage.fail_copy_at = self.storage.copy_attempts + 2
+        failed = self.client.post(
+            f"/api/v1/experiments/{experiment_id}/publish", json=update_payload
+        )
+        self.assertEqual(failed.status_code, 503, failed.text)
+        unchanged = self.client.get(f"/api/v1/experiments/{experiment_id}").json()
+        self.assertEqual(unchanged["current_revision_id"], initial_revision_id)
+        self.assertEqual([block["name"] for block in unchanged["blocks"]], ["baseline"])
+        self.assertEqual(self.client.get(old_revision_url).content, baseline_bytes)
+
+        self.storage.fail_copy_at = None
+        published = self.client.post(
+            f"/api/v1/experiments/{experiment_id}/publish", json=update_payload
+        )
+        self.assertEqual(published.status_code, 200, published.text)
+        self.assertNotEqual(published.json()["current_revision_id"], initial_revision_id)
+        self.assertEqual(published.json()["current_revision"]["revision_number"], 2)
+        self.assertEqual(self.client.get(old_revision_url).content, baseline_bytes)
+
+        retried = self.client.post(
+            f"/api/v1/experiments/{experiment_id}/publish", json=update_payload
+        )
+        self.assertEqual(retried.status_code, 200, retried.text)
+        self.assertEqual(
+            retried.json()["current_revision_id"],
+            published.json()["current_revision_id"],
+        )
+
+    def test_concurrent_editor_is_rejected_without_advancing_revision(self):
+        baseline = self.stage_block("baseline")
+        created = self.publish_create("Concurrent", [baseline.json()["id"]]).json()
+        expected_revision = created["current_revision_id"]
+        first_edit = self.stage_block("first-edit")
+        stale_edit = self.stage_block("stale-edit")
+
+        def payload(asset, request_id):
+            return {
+                "request_id": str(request_id),
+                "expected_current_revision_id": expected_revision,
+                "name": "Concurrent",
+                "blocks": [
+                    {
+                        "source": "staged",
+                        "id": asset.json()["id"],
+                        "same_page_as_previous": False,
+                    }
+                ],
+            }
+
+        first = self.client.post(
+            f"/api/v1/experiments/{created['id']}/publish",
+            json=payload(first_edit, uuid.uuid4()),
+        )
+        self.assertEqual(first.status_code, 200, first.text)
+        stale = self.client.post(
+            f"/api/v1/experiments/{created['id']}/publish",
+            json=payload(stale_edit, uuid.uuid4()),
+        )
+        self.assertEqual(stale.status_code, 409, stale.text)
+        current = self.client.get(f"/api/v1/experiments/{created['id']}").json()
+        self.assertEqual(current["current_revision_id"], first.json()["current_revision_id"])
+        self.assertEqual([block["name"] for block in current["blocks"]], ["first-edit"])
+
+    def test_atomic_update_can_mix_unchanged_and_staged_blocks(self):
+        first = self.stage_block("first")
+        second = self.stage_block("second")
+        created = self.publish_create(
+            "Mixed Sources", [first.json()["id"], second.json()["id"]]
+        ).json()
+        replacement = self.stage_block("replacement")
+        payload = {
+            "request_id": str(uuid.uuid4()),
+            "expected_current_revision_id": created["current_revision_id"],
+            "name": "Mixed Sources",
+            "blocks": [
+                {
+                    "source": "existing",
+                    "id": created["blocks"][1]["id"],
+                    "same_page_as_previous": False,
+                },
+                {
+                    "source": "staged",
+                    "id": replacement.json()["id"],
+                    "same_page_as_previous": False,
+                },
+            ],
+        }
+        updated = self.client.post(
+            f"/api/v1/experiments/{created['id']}/publish", json=payload
+        )
+        self.assertEqual(updated.status_code, 200, updated.text)
+        self.assertEqual(
+            [block["name"] for block in updated.json()["blocks"]],
+            ["second", "replacement"],
+        )
+        self.assertEqual(updated.json()["current_revision"]["revision_number"], 2)
+
+    def test_staging_idempotency_validation_and_expiry_cleanup(self):
+        invalid = self.client.post(
+            "/api/v1/staged-blocks",
+            content=b"not-a-zip",
+            headers={
+                "X-Filename": "invalid.zip",
+                "X-Block-Name": "invalid",
+                "X-Idempotency-Key": str(uuid.uuid4()),
+            },
+        )
+        self.assertEqual(invalid.status_code, 422, invalid.text)
+        self.assertEqual(self.storage.objects, {})
+
+        request_id = uuid.uuid4()
+        first = self.stage_block("same", request_id=request_id)
+        exact = self.stage_block("same", request_id=request_id)
+        self.assertEqual(first.status_code, 201, first.text)
+        self.assertEqual(exact.status_code, 200, exact.text)
+        self.assertEqual(first.json()["id"], exact.json()["id"])
+
+        divergent = self.stage_block(
+            "different", request_id=request_id, package=block_package("different")
+        )
+        self.assertEqual(divergent.status_code, 409, divergent.text)
+        expired_key = next(iter(self.storage.objects))
+        with self.session_factory() as session:
+            asset = session.get(StagedBlockAsset, uuid.UUID(first.json()["id"]))
+            asset.expires_at = datetime.now(timezone.utc) - timedelta(hours=1)
+            session.commit()
+        fresh = self.stage_block("fresh")
+        self.assertEqual(fresh.status_code, 201, fresh.text)
+        self.assertNotIn(expired_key, self.storage.objects)
+
+    def test_publish_rejects_invalid_same_page_layout(self):
+        first = self.stage_block("first")
+        second = self.stage_block("second")
+        rejected = self.publish_create(
+            "Too Full",
+            [first.json()["id"], second.json()["id"]],
+            joins={1},
+        )
+        self.assertEqual(rejected.status_code, 422, rejected.text)
+        self.assertEqual(self.client.get("/api/v1/experiments").json(), [])
 
     def test_rejects_invalid_mismatched_or_incomplete_block_requests(self):
         experiment = self.create_experiment()
@@ -338,6 +629,9 @@ class ExperimentApiTests(unittest.TestCase):
         revision = self.client.post(f"/api/v1/experiments/{experiment['id']}/revisions")
         self.assertEqual(revision.status_code, 201, revision.text)
         self.assertEqual(revision.json()["revision_number"], 1)
+        self.assertEqual(revision.json()["blocks"][0]["expected_word_count"], 1)
+        self.assertEqual(revision.json()["blocks"][0]["grid_rows"], 1)
+        self.assertEqual(revision.json()["blocks"][0]["grid_cols"], 1)
         history = self.client.get(
             f"/api/v1/experiments/{experiment['id']}/revisions"
         )

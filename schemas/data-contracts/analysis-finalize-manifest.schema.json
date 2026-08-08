@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autoscript.local/schemas/analysis-finalize-manifest.schema.json",
+  "title": "AutoScript atomic analysis finalization manifest",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "run_id",
+    "session_id",
+    "completed",
+    "source_fingerprint",
+    "files"
+  ],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "analyzer_version": {"type": "string", "maxLength": 32},
+    "run_id": {"type": "string", "minLength": 1},
+    "session_id": {"type": "string", "minLength": 1, "maxLength": 128},
+    "completed": {"type": "boolean"},
+    "source_fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "files": {
+      "type": "object",
+      "required": ["analysis_state.json", "analysis.csv", "trainable.json"],
+      "properties": {
+        "analysis_state.json": {"$ref": "#/$defs/file"},
+        "analysis.csv": {"$ref": "#/$defs/file"},
+        "trainable.json": {"$ref": "#/$defs/file"}
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "file": {
+      "type": "object",
+      "required": ["sha256"],
+      "properties": {
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      },
+      "additionalProperties": false
+    }
+  }
+}

@@ -31,6 +31,7 @@ from ..schemas import (
     RunResultResponse,
 )
 from ..services.raw_results import RawResultValidationError, validate_raw_result
+from ..services.object_cleanup import drain_object_deletions, queue_object_deletions
 from ..services.storage import get_object_storage
 
 
@@ -82,12 +83,11 @@ def _run_response(run):
     results = sorted(run.results, key=lambda result: result.block_index)
     artifacts = sorted(run.artifacts, key=lambda item: item.created_at, reverse=True)
     completed_word_count = sum(result.completed_word_count for result in results)
-    expected_word_count = sum(result.expected_word_count for result in results)
-    complete = (
-        len(results) == run.block_count
-        and all(result.block_completed for result in results)
-        and all(result.experiment_completed for result in results)
-        and completed_word_count == expected_word_count
+    revision_blocks = _authoritative_revision_blocks(run)
+    expected_word_count = (
+        sum(block.expected_word_count for block in revision_blocks)
+        if revision_blocks is not None
+        else sum(result.expected_word_count for result in results)
     )
     return ExperimentRunResponse(
         id=run.id,
@@ -109,14 +109,42 @@ def _run_response(run):
         result_count=len(results),
         completed_word_count=completed_word_count,
         expected_word_count=expected_word_count,
-        complete=complete,
+        complete=_run_is_complete(run, results),
         results=[_result_response(result) for result in results],
         artifacts=[_artifact_response(artifact) for artifact in artifacts],
     )
 
 
-def _run_is_complete(run):
-    results = list(run.results)
+def _ordered_revision_blocks(run):
+    revision = getattr(run, "revision", None)
+    if revision is None:
+        return []
+    return sorted(revision.blocks, key=lambda block: block.position)
+
+
+def _authoritative_revision_blocks(run):
+    blocks = _ordered_revision_blocks(run)
+    if (
+        len(blocks) != run.block_count
+        or any(block.expected_word_count is None for block in blocks)
+    ):
+        return None
+    return blocks
+
+
+def _run_is_complete(run, results=None):
+    results = list(run.results if results is None else results)
+    revision_blocks = _authoritative_revision_blocks(run)
+    if revision_blocks is not None:
+        results_by_index = {result.block_index: result for result in results}
+        return (
+            len(results_by_index) == len(revision_blocks)
+            and all(
+                (result := results_by_index.get(block.position + 1)) is not None
+                and result.completed_word_count == block.expected_word_count
+                for block in revision_blocks
+            )
+        )
     return (
         len(results) == run.block_count
         and all(result.block_completed for result in results)
@@ -147,7 +175,7 @@ def _owned_experiment(database, actor, experiment_id, *, lock=False):
 def _owned_run(database, actor, run_id):
     run = database.scalar(
         select(ExperimentRun)
-        .join(Experiment)
+        .join(Experiment, ExperimentRun.experiment_id == Experiment.id)
         .where(
             ExperimentRun.id == run_id,
             Experiment.owner_id == actor.id,
@@ -156,6 +184,7 @@ def _owned_run(database, actor, run_id):
         .options(
             selectinload(ExperimentRun.results),
             selectinload(ExperimentRun.artifacts),
+            selectinload(ExperimentRun.revision).selectinload(ExperimentRevision.blocks),
         )
     )
     if run is None:
@@ -177,7 +206,7 @@ def create_experiment_run(
 ):
     revision = database.scalar(
         select(ExperimentRevision)
-        .join(Experiment)
+        .join(Experiment, ExperimentRevision.experiment_id == Experiment.id)
         .where(
             ExperimentRevision.id == revision_id,
             Experiment.owner_id == actor.id,
@@ -196,6 +225,7 @@ def create_experiment_run(
         .options(
             selectinload(ExperimentRun.results),
             selectinload(ExperimentRun.artifacts),
+            selectinload(ExperimentRun.revision).selectinload(ExperimentRevision.blocks),
         )
     )
     if existing is not None:
@@ -400,11 +430,70 @@ def _ensure_consistent_run(run, metadata):
         )
 
 
+def _revision_block_for_result(run, metadata, *, allow_missing_server_run_id=False):
+    """Validate current-format result identity against the pinned snapshot."""
+    if run.revision_id is None:
+        return None
+    revision = run.revision
+    if revision is None:
+        raise HTTPException(status_code=409, detail="Run revision is unavailable.")
+
+    blocks = _ordered_revision_blocks(run)
+    if metadata.block_index < 1 or metadata.block_index > len(blocks):
+        raise HTTPException(
+            status_code=409,
+            detail="Result Block index does not exist in the pinned revision.",
+        )
+    block = blocks[metadata.block_index - 1]
+    expected_block_ids = {str(block.id)}
+    if block.source_block_id is not None:
+        expected_block_ids.add(str(block.source_block_id))
+
+    identity_conflicts = []
+    if metadata.source_experiment_id != str(run.experiment_id):
+        identity_conflicts.append("Experiment ID")
+    if metadata.experiment_revision_id != str(revision.id):
+        identity_conflicts.append("revision ID")
+    if metadata.experiment_revision_number != revision.revision_number:
+        identity_conflicts.append("revision number")
+    if metadata.block_count != len(blocks):
+        identity_conflicts.append("Block count")
+    if metadata.block_name != block.name:
+        identity_conflicts.append("Block name")
+    if metadata.source_block_id not in expected_block_ids:
+        identity_conflicts.append("Block ID")
+    if metadata.schema_version == "1.3":
+        if metadata.server_run_id is None and allow_missing_server_run_id:
+            pass
+        elif metadata.server_run_id != str(run.id):
+            identity_conflicts.append("server Run ID")
+    if (
+        block.expected_word_count is not None
+        and metadata.expected_word_count != block.expected_word_count
+    ):
+        identity_conflicts.append("expected word count")
+    if identity_conflicts:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Result identity conflicts with the pinned revision: "
+                + ", ".join(identity_conflicts)
+                + "."
+            ),
+        )
+    return block
+
+
 def _persist_received_result(
     database, storage, actor, experiment, run, metadata,
     upload_path, sha256, size_bytes, filename, response, auto_finalize=False,
 ):
     _ensure_consistent_run(run, metadata)
+    revision_block = _revision_block_for_result(
+        run,
+        metadata,
+        allow_missing_server_run_id=auto_finalize,
+    )
     existing = next(
         (result for result in run.results if result.block_index == metadata.block_index),
         None,
@@ -421,20 +510,32 @@ def _persist_received_result(
         raise HTTPException(status_code=409, detail=f"Run is already {run.status}.")
 
     block_id = None
-    if metadata.source_block_id:
+    source_block_id = (
+        revision_block.source_block_id
+        if revision_block is not None
+        else metadata.source_block_id
+    )
+    if source_block_id:
         try:
-            candidate_id = uuid.UUID(metadata.source_block_id)
+            candidate_id = uuid.UUID(str(source_block_id))
         except (ValueError, TypeError, AttributeError):
             candidate_id = None
         if candidate_id is not None and any(block.id == candidate_id for block in experiment.blocks):
             block_id = candidate_id
+    completed_word_count = len(metadata.payload["words"])
+    expected_word_count = (
+        revision_block.expected_word_count
+        if revision_block is not None and revision_block.expected_word_count is not None
+        else metadata.expected_word_count
+    )
+    block_completed = completed_word_count == expected_word_count
     result = RunResult(
         id=uuid.uuid4(), run_id=run.id, block_id=block_id,
         block_index=metadata.block_index, block_count=metadata.block_count,
-        block_name=metadata.block_name, block_completed=metadata.block_completed,
+        block_name=metadata.block_name, block_completed=block_completed,
         experiment_completed=metadata.experiment_completed,
-        completed_word_count=metadata.completed_word_count,
-        expected_word_count=metadata.expected_word_count,
+        completed_word_count=completed_word_count,
+        expected_word_count=expected_word_count,
         schema_version=metadata.schema_version, app_version=metadata.app_version,
         result_timestamp=metadata.timestamp,
         original_filename=_safe_json_filename(filename), sha256=sha256,
@@ -453,14 +554,7 @@ def _persist_received_result(
         candidate_results = [
             item for item in run.results if item.block_index != result.block_index
         ] + [result]
-        legacy_complete = (
-            auto_finalize
-            and len(candidate_results) == run.block_count
-            and all(item.block_completed for item in candidate_results)
-            and all(item.experiment_completed for item in candidate_results)
-            and sum(item.completed_word_count for item in candidate_results)
-            == sum(item.expected_word_count for item in candidate_results)
-        )
+        legacy_complete = auto_finalize and _run_is_complete(run, candidate_results)
         run.status = "completed" if legacy_complete else "running"
         if legacy_complete:
             run.finalized_at = datetime.now(timezone.utc)
@@ -578,6 +672,7 @@ def list_experiment_runs(
         .options(
             selectinload(ExperimentRun.results),
             selectinload(ExperimentRun.artifacts),
+            selectinload(ExperimentRun.revision).selectinload(ExperimentRevision.blocks),
         )
         .order_by(ExperimentRun.created_at.desc())
     ).all()
@@ -681,10 +776,10 @@ def delete_experiment_run(
     storage_keys = {
         item.storage_key for item in [*run.results, *run.artifacts]
     }
+    queue_object_deletions(database, storage_keys)
     database.delete(run)
     database.commit()
-    for storage_key in storage_keys:
-        storage.remove_object(storage_key)
+    drain_object_deletions(database, storage)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 

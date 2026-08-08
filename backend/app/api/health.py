@@ -1,9 +1,10 @@
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Response
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from ..database import get_db
+from ..runtime_state import DATABASE_SCHEMA_REVISION
 from ..services.storage import get_object_storage
 
 
@@ -11,7 +12,8 @@ router = APIRouter(prefix="/health", tags=["health"])
 
 
 @router.get("/live")
-def live():
+def live(response: Response):
+    response.headers["Cache-Control"] = "no-store"
     return {"status": "ok"}
 
 
@@ -20,12 +22,29 @@ def ready(
     database: Session = Depends(get_db),
     storage=Depends(get_object_storage),
 ):
-    components = {"database": "ready", "object_storage": "ready"}
+    components = {
+        "database": "ready",
+        "schema": "ready",
+        "object_storage": "ready",
+    }
 
     try:
         database.execute(text("SELECT 1"))
     except Exception:
         components["database"] = "unavailable"
+        components["schema"] = "unavailable"
+        database.rollback()
+
+    if components["database"] == "ready":
+        try:
+            revision = database.execute(
+                text("SELECT version_num FROM alembic_version")
+            ).scalar_one_or_none()
+            if revision != DATABASE_SCHEMA_REVISION:
+                components["schema"] = "migration_required"
+        except Exception:
+            components["schema"] = "unavailable"
+            database.rollback()
 
     try:
         if not storage.bucket_exists():
@@ -38,4 +57,8 @@ def ready(
         "status": "ready" if is_ready else "not_ready",
         "components": components,
     }
-    return JSONResponse(payload, status_code=200 if is_ready else 503)
+    return JSONResponse(
+        payload,
+        status_code=200 if is_ready else 503,
+        headers={"Cache-Control": "no-store"},
+    )

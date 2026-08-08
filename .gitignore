@@ -29,6 +29,8 @@ assets/bin/ffprobe.exe
 *trainable*.json
 *analysis*.json
 *analysis*.csv
+!schemas/data-contracts/analysis-state.schema.json
+!schemas/data-contracts/analysis-finalize-manifest.schema.json
 1_*/
 
 # OS files

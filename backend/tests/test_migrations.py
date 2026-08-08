@@ -38,7 +38,19 @@ class MigrationTests(unittest.TestCase):
             get_settings.cache_clear()
             engine = create_engine(database_url)
             try:
-                table_names = set(inspect(engine).get_table_names())
+                inspector = inspect(engine)
+                table_names = set(inspector.get_table_names())
+                experiment_columns = {
+                    column["name"] for column in inspector.get_columns("experiments")
+                }
+                staged_columns = {
+                    column["name"]
+                    for column in inspector.get_columns("staged_block_assets")
+                }
+                security_event_columns = {
+                    column["name"]
+                    for column in inspector.get_columns("security_events")
+                }
             finally:
                 engine.dispose()
 
@@ -54,9 +66,28 @@ class MigrationTests(unittest.TestCase):
                     "experiment_versions",
                     "experiment_revisions",
                     "experiment_revision_blocks",
+                    "experiment_publish_operations",
+                    "staged_block_assets",
+                    "run_analysis_revisions",
+                    "run_analysis_operations",
+                    "object_deletion_tasks",
+                    "security_events",
+                    "login_rate_limits",
                     "run_artifacts",
                     "run_results",
                 },
+            )
+            self.assertIn("current_revision_id", experiment_columns)
+            self.assertTrue(
+                {"request_id", "expires_at", "consumed_at"}.issubset(staged_columns)
+            )
+            self.assertTrue(
+                {
+                    "event_type",
+                    "outcome",
+                    "request_id",
+                    "client_address_hash",
+                }.issubset(security_event_columns)
             )
 
     def test_block_migration_backfills_only_latest_legacy_version(self):
@@ -129,6 +160,9 @@ class MigrationTests(unittest.TestCase):
             self.assertFalse(rows[0]["same_page_as_previous"])
             self.assertEqual(rows[0]["storage_key"], "legacy/2.zip")
             self.assertEqual(rows[0]["sha256"], "2" * 64)
+            self.assertIsNone(rows[0]["expected_word_count"])
+            self.assertIsNone(rows[0]["grid_rows"])
+            self.assertIsNone(rows[0]["grid_cols"])
 
 
 if __name__ == "__main__":

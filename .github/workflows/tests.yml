@@ -27,6 +27,7 @@ jobs:
           python -m pip install
           "PyQt5>=5.15.9"
           "jsonschema>=4.23,<5"
+          "cryptography>=43.0.0"
 
       - name: Run focused unit tests
         run: python -m unittest discover -s tests -v

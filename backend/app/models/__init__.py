@@ -5,9 +5,14 @@ from .experiment import (
     ExperimentRun,
     ExperimentRevision,
     ExperimentRevisionBlock,
+    ExperimentPublishOperation,
     ExperimentVersion,
+    ObjectDeletionTask,
+    RunAnalysisOperation,
+    RunAnalysisRevision,
     RunArtifact,
     RunResult,
+    StagedBlockAsset,
 )
 from .user import AccessToken, User
 
@@ -18,9 +23,14 @@ __all__ = [
     "ExperimentRun",
     "ExperimentRevision",
     "ExperimentRevisionBlock",
+    "ExperimentPublishOperation",
     "ExperimentVersion",
+    "ObjectDeletionTask",
+    "RunAnalysisOperation",
+    "RunAnalysisRevision",
     "RunArtifact",
     "RunResult",
+    "StagedBlockAsset",
     "User",
     "AccessToken",
 ]

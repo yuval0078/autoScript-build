@@ -44,6 +44,19 @@ def raw_result(experiment_id, *, block_index=1, block_count=2):
     }
 
 
+def word_record(word="test"):
+    return {
+        "word": word,
+        "cell": 0,
+        "group": "group-a",
+        "start_time": 1.0,
+        "end_time": 2.0,
+        "audio_start_time": 1.0,
+        "audio_end_time": 1.5,
+        "pen_events": [],
+    }
+
+
 class FakeStorage:
     def __init__(self):
         self.objects = {}
@@ -170,21 +183,32 @@ class ResultApiTests(unittest.TestCase):
 
     def test_run_is_pinned_to_declared_experiment_revision(self):
         revision_id = uuid.uuid4()
+        revision_block_id = uuid.uuid4()
         with self.session_factory() as session:
             actor = session.query(User).one()
-            session.add(ExperimentRevision(
+            revision = ExperimentRevision(
                 id=revision_id,
                 experiment_id=uuid.UUID(self.experiment["id"]),
                 revision_number=1,
                 name="Results Study",
                 created_by=actor.id,
-            ))
+            )
+            revision.blocks = [ExperimentRevisionBlock(
+                id=revision_block_id, source_block_id=None, position=0,
+                same_page_as_previous=False, name="block-1",
+                expected_word_count=0, grid_rows=1, grid_cols=1,
+                storage_key="revision/0.zip", original_filename="block-1.zip",
+                sha256="1" * 64, size_bytes=10,
+            )]
+            session.add(revision)
             session.commit()
         payload = raw_result(self.experiment["id"], block_count=1)
         payload.update({
             "schema_version": "1.3",
             "experiment_revision_id": str(revision_id),
             "experiment_revision_number": 1,
+            "server_run_id": None,
+            "block_id": str(revision_block_id),
         })
         uploaded, _ = self.upload(payload)
         self.assertEqual(uploaded.status_code, 201, uploaded.text)
@@ -203,10 +227,11 @@ class ResultApiTests(unittest.TestCase):
             )
             revision.blocks = [
                 ExperimentRevisionBlock(
-                    source_block_id=None, position=index, same_page_as_previous=False,
+                    id=uuid.uuid4(), source_block_id=None, position=index,
+                    same_page_as_previous=False,
                     name=f"block-{index + 1}", storage_key=f"revision/{index}.zip",
                     original_filename=f"block-{index + 1}.zip", sha256=str(index + 1) * 64,
-                    size_bytes=10,
+                    size_bytes=10, expected_word_count=0, grid_rows=1, grid_cols=1,
                 )
                 for index in range(2)
             ]
@@ -236,6 +261,8 @@ class ResultApiTests(unittest.TestCase):
                 "schema_version": "1.3",
                 "experiment_revision_id": str(revision_id),
                 "experiment_revision_number": 1,
+                "server_run_id": run_id,
+                "block_id": str(revision.blocks[block_index - 1].id),
             })
             content = json.dumps(payload).encode("utf-8")
             uploaded = self.client.post(
@@ -253,6 +280,107 @@ class ResultApiTests(unittest.TestCase):
         self.assertEqual(finalized.status_code, 200, finalized.text)
         self.assertEqual(finalized.json()["status"], "completed")
         self.assertIsNotNone(finalized.json()["finalized_at"])
+
+    def test_revision_truth_controls_result_identity_and_completeness(self):
+        revision_id = uuid.uuid4()
+        revision_block_id = uuid.uuid4()
+        with self.session_factory() as session:
+            actor = session.query(User).one()
+            revision = ExperimentRevision(
+                id=revision_id,
+                experiment_id=uuid.UUID(self.experiment["id"]),
+                revision_number=1,
+                name="Results Study",
+                created_by=actor.id,
+            )
+            revision.blocks = [ExperimentRevisionBlock(
+                id=revision_block_id,
+                source_block_id=None,
+                position=0,
+                same_page_as_previous=False,
+                name="block-1",
+                expected_word_count=2,
+                grid_rows=1,
+                grid_cols=2,
+                storage_key="revision/authoritative.zip",
+                original_filename="block-1.zip",
+                sha256="a" * 64,
+                size_bytes=10,
+            )]
+            session.add(revision)
+            session.commit()
+
+        created = self.client.post(
+            f"/api/v1/experiment-revisions/{revision_id}/runs",
+            json={
+                "session_id": "7_20260807_120000_abcdef",
+                "participant_number": 7,
+                "participant_age": 25,
+                "participant_gender": "Other",
+            },
+        )
+        self.assertEqual(created.status_code, 201, created.text)
+        run_id = created.json()["id"]
+        self.assertEqual(created.json()["expected_word_count"], 2)
+        self.client.post(f"/api/v1/runs/{run_id}/start")
+
+        payload = raw_result(self.experiment["id"], block_count=1)
+        payload.update({
+            "schema_version": "1.3",
+            "experiment_revision_id": str(revision_id),
+            "experiment_revision_number": 1,
+            "server_run_id": str(uuid.uuid4()),
+            "block_id": str(revision_block_id),
+            "completed_word_count": 2,
+            "expected_word_count": 2,
+            "block_completed": False,
+            "experiment_completed": False,
+            "words": [word_record("one"), word_record("two")],
+        })
+        conflicting = self.client.post(
+            f"/api/v1/runs/{run_id}/results",
+            content=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(conflicting.status_code, 409, conflicting.text)
+        self.assertIn("server Run ID", conflicting.json()["detail"])
+        self.assertEqual(self.storage.objects, {})
+
+        payload["server_run_id"] = run_id
+        payload["block_name"] = "wrong-block"
+        wrong_block = self.client.post(
+            f"/api/v1/runs/{run_id}/results",
+            content=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(wrong_block.status_code, 409, wrong_block.text)
+        self.assertIn("Block name", wrong_block.json()["detail"])
+
+        payload["block_name"] = "block-1"
+        payload["expected_word_count"] = 3
+        wrong_count = self.client.post(
+            f"/api/v1/runs/{run_id}/results",
+            content=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(wrong_count.status_code, 409, wrong_count.text)
+        self.assertIn("expected word count", wrong_count.json()["detail"])
+
+        payload["expected_word_count"] = 2
+        accepted = self.client.post(
+            f"/api/v1/runs/{run_id}/results",
+            content=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(accepted.status_code, 201, accepted.text)
+        self.assertTrue(accepted.json()["block_completed"])
+        self.assertEqual(accepted.json()["completed_word_count"], 2)
+        self.assertEqual(accepted.json()["expected_word_count"], 2)
+
+        finalized = self.client.post(f"/api/v1/runs/{run_id}/finalize")
+        self.assertEqual(finalized.status_code, 200, finalized.text)
+        self.assertEqual(finalized.json()["status"], "completed")
+        self.assertTrue(finalized.json()["complete"])
 
     def test_legacy_result_without_block_identity_is_accepted(self):
         payload = raw_result(self.experiment["id"], block_index=1, block_count=1)
@@ -289,6 +417,7 @@ class ResultApiTests(unittest.TestCase):
                 "expected_word_count": 2,
             }
         )
+        payload["words"] = [word_record()]
         uploaded, _ = self.upload(payload)
         self.assertEqual(uploaded.status_code, 201, uploaded.text)
         run = self.client.get(

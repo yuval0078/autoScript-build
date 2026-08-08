@@ -7,6 +7,17 @@ JSON bytes.
 
 ## Experiment and block API
 
+- `POST /api/v1/staged-blocks` validates and stores an owner-scoped immutable
+  Block asset. It requires a UUID `X-Idempotency-Key`; an exact retry returns
+  the same asset, while reuse for different bytes returns HTTP 409.
+- `POST /api/v1/experiments/publish` atomically creates a non-empty Experiment,
+  its ordered live Blocks, and revision 1 from staged assets.
+- `POST /api/v1/experiments/{id}/publish` atomically replaces the complete live
+  Block order/page layout and advances `current_revision_id`. Its body must
+  include the revision seen by the editor as `expected_current_revision_id`;
+  stale editors receive HTTP 409.
+- `GET /api/v1/experiments/{id}` returns one owner-scoped Experiment, including
+  the explicit `current_revision_id` and immutable current revision.
 - `POST /api/v1/experiments` creates an empty experiment.
 - `GET /api/v1/experiments` lists experiments with their ordered `blocks`.
 - `PATCH /api/v1/experiments/{id}` renames or updates the description.
@@ -27,6 +38,21 @@ JSON bytes.
 Uploaded block ZIPs are validated against
 `schemas/data-contracts/experiment-package.schema.json`. The `name` inside the
 package is the block name and must match `X-Block-Name`.
+The API also records the package's expected prompt count and grid dimensions
+on both the live Block and every immutable revision snapshot. Existing rows
+migrated from older releases retain `null` metrics because Alembic cannot read
+their object-storage ZIPs during a database migration.
+
+Atomic publish bodies carry a UUID `request_id` and ordered references of the
+form `{"source":"staged|existing","id":"...","same_page_as_previous":false}`.
+The same request can be retried exactly without creating another revision.
+The server copies every source to fresh live and revision objects before its
+single database commit. A validation, storage, or database failure therefore
+leaves the previous runnable Blocks and current revision unchanged; a failed
+create leaves no empty Experiment. Staged assets expire after
+`AUTOSCRIPT_STAGED_BLOCK_TTL_HOURS` (24 by default) and are cleaned
+opportunistically. Legacy CRUD, upload, reorder, and revision routes remain
+available for older clients.
 
 The legacy immutable-version routes remain available. A publish to
 `POST /api/v1/experiments/{id}/versions` creates a block when empty and replaces
@@ -53,6 +79,13 @@ The desktop Runner copies pending uploads into its durable `api_upload_queue`.
 Result uploads and finalization are retried in FIFO order after a connection
 failure.
 
+For a revision-pinned Run, the server validates the Experiment, revision,
+server Run, Block index/name/ID, Block count, and expected word count against
+the immutable revision. Completion is derived from the number of stored word
+records and the revision's expected prompt counts; client completion flags do
+not decide final Run status. Revisions migrated without authoritative metrics
+retain the previous compatibility calculation.
+
 - `POST /api/v1/experiments/{id}/results` streams one raw Runner JSON file.
   `X-Filename` is optional. The body is validated against
   `schemas/data-contracts/raw-run.schema.json` and stored byte-for-byte.
@@ -61,6 +94,18 @@ failure.
 - `GET /api/v1/runs/{run_id}` returns one session.
 - `GET /api/v1/run-results/{result_id}/download` returns the exact JSON bytes
   with `X-Checksum-SHA256`.
+- `POST /api/v1/run-results/resolve` resolves owner-visible immutable results
+  by exact SHA-256 and reports both matching result metadata and missing hashes.
+- `GET /api/v1/runs/{run_id}/analysis-state` returns the current raw state JSON
+  with `ETag`, revision, checksum, source-fingerprint, and `Last-Modified`
+  headers. `If-None-Match` supports a bodyless HTTP 304 response.
+- `PUT /api/v1/runs/{run_id}/analysis-state` creates an immutable draft. It
+  requires a UUID `X-Idempotency-Key` and either the current `If-Match` ETag or
+  `If-None-Match: *` for the first state. The newest 20 drafts are retained.
+- `POST /api/v1/runs/{run_id}/analysis/finalize` atomically validates and stores
+  a ZIP containing only `manifest.json`, `analysis_state.json`, `analysis.csv`,
+  and `trainable.json`. The state, CSV, training JSON, and analysis status
+  become visible in one database commit. Finalized revisions are never pruned.
 - `PATCH /api/v1/runs/{run_id}/analysis` records whether analysis is completed.
 - `POST /api/v1/runs/{run_id}/artifacts/{analysis_csv|trainable_json|analysis_state}` stores
   immutable Analyzer exports; exact retries are idempotent.
@@ -77,6 +122,13 @@ Migration `20260807_0004` adds `experiment_runs` and `run_results`; migration
 `20260807_0005` adds word/Block completeness, tri-state analysis status, and
 immutable Analyzer artifacts. Migrations `20260808_0008` and `0009` add access
 tokens, explicit Run lifecycle timestamps/status, and historical Run backfill.
+Migration `20260808_0010` adds authoritative word-count and grid metadata to
+live and revision Blocks. Migration `20260808_0011` adds atomic publish
+idempotency, expiring staged assets, and the explicit current-revision pointer.
+Migration `20260808_0012` adds revisioned Analyzer state, permanent
+finalizations, request idempotency records, CAS pointers, and a durable object
+deletion queue. The legacy analysis status and artifact routes remain
+available for older clients.
 
 ## Run with Docker
 
@@ -94,6 +146,10 @@ docker compose up -d --build
 The API container applies migrations, creates the object-storage bucket, and
 bootstraps a local actor before Uvicorn starts. The development stack uses
 `AUTOSCRIPT_AUTH_MODE=local` and remains bound to localhost.
+`/health/live` has no dependency checks. `/health/ready` returns 503 unless the
+database is reachable, Alembic is exactly at the application schema revision,
+and the configured object-storage bucket is reachable. Both responses disable
+caching.
 
 ## Multi-user authentication
 
@@ -104,6 +160,26 @@ only its SHA-256 hash is stored so the token can expire or be revoked.
 - `POST /api/v1/auth/login`, `POST /api/v1/auth/logout`, `GET /api/v1/auth/me`
 - Admin-only: `GET /api/v1/users`, `POST /api/v1/users`, and
   `PATCH /api/v1/users/{id}`
+- Admin-only: `GET /api/v1/security/events` returns recent durable login,
+  logout, session-cleanup, and user-administration audit events.
+
+Login failures are rate-limited in shared database state by normalized account
+and a one-way hash of the client address, so limits apply across API workers.
+The default principal limit is five attempts in five minutes followed by a
+15-minute lockout; address limits use a configurable multiplier. Exact settings
+are `AUTOSCRIPT_LOGIN_RATE_LIMIT_ATTEMPTS`,
+`AUTOSCRIPT_LOGIN_RATE_LIMIT_ADDRESS_MULTIPLIER`,
+`AUTOSCRIPT_LOGIN_RATE_LIMIT_WINDOW_SECONDS`, and
+`AUTOSCRIPT_LOGIN_RATE_LIMIT_LOCKOUT_SECONDS`. Login/logout and administrator
+security writes opportunistically delete expired/revoked access tokens and old
+inactive limiter buckets; ordinary authenticated reads remain read-only.
+
+Every HTTP response includes `X-Request-ID` and `X-Correlation-ID`. Safe values
+provided by callers are propagated; otherwise a request UUID is generated.
+Access and unexpected-error logs are JSON objects containing method, path,
+status, duration, and these identifiers. Headers, query strings, request bodies,
+passwords, bearer tokens, and exception messages are never logged. Unexpected
+errors return a generic correlated HTTP 500 response.
 
 Experiments and all nested revisions, Runs, results, and artifacts are filtered
 through their owner's user ID. The desktop app prompts after an HTTP 401 and
@@ -123,6 +199,9 @@ console, and binds the API to loopback for a TLS reverse proxy. Put Caddy,
 nginx, or the hosting platform's HTTPS proxy in front of port 8000. Do not
 expose PostgreSQL or MinIO publicly. Desktop clients set
 `AUTOSCRIPT_API_URL=https://your-api-host` and authenticate in the app.
+
+Migration `20260808_0013` adds durable security audit and shared login-rate-limit
+tables. It depends on Analyzer migration `20260808_0012`.
 
 ## Test
 

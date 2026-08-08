@@ -100,8 +100,11 @@ class RunnerRecoveryContractsTests(unittest.TestCase):
         self.assertIn("safe_extract_zip(block_archive, extracted_dir)", package_source)
         self.assertIn('source_kind="block"', package_source)
         self.assertIn('source_kind="experiment"', package_source)
-        self.assertIn('source_script_path("tablet_experiment.py")', source)
-        self.assertIn('command.extend(["--session-plan", str(session_plan_path)])', source)
+        self.assertIn('component_launch_command(', source)
+        self.assertIn('"runner",', source)
+        self.assertIn('source_script="tablet_experiment.py"', source)
+        self.assertIn('legacy_executable="ExperimentRunner.exe"', source)
+        self.assertIn('arguments.extend(["--session-plan", str(session_plan_path)])', source)
 
     def test_local_legacy_runs_use_the_block_arrangement_dialog(self):
         source = _source("gui_menu.py")

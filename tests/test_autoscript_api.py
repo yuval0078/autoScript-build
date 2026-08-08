@@ -22,11 +22,13 @@ class ApiHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
 
-    def send_json(self, status, payload):
+    def send_json(self, status, payload, headers=None):
         body = json.dumps(payload).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(body)
 
@@ -34,6 +36,17 @@ class ApiHandler(BaseHTTPRequestHandler):
         type(self).last_authorization = self.headers.get("Authorization")
         if self.path == "/api/v1/experiments":
             self.send_json(200, [{"id": "experiment-1", "name": "fixture", "versions": []}])
+            return
+        if self.path == "/api/v1/experiments/experiment-1":
+            self.send_json(
+                200,
+                {
+                    "id": "experiment-1",
+                    "name": "fixture",
+                    "current_revision_id": "revision-1",
+                    "blocks": [],
+                },
+            )
             return
         if self.path == "/api/v1/experiment-versions/version-1/download":
             self.send_response(200)
@@ -69,6 +82,22 @@ class ApiHandler(BaseHTTPRequestHandler):
                     }
                 ],
             )
+            return
+        if self.path == "/api/v1/runs/run-1":
+            self.send_json(200, {
+                "id": "run-1", "experiment_id": "experiment-1",
+                "session_id": "7_20260807_120000_abcdef",
+                "source_experiment_name": "fixture",
+            })
+            return
+        if self.path == "/api/v1/runs/run-1/analysis-state":
+            state = {"schema_version": "1.1", "run_id": "run-1", "sources": []}
+            self.send_json(200, state, {
+                "ETag": '"state-r2"',
+                "X-Analysis-Revision": "2",
+                "X-Checksum-SHA256": "a" * 64,
+                "X-Source-Fingerprint": "b" * 64,
+            })
             return
         if self.path == "/api/v1/run-results/result-1/download":
             self.send_response(200)
@@ -112,6 +141,27 @@ class ApiHandler(BaseHTTPRequestHandler):
             type(self).uploaded = self.rfile.read(length)
             self.send_json(201, {"id": "result-1"})
             return
+        if self.path == "/api/v1/run-results/resolve":
+            payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            self.send_json(200, {
+                "results": [{
+                    "id": "result-1", "run_id": "run-1",
+                    "sha256": payload["sha256"][0], "block_index": 1,
+                }],
+                "missing_sha256": payload["sha256"][1:],
+            })
+            return
+        if self.path == "/api/v1/runs/run-1/analysis/finalize":
+            type(self).uploaded = self.rfile.read(int(self.headers["Content-Length"]))
+            type(self).requests.append((
+                "ANALYSIS_FINALIZE", self.path,
+                self.headers.get("If-Match"),
+                self.headers.get("X-Idempotency-Key"),
+            ))
+            self.send_json(200, {"run_id": "run-1", "completed": True}, {
+                "ETag": '"state-r3"', "X-Analysis-Revision": "3",
+            })
+            return
         if self.path == "/api/v1/experiments":
             payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             self.send_json(201, {"id": "created-1", "name": payload["name"], "versions": []})
@@ -141,6 +191,39 @@ class ApiHandler(BaseHTTPRequestHandler):
                     "name": "Block α",
                     "position": int(self.headers["X-Position"]),
                     "sha256": hashlib.sha256(self.uploaded).hexdigest(),
+                },
+            )
+            return
+        if self.path == "/api/v1/staged-blocks":
+            length = int(self.headers["Content-Length"])
+            type(self).uploaded = self.rfile.read(length)
+            type(self).uploaded_filename = self.headers["X-Filename"]
+            type(self).uploaded_block_name = self.headers["X-Block-Name"]
+            type(self).requests.append(
+                ("STAGE", self.path, self.headers["X-Idempotency-Key"])
+            )
+            self.send_json(
+                201,
+                {
+                    "id": "staged-1",
+                    "request_id": self.headers["X-Idempotency-Key"],
+                    "name": "Block Î±",
+                },
+            )
+            return
+        if self.path in {
+            "/api/v1/experiments/publish",
+            "/api/v1/experiments/experiment-1/publish",
+        }:
+            payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            type(self).requests.append(("POST", self.path, payload))
+            self.send_json(
+                201 if self.path.endswith("/experiments/publish") else 200,
+                {
+                    "id": "experiment-1",
+                    "name": payload["name"],
+                    "current_revision_id": "revision-2",
+                    "blocks": [],
                 },
             )
             return
@@ -188,6 +271,17 @@ class ApiHandler(BaseHTTPRequestHandler):
         self.send_json(200, {"id": "experiment-1", "name": payload["name"], "blocks": []})
 
     def do_PUT(self):
+        if self.path == "/api/v1/runs/run-1/analysis-state":
+            type(self).uploaded = self.rfile.read(int(self.headers["Content-Length"]))
+            type(self).requests.append((
+                "ANALYSIS_STATE", self.path,
+                self.headers.get("If-Match"),
+                self.headers.get("X-Idempotency-Key"),
+            ))
+            self.send_json(200, {"run_id": "run-1"}, {
+                "ETag": '"state-r3"', "X-Analysis-Revision": "3",
+            })
+            return
         payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         type(self).requests.append(("PUT", self.path, payload))
         self.send_json(200, {"id": "experiment-1", "name": "fixture", "blocks": []})
@@ -292,6 +386,58 @@ class AutoScriptApiClientTests(unittest.TestCase):
             ApiHandler.requests,
         )
 
+    def test_atomic_staging_publish_and_get_requests(self):
+        self.assertEqual(
+            self.api.get_experiment("experiment-1")["current_revision_id"],
+            "revision-1",
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            package_path = Path(temp_dir) / "block.zip"
+            package_path.write_bytes(b"atomic-block")
+            staged = self.api.stage_block(
+                package_path,
+                "Block Î±",
+                request_id="11111111-1111-1111-1111-111111111111",
+            )
+        self.assertEqual(staged["id"], "staged-1")
+        self.assertEqual(ApiHandler.uploaded, b"atomic-block")
+
+        blocks = [
+            {
+                "source": "staged",
+                "id": "staged-1",
+                "same_page_as_previous": False,
+            }
+        ]
+        created = self.api.publish_experiment(
+            "Atomic",
+            blocks,
+            "22222222-2222-2222-2222-222222222222",
+        )
+        self.assertEqual(created["current_revision_id"], "revision-2")
+        updated = self.api.publish_experiment(
+            "Atomic Renamed",
+            blocks,
+            "33333333-3333-3333-3333-333333333333",
+            experiment_id="experiment-1",
+            expected_current_revision_id="revision-1",
+        )
+        self.assertEqual(updated["name"], "Atomic Renamed")
+        self.assertIn(
+            (
+                "POST",
+                "/api/v1/experiments/experiment-1/publish",
+                {
+                    "request_id": "33333333-3333-3333-3333-333333333333",
+                    "name": "Atomic Renamed",
+                    "description": None,
+                    "blocks": blocks,
+                    "expected_current_revision_id": "revision-1",
+                },
+            ),
+            ApiHandler.requests,
+        )
+
     def test_result_upload_list_and_download(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             result_path = Path(temp_dir) / "participant result.json"
@@ -325,6 +471,27 @@ class AutoScriptApiClientTests(unittest.TestCase):
         self.assertTrue(updated["analysis_completed"])
         self.api.delete_run("run-1")
         self.assertIn(("DELETE", "/api/v1/runs/run-1", None), ApiHandler.requests)
+
+    def test_analysis_state_etag_finalize_and_sha_resolution(self):
+        state = self.api.get_run_analysis_state("run-1")
+        self.assertEqual(state["revision"], 2)
+        self.assertEqual(state["etag"], '"state-r2"')
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "analysis_state.json"
+            bundle_path = Path(temp_dir) / "analysis.zip"
+            state_path.write_text(json.dumps(state["state"]), encoding="utf-8")
+            bundle_path.write_bytes(b"zip-bundle")
+            updated = self.api.put_run_analysis_state(
+                "run-1", state_path, base_etag=state["etag"], request_id="request-1"
+            )
+            finalized = self.api.finalize_run_analysis(
+                "run-1", bundle_path, base_etag=updated["etag"], request_id="request-2"
+            )
+        self.assertEqual(updated["revision"], 3)
+        self.assertEqual(finalized["etag"], '"state-r3"')
+        resolved = self.api.resolve_run_results_by_sha(["a" * 64, "b" * 64])
+        self.assertEqual(resolved["results"][0]["run_id"], "run-1")
+        self.assertEqual(resolved["missing_sha256"], ["b" * 64])
 
     def test_login_bearer_header_and_explicit_run_lifecycle(self):
         api = AutoScriptAPI(self.api.base_url)

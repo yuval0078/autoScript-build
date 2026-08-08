@@ -1,5 +1,6 @@
 import uuid
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -46,6 +47,9 @@ class ExperimentBlockResponse(BaseModel):
     name: str
     schema_version: str | None
     app_version: str | None
+    expected_word_count: int | None
+    grid_rows: int | None
+    grid_cols: int | None
     original_filename: str
     sha256: str
     size_bytes: int
@@ -101,6 +105,9 @@ class ExperimentRevisionBlockResponse(BaseModel):
     position: int
     same_page_as_previous: bool
     name: str
+    expected_word_count: int | None
+    grid_rows: int | None
+    grid_cols: int | None
     sha256: str
     size_bytes: int
 
@@ -115,12 +122,67 @@ class ExperimentRevisionResponse(BaseModel):
     download_url: str
 
 
+class StagedBlockAssetResponse(BaseModel):
+    id: uuid.UUID
+    request_id: str
+    name: str
+    schema_version: str | None
+    app_version: str | None
+    expected_word_count: int
+    grid_rows: int
+    grid_cols: int
+    original_filename: str
+    sha256: str
+    size_bytes: int
+    created_at: datetime
+    expires_at: datetime
+
+
+class PublishBlockReference(BaseModel):
+    source: Literal["existing", "staged"]
+    id: uuid.UUID
+    same_page_as_previous: bool = False
+
+
+class _ExperimentPublishBase(BaseModel):
+    request_id: uuid.UUID
+    name: str = Field(min_length=1, max_length=200)
+    description: str | None = None
+    blocks: list[PublishBlockReference] = Field(min_length=1, max_length=999)
+
+    @field_validator("name")
+    @classmethod
+    def normalize_publish_name(cls, value):
+        value = value.strip()
+        if not value:
+            raise ValueError("Experiment name cannot be blank.")
+        return value
+
+    @model_validator(mode="after")
+    def validate_block_references(self):
+        references = [(block.source, block.id) for block in self.blocks]
+        if len(references) != len(set(references)):
+            raise ValueError("Published Block references must be unique.")
+        if self.blocks[0].same_page_as_previous:
+            raise ValueError("The first Block cannot share a page with a previous Block.")
+        return self
+
+
+class ExperimentPublishCreate(_ExperimentPublishBase):
+    pass
+
+
+class ExperimentPublishUpdate(_ExperimentPublishBase):
+    expected_current_revision_id: uuid.UUID | None
+
+
 class ExperimentResponse(BaseModel):
     id: uuid.UUID
     name: str
     description: str | None
     owner_id: uuid.UUID
     created_at: datetime
+    current_revision_id: uuid.UUID | None
     blocks: list[ExperimentBlockResponse]
     versions: list[ExperimentVersionResponse]
     current_revision: ExperimentRevisionResponse | None

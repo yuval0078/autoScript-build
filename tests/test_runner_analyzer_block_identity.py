@@ -12,10 +12,29 @@ from tablet_experiment import (
     ensure_shared_run_session_id,
     initialize_cloud_run,
     get_block_run_identity,
+    queue_cloud_run_failure,
 )
 
 
 class RunnerBlockIdentityTests(unittest.TestCase):
+    def test_uncaught_runner_failure_is_queued_and_reported(self):
+        run_id = str(uuid.uuid4())
+        calls = []
+
+        class API:
+            def fail_run(self, target_run_id):
+                calls.append(target_run_id)
+
+        with tempfile.TemporaryDirectory() as temp_dir, patch(
+            "result_upload_queue.queue_root", return_value=Path(temp_dir)
+        ):
+            outcome = queue_cloud_run_failure(
+                [{"__server_run_id__": run_id}], api_factory=API
+            )
+
+        self.assertEqual(outcome, (0, []))
+        self.assertEqual(calls, [run_id])
+
     def test_cloud_run_is_created_once_and_shared_by_all_blocks(self):
         experiment_id = str(uuid.uuid4())
         revision_id = str(uuid.uuid4())
@@ -162,8 +181,61 @@ class RunnerBlockIdentityTests(unittest.TestCase):
             self.assertTrue(result_path.exists())
             self.assertEqual(uploaded[0][0], experiment_id)
             self.assertEqual(uploaded[0][1], "{}")
-            self.assertEqual(list(queue_dir.iterdir()), [])
+            self.assertEqual(list(queue_dir.glob("*.queue.json")), [])
             self.assertEqual((count, errors, skipped), (1, [], 0))
+
+    def test_cloud_result_is_queued_before_optional_local_export(self):
+        canvas = ExperimentCanvas.__new__(ExperimentCanvas)
+        canvas.test_mode = False
+        canvas._cloud_upload_outcome = None
+        captured = []
+        result = {
+            "experiment_id": str(uuid.uuid4()),
+            "server_run_id": str(uuid.uuid4()),
+            "block_index": 1,
+        }
+
+        def upload_saved(staged, transition="finalize"):
+            captured.append(
+                (json.loads(Path(staged[0][0]).read_text(encoding="utf-8")), transition)
+            )
+            return 0, ["offline"], 0
+
+        with tempfile.TemporaryDirectory() as temp_dir, patch(
+            "app_paths.user_data_dir", return_value=Path(temp_dir)
+        ), patch.object(canvas, "_upload_saved_results", side_effect=upload_saved):
+            first = canvas._upload_results_before_export([result])
+            second = canvas._upload_results_before_export([result])
+
+        self.assertEqual(first, (0, ["offline"], 0))
+        self.assertEqual(second, first)
+        self.assertEqual(captured, [(result, None)])
+
+    def test_offline_api_creation_keeps_durable_queue_item(self):
+        canvas = ExperimentCanvas.__new__(ExperimentCanvas)
+        canvas.test_mode = False
+        experiment_id = str(uuid.uuid4())
+        run_id = str(uuid.uuid4())
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            result_path = root / "result.json"
+            result_path.write_text("{}", encoding="utf-8")
+            queue_dir = root / "queue"
+            queue_dir.mkdir()
+            with patch(
+                "autoscript_api.AutoScriptAPI", side_effect=RuntimeError("offline")
+            ), patch("result_upload_queue.queue_root", return_value=queue_dir):
+                uploaded, errors, skipped = canvas._upload_saved_results(
+                    [(
+                        result_path,
+                        {"experiment_id": experiment_id, "server_run_id": run_id},
+                    )]
+                )
+
+            self.assertEqual(uploaded, 0)
+            self.assertTrue(errors)
+            self.assertEqual(skipped, 0)
+            self.assertEqual(len(list(queue_dir.glob("*.queue.json"))), 2)
 
     def test_local_legacy_and_test_runs_are_not_uploaded(self):
         canvas = ExperimentCanvas.__new__(ExperimentCanvas)

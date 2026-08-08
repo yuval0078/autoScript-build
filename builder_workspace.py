@@ -155,9 +155,12 @@ class ExperimentBuilderWorkspace(QWidget):
         self.parent = parent
         self.api = AutoScriptAPI()
         self.experiment_id = None
+        self.current_revision_id = None
+        self.description = None
         self.blocks = {}
         self._remote_block_ids = set()
         self._dirty = False
+        self._publish_request_id = None
         self._build_ui()
 
     def _build_ui(self):
@@ -257,8 +260,11 @@ class ExperimentBuilderWorkspace(QWidget):
 
     def new_experiment(self):
         self.experiment_id = None
+        self.current_revision_id = None
+        self.description = None
         self.blocks = {}
         self._remote_block_ids = set()
+        self._publish_request_id = None
         self.name_input.blockSignals(True)
         self.name_input.clear()
         self.name_input.blockSignals(False)
@@ -268,6 +274,10 @@ class ExperimentBuilderWorkspace(QWidget):
 
     def load_experiment(self, experiment):
         self.experiment_id = experiment["id"]
+        self.current_revision_id = experiment.get("current_revision_id")
+        if self.current_revision_id is None and experiment.get("current_revision"):
+            self.current_revision_id = experiment["current_revision"].get("id")
+        self.description = experiment.get("description")
         self.blocks = {}
         ordered_blocks = sorted(
             experiment.get("blocks", []),
@@ -280,6 +290,8 @@ class ExperimentBuilderWorkspace(QWidget):
                 "key": key,
                 "local_path": None,
                 "dirty": False,
+                "staged_asset": None,
+                "stage_request_id": None,
                 "same_page_as_previous": bool(
                     block.get("same_page_as_previous", False)
                 ),
@@ -291,6 +303,7 @@ class ExperimentBuilderWorkspace(QWidget):
         self.name_input.setText(experiment["name"])
         self.name_input.blockSignals(False)
         self._dirty = False
+        self._publish_request_id = None
         self._refresh_blocks()
 
     def _ordered_keys(self):
@@ -337,12 +350,13 @@ class ExperimentBuilderWorkspace(QWidget):
 
     def _mark_dirty(self, *args):
         self._dirty = True
+        self._publish_request_id = None
 
     def _blocks_reordered(self, *args):
         keys = self._ordered_keys()
         if keys:
             self.blocks[keys[0]]["same_page_as_previous"] = False
-        self._dirty = True
+        self._mark_dirty()
         QTimer.singleShot(0, self._refresh_blocks)
 
     def _layout_metrics(self, key):
@@ -422,7 +436,7 @@ class ExperimentBuilderWorkspace(QWidget):
                 )
                 return
             block["same_page_as_previous"] = True
-        self._dirty = True
+        self._mark_dirty()
         self._refresh_blocks()
 
     def _validate_page_layout(self, ordered_keys):
@@ -493,6 +507,8 @@ class ExperimentBuilderWorkspace(QWidget):
                 "local_path": str(stored_path),
                 "dirty": True,
                 "layout_metrics": layout_metrics,
+                "staged_asset": None,
+                "stage_request_id": None,
             }
         else:
             key = str(uuid.uuid4())
@@ -505,8 +521,10 @@ class ExperimentBuilderWorkspace(QWidget):
                 "original_filename": stored_path.name,
                 "same_page_as_previous": False,
                 "layout_metrics": layout_metrics,
+                "staged_asset": None,
+                "stage_request_id": None,
             }
-        self._dirty = True
+        self._mark_dirty()
         self._refresh_blocks()
 
     def _materialize_block(self, key):
@@ -560,7 +578,7 @@ class ExperimentBuilderWorkspace(QWidget):
         if answer != QMessageBox.Yes:
             return
         self.blocks.pop(key)
-        self._dirty = True
+        self._mark_dirty()
         self._refresh_blocks()
 
     def save_experiment(self):
@@ -578,52 +596,46 @@ class ExperimentBuilderWorkspace(QWidget):
         self.save_button.setEnabled(False)
         try:
             self._validate_page_layout(ordered_keys)
-            if self.experiment_id is None:
-                experiment = self.api.create_experiment(experiment_name)
-                self.experiment_id = experiment["id"]
-            else:
-                self.api.update_experiment(self.experiment_id, experiment_name)
-
-            final_block_ids = []
-            replaced_ids = set()
-            for position, key in enumerate(ordered_keys):
+            publish_blocks = []
+            for key in ordered_keys:
                 block = self.blocks[key]
                 if block.get("dirty") or not block.get("id"):
-                    same_page_as_previous = bool(
-                        block.get("same_page_as_previous", False)
-                    )
-                    package_path = self._materialize_block(key)
-                    uploaded = self.api.upload_block(
-                        self.experiment_id,
-                        package_path,
-                        block["name"],
-                        position,
-                    )
-                    if block.get("id"):
-                        replaced_ids.add(str(block["id"]))
-                    block.update(uploaded)
-                    block["same_page_as_previous"] = same_page_as_previous
-                    block["dirty"] = False
-                final_block_ids.append(str(block["id"]))
+                    if not block.get("staged_asset"):
+                        stage_request_id = block.get("stage_request_id") or str(
+                            uuid.uuid4()
+                        )
+                        block["stage_request_id"] = stage_request_id
+                        block["staged_asset"] = self.api.stage_block(
+                            self._materialize_block(key),
+                            block["name"],
+                            request_id=stage_request_id,
+                        )
+                    source = "staged"
+                    source_id = block["staged_asset"]["id"]
+                else:
+                    source = "existing"
+                    source_id = block["id"]
+                publish_blocks.append(
+                    {
+                        "source": source,
+                        "id": str(source_id),
+                        "same_page_as_previous": bool(
+                            block.get("same_page_as_previous", False)
+                        ),
+                    }
+                )
 
-            removed_ids = self._remote_block_ids.difference(final_block_ids)
-            removed_ids.update(replaced_ids)
-            for block_id in removed_ids:
-                self.api.delete_block(block_id)
-            same_page_block_ids = [
-                str(self.blocks[key]["id"])
-                for key in ordered_keys[1:]
-                if self.blocks[key].get("same_page_as_previous", False)
-            ]
-            self.api.reorder_blocks(
-                self.experiment_id,
-                final_block_ids,
-                same_page_block_ids=same_page_block_ids,
+            if self._publish_request_id is None:
+                self._publish_request_id = str(uuid.uuid4())
+            published = self.api.publish_experiment(
+                experiment_name,
+                publish_blocks,
+                self._publish_request_id,
+                experiment_id=self.experiment_id,
+                expected_current_revision_id=self.current_revision_id,
+                description=self.description,
             )
-            self.api.create_experiment_revision(self.experiment_id)
-
-            self._remote_block_ids = set(final_block_ids)
-            self._dirty = False
+            self.load_experiment(published)
             self.save_button.setText("Saved")
             QApplication.processEvents()
         except (APIError, OSError, ValueError) as exc:

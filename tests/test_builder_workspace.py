@@ -11,6 +11,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import QApplication
 
+from autoscript_api import APIError
 from builder_workspace import ExperimentBuilderWorkspace
 
 
@@ -34,9 +35,13 @@ class FakeParent:
 class FakeApi:
     def __init__(self):
         self.uploads = []
+        self.staged = []
+        self.staged_by_id = {}
+        self.publishes = []
         self.reorders = []
         self.deleted = []
         self.revisions = []
+        self.fail_publish_once = False
 
     def create_experiment(self, name):
         return {"id": "experiment-1", "name": name, "blocks": []}
@@ -56,6 +61,67 @@ class FakeApi:
             "sha256": "a" * 64,
             "size_bytes": Path(package_path).stat().st_size,
             "download_url": f"/api/v1/blocks/{block_id}/download",
+        }
+
+    def stage_block(self, package_path, block_name, request_id=None, progress=None):
+        staged_id = f"staged-{len(self.staged) + 1}"
+        record = (block_name, Path(package_path), str(request_id))
+        self.staged.append(record)
+        response = {
+            "id": staged_id,
+            "name": block_name,
+            "request_id": str(request_id),
+        }
+        self.staged_by_id[staged_id] = response
+        return response
+
+    def publish_experiment(
+        self,
+        name,
+        blocks,
+        request_id,
+        *,
+        experiment_id=None,
+        expected_current_revision_id=None,
+        description=None,
+    ):
+        self.publishes.append(
+            {
+                "name": name,
+                "blocks": list(blocks),
+                "request_id": str(request_id),
+                "experiment_id": experiment_id,
+                "expected_current_revision_id": expected_current_revision_id,
+            }
+        )
+        if self.fail_publish_once:
+            self.fail_publish_once = False
+            raise APIError("simulated atomic publish failure", 503)
+        published_id = experiment_id or "experiment-1"
+        revision_id = f"revision-{len(self.publishes)}"
+        published_blocks = []
+        for position, reference in enumerate(blocks):
+            if reference["source"] == "staged":
+                source = self.staged_by_id[reference["id"]]
+                block_name = source["name"]
+            else:
+                block_name = f"Existing {reference['id']}"
+            published_blocks.append(
+                {
+                    "id": f"uploaded-{position + 1}",
+                    "experiment_id": published_id,
+                    "name": block_name,
+                    "position": position,
+                    "same_page_as_previous": reference["same_page_as_previous"],
+                }
+            )
+        return {
+            "id": published_id,
+            "name": name,
+            "description": description,
+            "current_revision_id": revision_id,
+            "current_revision": {"id": revision_id},
+            "blocks": published_blocks,
         }
 
     def reorder_blocks(
@@ -118,15 +184,16 @@ class BuilderWorkspaceTests(unittest.TestCase):
             workspace.save_experiment()
 
         self.assertEqual(
-            [upload[1] for upload in workspace.api.uploads],
+            [upload[0] for upload in workspace.api.staged],
             ["Second", "First"],
         )
+        self.assertEqual(len(workspace.api.publishes), 1)
         self.assertEqual(
-            workspace.api.reorders,
-            [("experiment-1", ["uploaded-1", "uploaded-2"], [])],
+            [item["id"] for item in workspace.api.publishes[0]["blocks"]],
+            ["staged-1", "staged-2"],
         )
         self.assertEqual(parent.saved_id, "experiment-1")
-        self.assertEqual(workspace.api.revisions, ["experiment-1"])
+        self.assertEqual(workspace.current_revision_id, "revision-1")
         workspace.deleteLater()
 
     def test_cloud_experiment_blocks_are_loaded_by_position(self):
@@ -155,6 +222,46 @@ class BuilderWorkspaceTests(unittest.TestCase):
         second_key = workspace.block_list.item(1).data(Qt.UserRole)
         self.assertTrue(workspace.blocks[second_key]["same_page_as_previous"])
         self.assertEqual(workspace.name_input.text(), "Ordered")
+        workspace.deleteLater()
+
+    def test_unchanged_cloud_block_is_referenced_by_atomic_publish(self):
+        parent = FakeParent()
+        workspace = ExperimentBuilderWorkspace(parent)
+        workspace.api = FakeApi()
+        workspace.load_experiment(
+            {
+                "id": "experiment-2",
+                "name": "Original",
+                "description": "keep me",
+                "current_revision_id": "revision-7",
+                "blocks": [
+                    {
+                        "id": "block-7",
+                        "name": "Existing",
+                        "position": 0,
+                        "same_page_as_previous": False,
+                    }
+                ],
+            }
+        )
+        workspace.name_input.setText("Renamed")
+        workspace.save_experiment()
+
+        self.assertEqual(workspace.api.staged, [])
+        publish = workspace.api.publishes[0]
+        self.assertEqual(publish["experiment_id"], "experiment-2")
+        self.assertEqual(publish["expected_current_revision_id"], "revision-7")
+        self.assertEqual(
+            publish["blocks"],
+            [
+                {
+                    "source": "existing",
+                    "id": "block-7",
+                    "same_page_as_previous": False,
+                }
+            ],
+        )
+        self.assertEqual(parent.saved_id, "experiment-2")
         workspace.deleteLater()
 
     def test_same_page_layout_is_validated_and_saved_with_block_order(self):
@@ -191,15 +298,45 @@ class BuilderWorkspaceTests(unittest.TestCase):
                 workspace.save_experiment()
 
         self.assertEqual(
-            workspace.api.reorders,
-            [
-                (
-                    "experiment-1",
-                    ["uploaded-1", "uploaded-2"],
-                    ["uploaded-2"],
-                )
-            ],
+            [item["same_page_as_previous"] for item in workspace.api.publishes[0]["blocks"]],
+            [False, True],
         )
+        workspace.deleteLater()
+
+    def test_failed_publish_retries_same_staging_and_publish_requests(self):
+        parent = FakeParent()
+        workspace = ExperimentBuilderWorkspace(parent)
+        workspace.api = FakeApi()
+        workspace.api.fail_publish_once = True
+        with tempfile.TemporaryDirectory() as temp_dir:
+            package = Path(temp_dir) / "block.zip"
+            package.write_bytes(b"block")
+            workspace.blocks = {
+                "block": {
+                    "key": "block",
+                    "id": None,
+                    "name": "Block",
+                    "local_path": str(package),
+                    "dirty": True,
+                }
+            }
+            workspace._refresh_blocks()
+            workspace.name_input.setText("Retry Study")
+            with patch("builder_workspace.QMessageBox.critical") as error:
+                workspace.save_experiment()
+            self.assertIn("simulated atomic", error.call_args.args[2])
+            self.assertIsNone(workspace.experiment_id)
+            self.assertIsNone(parent.saved_id)
+            staged_request_id = workspace.api.staged[0][2]
+            publish_request_id = workspace.api.publishes[0]["request_id"]
+
+            workspace.save_experiment()
+
+        self.assertEqual(len(workspace.api.staged), 1)
+        self.assertEqual(workspace.api.staged[0][2], staged_request_id)
+        self.assertEqual(len(workspace.api.publishes), 2)
+        self.assertEqual(workspace.api.publishes[1]["request_id"], publish_request_id)
+        self.assertEqual(parent.saved_id, "experiment-1")
         workspace.deleteLater()
 
     def test_same_page_layout_rejects_blocks_that_exceed_grid_capacity(self):

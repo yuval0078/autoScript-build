@@ -1,11 +1,15 @@
 # Versioning and releases
 
+> `project_version.py` now describes only the legacy all-in-one portable build.
+> Independently delivered components use `component_versions.json`; see
+> [docs/COMPONENT_UPDATES.md](docs/COMPONENT_UPDATES.md).
+
 AutoScript release identifiers contain three or four numeric components. The
 usual `MAJOR.MINOR.PATCH` form is used for feature releases, while an optional
 fourth `REVISION` component identifies a corrective rebuild of an existing
 patch release. The current application version is `1.0.3.1`.
 
-## Single source of truth
+## Legacy portable-build source of truth
 
 Change the version only in `project_version.py`:
 
@@ -19,7 +23,22 @@ The following values are derived automatically:
 - Git tag: `v1.0.3.1`
 - release archive: `TouchpadExperiment-v1.0.3.1-portable.zip`
 
-Do not duplicate or manually edit these derived values elsewhere.
+Do not duplicate or manually edit these legacy portable-build values
+elsewhere. Do not use `APP_VERSION` as an independently delivered component
+version.
+
+## Independent component versions
+
+The Main Interface, Builder, Runner and Analyzer each have their own version in
+`component_versions.json`. These values begin at `0.0` and can advance
+independently. A Builder version may be recorded as the producer of a Block, a
+Runner version as the producer of a raw Run, and an Analyzer version as the
+producer of analysis state; consumers must continue accepting missing legacy
+producer fields.
+
+Experiment and result `schema_version` values are data-contract versions. They
+are not application versions and do not change merely because a component is
+released.
 
 ## Choosing the next version
 
@@ -30,7 +49,7 @@ Increment:
 - **MINOR** for backward-compatible features, for example `1.0.3.1` to `1.1.0`;
 - **MAJOR** for incompatible changes to workflows or data formats, for example `1.0.3.1` to `2.0.0`.
 
-## Preparing a release
+## Preparing a legacy portable release
 
 1. Update `APP_VERSION` in `project_version.py`.
 2. Commit and merge the release changes into `main`.

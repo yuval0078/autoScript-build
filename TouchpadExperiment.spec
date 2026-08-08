@@ -29,6 +29,8 @@ common_binaries = _ffmpeg_binaries()
 
 # Define common source files to bundle
 common_sources = [
+    ('analysis_local_state.py', '.'),
+    ('analysis_sync_queue.py', '.'),
     ('analyzer_refactored.py', '.'),
     ('tablet_experiment.py', '.'),
     ('audio_processor.py', '.'),
@@ -36,10 +38,17 @@ common_sources = [
     ('archive_utils.py', '.'),
     ('autoscript_api.py', '.'),
     ('builder_workspace.py', '.'),
+    ('component_runtime.py', '.'),
+    ('component_update_manager.py', '.'),
+    ('component_updates_dialog.py', '.'),
+    ('component_versions.py', '.'),
+    ('component_versions.json', '.'),
     ('experiment_packages.py', '.'),
     ('experiment_results.py', '.'),
     ('project_version.py', '.'),
     ('qt_bootstrap.py', '.'),
+    ('runner_launch_contract.py', '.'),
+    ('update_trust.json', '.'),
     ('gui_menu.py', '.'),
     ('exp_initializer.py', '.'),
     ('convert_audio.py', '.'),
@@ -56,6 +65,7 @@ a_main = Analysis(
         'PyQt5.QtGui',
         'PyQt5.QtWidgets',
         'PyQt5.QtMultimedia',
+        'analysis_sync_queue',
         'pydub',
         'pydub.silence',
         'pygame',
@@ -82,6 +92,37 @@ a_main = Analysis(
     noarchive=False,
 )
 
+# Standalone Builder retained in the legacy portable transition package.
+a_builder = Analysis(
+    ['builder_main.py'],
+    pathex=[],
+    binaries=common_binaries,
+    datas=common_sources,
+    hiddenimports=[
+        'PyQt5.QtCore',
+        'PyQt5.QtGui',
+        'PyQt5.QtWidgets',
+        'PyQt5.QtMultimedia',
+        'audio_processor',
+        'autoscript_api',
+        'builder_workspace',
+        'component_versions',
+        'exp_initializer',
+        'experiment_packages',
+        'numpy',
+        'pydub',
+        'pydub.silence',
+    ],
+    hookspath=[],
+    hooksconfig={},
+    runtime_hooks=[],
+    excludes=[],
+    win_no_prefer_redirects=False,
+    win_private_assemblies=False,
+    cipher=block_cipher,
+    noarchive=False,
+)
+
 # Analyzer application
 a_analyzer = Analysis(
     ['launch_analyzer.py'],
@@ -92,9 +133,12 @@ a_analyzer = Analysis(
         'PyQt5.QtCore',
         'PyQt5.QtGui',
         'PyQt5.QtWidgets',
+        'analysis_local_state',
+        'analysis_sync_queue',
         'analyzer_refactored',
         'app_paths',
         'autoscript_api',
+        'component_versions',
     ],
     hookspath=[],
     hooksconfig={},
@@ -135,10 +179,12 @@ a_experiment = Analysis(
 
 # Merge all analyses to share dependencies
 MERGE((a_main, 'TouchpadExperiment', 'TouchpadExperiment'),
+      (a_builder, 'Builder', 'Builder'),
       (a_analyzer, 'Analyzer', 'Analyzer'),
       (a_experiment, 'ExperimentRunner', 'ExperimentRunner'))
 
 pyz_main = PYZ(a_main.pure, a_main.zipped_data, cipher=block_cipher)
+pyz_builder = PYZ(a_builder.pure, a_builder.zipped_data, cipher=block_cipher)
 pyz_analyzer = PYZ(a_analyzer.pure, a_analyzer.zipped_data, cipher=block_cipher)
 pyz_experiment = PYZ(a_experiment.pure, a_experiment.zipped_data, cipher=block_cipher)
 
@@ -148,6 +194,25 @@ exe_main = EXE(
     [],
     exclude_binaries=True,
     name='TouchpadExperiment',
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=True,
+    console=True,
+    disable_windowed_traceback=False,
+    argv_emulation=False,
+    target_arch=None,
+    codesign_identity=None,
+    entitlements_file=None,
+    icon=None,
+)
+
+exe_builder = EXE(
+    pyz_builder,
+    a_builder.scripts,
+    [],
+    exclude_binaries=True,
+    name='Builder',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -204,6 +269,10 @@ coll = COLLECT(
     a_main.binaries,
     a_main.zipfiles,
     a_main.datas,
+    exe_builder,
+    a_builder.binaries,
+    a_builder.zipfiles,
+    a_builder.datas,
     exe_analyzer,
     a_analyzer.binaries,
     a_analyzer.zipfiles,

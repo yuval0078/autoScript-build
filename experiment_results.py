@@ -429,12 +429,27 @@ class ExperimentResultsPage(QWidget):
             downloaded = []
             context_runs = []
             for run in runs:
-                context_run = {"id": run["id"], "session_id": run["session_id"]}
-                state_artifact = self._latest_artifact(run, "analysis_state")
-                if state_artifact is not None:
+                context_run = {
+                    "id": run["id"],
+                    "session_id": run["session_id"],
+                    "analysis_etag": None,
+                    "analysis_revision": 0,
+                    "results": [],
+                }
+                try:
+                    saved_state = self.api.get_run_analysis_state(run["id"])
+                except APIError as exc:
+                    if exc.status_code != 404:
+                        raise
+                else:
                     state_path = workspace / f"{run['id']}_analysis_state.json"
-                    self.api.download_run_artifact(state_artifact, state_path)
+                    state_path.write_text(
+                        json.dumps(saved_state["state"], ensure_ascii=False, indent=2),
+                        encoding="utf-8",
+                    )
                     context_run["analysis_state_path"] = str(state_path)
+                    context_run["analysis_etag"] = saved_state.get("etag")
+                    context_run["analysis_revision"] = saved_state.get("revision", 0)
                 context_runs.append(context_run)
                 for result in sorted(
                     run.get("results", []), key=lambda item: item.get("block_index", 0)
@@ -446,6 +461,16 @@ class ExperimentResultsPage(QWidget):
                     destination = inputs / filename
                     self.api.download_run_result(result, destination)
                     downloaded.append(str(destination))
+                    context_run["results"].append(
+                        {
+                            "id": result["id"],
+                            "sha256": result["sha256"],
+                            "block_id": result.get("block_id"),
+                            "block_index": result.get("block_index"),
+                            "block_name": result.get("block_name"),
+                            "path": str(destination),
+                        }
+                    )
             context_path = workspace / "analysis_context.json"
             context_path.write_text(
                 json.dumps(

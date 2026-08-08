@@ -19,7 +19,26 @@ from datetime import datetime
 import time
 import json
 import uuid
-from project_version import APP_VERSION
+from component_versions import get_component_version
+from runner_launch_contract import read_runtime_session_seed
+
+
+RUNNER_VERSION = get_component_version("runner")
+
+
+def _configure_console_output():
+    """Keep diagnostic Unicode from crashing Windows legacy consoles."""
+
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(errors="replace")
+            except (OSError, ValueError):
+                pass
+
+
+_configure_console_output()
 
 # Import AudioProcessor for segment playback
 try:
@@ -277,28 +296,25 @@ def initialize_cloud_run(configs, participant_number, age, gender, test_mode=Fal
         return None
 
 
-_SESSION_SEED_SUFFIX = ".autoscript_session_seed"
+def queue_cloud_run_failure(configs, api_factory=None):
+    """Best-effort durable failure reporting for an uncaught Runner exception."""
+    run_ids = {
+        str(config.get('__server_run_id__'))
+        for config in (configs or [])
+        if isinstance(config, dict) and config.get('__server_run_id__')
+    }
+    if not run_ids:
+        return 0, []
+    from autoscript_api import AutoScriptAPI
+    from result_upload_queue import drain_upload_queue, enqueue_transition
 
-
-def _session_seed_path(config_path: str) -> str:
-    """Return the sidecar path used to persist one session seed per extracted config."""
-    return f"{os.path.abspath(config_path)}{_SESSION_SEED_SUFFIX}"
-
-
-def write_runtime_session_seed(config_path: str, session_seed: str):
-    """Persist a session seed so launcher preloading and runner startup use the same order."""
-    with open(_session_seed_path(config_path), 'w', encoding='utf-8') as handle:
-        handle.write(str(session_seed).strip())
-
-
-def read_runtime_session_seed(config_path: str):
-    """Load a previously stored session seed, if one exists."""
+    for run_id in run_ids:
+        enqueue_transition(run_id, 'fail')
     try:
-        with open(_session_seed_path(config_path), 'r', encoding='utf-8') as handle:
-            session_seed = handle.read().strip()
-            return session_seed or None
-    except OSError:
-        return None
+        api = api_factory() if api_factory is not None else AutoScriptAPI()
+        return drain_upload_queue(api)
+    except Exception as exc:
+        return 0, [f"Cloud connection: {exc}"]
 
 
 def _make_word_shuffle_rng(config: dict, session_seed=None):
@@ -1283,6 +1299,7 @@ class ExperimentCanvas(QWidget):
         self.participant_number = participant_number
         self.config = config
         self.test_mode = test_mode
+        self._cloud_upload_outcome = None
         self.participant_age = age
         self.participant_gender = gender
         self.session_index = session_index
@@ -1971,7 +1988,7 @@ class ExperimentCanvas(QWidget):
         )
         self.completed_data = {
             'schema_version': '1.3',
-            'app_version': APP_VERSION,
+            'app_version': RUNNER_VERSION,
             'experiment_name': identity['experiment_name'],
             'experiment_id': identity['experiment_id'],
             'experiment_version': self.config.get('experiment_version', 1),
@@ -2043,8 +2060,8 @@ class ExperimentCanvas(QWidget):
         except Exception:
             pass
 
-    def _upload_saved_results(self, saved_results):
-        """Upload cloud-run results without risking the already saved local files."""
+    def _upload_saved_results(self, saved_results, transition="finalize"):
+        """Durably queue cloud-run results, then make a best-effort upload."""
         if self.test_mode:
             return 0, [], len(saved_results)
 
@@ -2062,25 +2079,78 @@ class ExperimentCanvas(QWidget):
         if not cloud_results:
             return 0, [], skipped
 
-        from autoscript_api import AutoScriptAPI
-        from result_upload_queue import drain_upload_queue, enqueue_finalize, enqueue_result
-        uploaded = 0
-        errors = []
-        try:
-            api = AutoScriptAPI()
-        except Exception as exc:
-            return 0, [f"Cloud connection: {exc}"], skipped
+        from result_upload_queue import drain_upload_queue, enqueue_result, enqueue_transition
         run_ids = set()
         for data_file, result, experiment_id in cloud_results:
             run_id = result.get('server_run_id') or result.get('config', {}).get('__server_run_id__')
             enqueue_result(data_file, experiment_id, run_id=run_id)
             if run_id:
                 run_ids.add(str(run_id))
-        for run_id in run_ids:
-            enqueue_finalize(run_id)
+        if transition:
+            for run_id in run_ids:
+                enqueue_transition(run_id, transition)
+        from autoscript_api import AutoScriptAPI
+        try:
+            api = AutoScriptAPI()
+        except Exception as exc:
+            return 0, [f"Cloud connection: {exc}"], skipped
         uploaded, queue_errors = drain_upload_queue(api)
-        errors.extend(queue_errors)
-        return uploaded, errors, skipped
+        return uploaded, list(queue_errors), skipped
+
+    def _upload_results_before_export(self, results):
+        """Persist cloud results independently of the optional user export dialog."""
+        cached = getattr(self, '_cloud_upload_outcome', None)
+        if cached is not None:
+            return cached
+
+        from app_paths import ensure_dir, user_data_dir
+
+        staging = ensure_dir(user_data_dir() / 'results' / 'cloud_staging')
+        staged_results = []
+        try:
+            for result in results:
+                target = staging / f"{uuid.uuid4().hex}.json"
+                temporary = target.with_suffix('.tmp')
+                temporary.write_text(
+                    json.dumps(result, ensure_ascii=False, indent=2),
+                    encoding='utf-8',
+                )
+                temporary.replace(target)
+                staged_results.append((target, result))
+            outcome = self._upload_saved_results(staged_results, transition=None)
+            self._cloud_upload_outcome = outcome
+            return outcome
+        finally:
+            for staged_path, _result in staged_results:
+                staged_path.unlink(missing_ok=True)
+
+    def _transition_cloud_results(self, results, transition):
+        """Queue a terminal Run transition after its result payloads."""
+        if self.test_mode:
+            return 0, []
+
+        from autoscript_api import AutoScriptAPI
+        from result_upload_queue import drain_upload_queue, enqueue_transition
+
+        run_ids = {
+            str(
+                result.get('server_run_id')
+                or result.get('config', {}).get('__server_run_id__')
+            )
+            for result in results
+            if (
+                result.get('server_run_id')
+                or result.get('config', {}).get('__server_run_id__')
+            )
+        }
+        if not run_ids:
+            return 0, []
+        for run_id in run_ids:
+            enqueue_transition(run_id, transition)
+        try:
+            return drain_upload_queue(AutoScriptAPI())
+        except Exception as exc:
+            return 0, [f"Cloud connection: {exc}"]
 
     @staticmethod
     def _cloud_save_status(uploaded, errors, skipped):
@@ -2107,6 +2177,10 @@ class ExperimentCanvas(QWidget):
         results_dir = ensure_dir(user_data_dir() / 'results')
         default_filename = f"{self._result_file_stem()}_p{self.participant_number}_{combined_data['timestamp']}.json"
         default_path = results_dir / default_filename
+        combined_data['experiment_completed'] = bool(
+            combined_data.get('block_completed', False)
+        )
+        uploaded, errors, skipped = self._upload_results_before_export([combined_data])
         
         save_dialog = QFileDialog(
             dialog_parent,
@@ -2125,21 +2199,23 @@ class ExperimentCanvas(QWidget):
             if not self._confirm_discard(dialog_parent, "Are you sure you want to exit without saving the experiment data?"):
                 self.finish_experiment()
             else:
+                self._transition_cloud_results([combined_data], 'cancel')
                 print("⚠ Experiment data discarded by user")
                 self._cleanup_and_quit()
             return
         
         try:
-            combined_data['experiment_completed'] = bool(
-                combined_data.get('block_completed', False)
-            )
             data_file = Path(save_path)
             with open(str(data_file), 'w', encoding='utf-8') as f:
                 json.dump(combined_data, f, ensure_ascii=False, indent=2)
-
-            uploaded, errors, skipped = self._upload_saved_results(
-                [(data_file, combined_data)]
+            transition_uploaded, transition_errors = self._transition_cloud_results(
+                [combined_data], 'finalize'
             )
+            uploaded += transition_uploaded
+            if transition_errors:
+                errors.extend(transition_errors)
+            elif transition_uploaded:
+                errors = [error for error in errors if "Quarantined" in error]
             
             msg = QMessageBox(dialog_parent)
             msg.setIcon(QMessageBox.Information)
@@ -2170,6 +2246,13 @@ class ExperimentCanvas(QWidget):
         from app_paths import ensure_dir, user_data_dir
         
         results_dir = ensure_dir(user_data_dir() / 'results')
+        experiment_completed = (
+            len(session_results) == self.session_total
+            and all(result.get('block_completed', False) for result in session_results)
+        )
+        for result in session_results:
+            result['experiment_completed'] = experiment_completed
+        uploaded, errors, skipped = self._upload_results_before_export(session_results)
         parent_dir = QFileDialog.getExistingDirectory(
             dialog_parent,
             f"Select Parent Folder for Participant {self.participant_number}",
@@ -2180,6 +2263,7 @@ class ExperimentCanvas(QWidget):
             if not self._confirm_discard(dialog_parent, "Are you sure you want to exit without saving this experiment run?"):
                 self.finish_experiment()
             else:
+                self._transition_cloud_results(session_results, 'cancel')
                 print("⚠ Experiment session data discarded by user")
                 self._cleanup_and_quit()
             return
@@ -2189,12 +2273,6 @@ class ExperimentCanvas(QWidget):
         
         saved_files = []
         try:
-            experiment_completed = (
-                len(session_results) == self.session_total
-                and all(result.get('block_completed', False) for result in session_results)
-            )
-            for result in session_results:
-                result['experiment_completed'] = experiment_completed
             for index, result in enumerate(session_results, start=1):
                 stem = self._result_file_stem(result.get('config'), result.get('block_name'))
                 filename = f"{stem}_p{self.participant_number}_{result.get('timestamp')}.json"
@@ -2205,6 +2283,14 @@ class ExperimentCanvas(QWidget):
                 with open(str(data_file), 'w', encoding='utf-8') as f:
                     json.dump(result, f, ensure_ascii=False, indent=2)
                 saved_files.append(data_file)
+            transition_uploaded, transition_errors = self._transition_cloud_results(
+                session_results, 'finalize'
+            )
+            uploaded += transition_uploaded
+            if transition_errors:
+                errors.extend(transition_errors)
+            elif transition_uploaded:
+                errors = [error for error in errors if "Quarantined" in error]
         except Exception as e:
             error_msg = QMessageBox(dialog_parent)
             error_msg.setIcon(QMessageBox.Critical)
@@ -2215,9 +2301,6 @@ class ExperimentCanvas(QWidget):
             error_msg.exec_()
             return
         
-        uploaded, errors, skipped = self._upload_saved_results(
-            list(zip(saved_files, session_results))
-        )
         msg = QMessageBox(dialog_parent)
         msg.setIcon(QMessageBox.Information)
         msg.setWindowTitle("Session Complete")
@@ -2957,6 +3040,14 @@ def main():
     except Exception as e:
         print(f"⚠ Failed to load session plan: {e}")
         apply_session_plan(configs, None)
+
+    original_excepthook = sys.excepthook
+
+    def report_runner_failure(exc_type, exc_value, traceback):
+        queue_cloud_run_failure(configs)
+        original_excepthook(exc_type, exc_value, traceback)
+
+    sys.excepthook = report_runner_failure
     
     from qt_bootstrap import ensure_qt_platform_plugin_path
     ensure_qt_platform_plugin_path()

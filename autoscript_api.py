@@ -5,6 +5,7 @@ import http.client
 import json
 import os
 import socket
+import uuid
 from pathlib import Path
 from urllib.parse import quote, urlsplit
 
@@ -95,6 +96,154 @@ class AutoScriptAPI:
         finally:
             connection.close()
 
+    def _file_request(
+        self,
+        method,
+        path,
+        source_path,
+        *,
+        content_type,
+        headers=None,
+        progress=None,
+    ):
+        """Stream a file request and return decoded JSON plus response headers."""
+        source_path = Path(source_path)
+        total = source_path.stat().st_size
+        request_headers = {
+            "Accept": "application/json",
+            "Content-Type": content_type,
+            "Content-Length": str(total),
+            **self._auth_headers(),
+            **(headers or {}),
+        }
+        connection = self._connection()
+        try:
+            connection.putrequest(method, self._path(path))
+            for name, value in request_headers.items():
+                connection.putheader(name, str(value))
+            connection.endheaders()
+            sent = 0
+            with source_path.open("rb") as source:
+                while True:
+                    chunk = source.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    connection.send(chunk)
+                    sent += len(chunk)
+                    if progress:
+                        progress(sent, total)
+            response = connection.getresponse()
+            body = response.read()
+            response_headers = {name.lower(): value for name, value in response.getheaders()}
+            if response.status >= 400:
+                raise self._error_from_response(response, body)
+            payload = json.loads(body.decode("utf-8")) if body else None
+            return payload, response_headers
+        except APIError:
+            raise
+        except (OSError, socket.timeout, http.client.HTTPException) as exc:
+            raise APIError(f"Could not connect to the AutoScript API: {exc}") from exc
+        finally:
+            connection.close()
+
+    def get_run_analysis_state(self, run_id):
+        """Return the current editable state together with its concurrency token."""
+        connection = self._connection()
+        try:
+            connection.request(
+                "GET",
+                self._path(f"/api/v1/runs/{run_id}/analysis-state"),
+                headers={"Accept": "application/json", **self._auth_headers()},
+            )
+            response = connection.getresponse()
+            body = response.read()
+            if response.status >= 400:
+                raise self._error_from_response(response, body)
+            return {
+                "state": json.loads(body.decode("utf-8-sig")),
+                "etag": response.getheader("ETag"),
+                "revision": int(response.getheader("X-Analysis-Revision") or 0),
+                "sha256": response.getheader("X-Checksum-SHA256"),
+                "source_fingerprint": response.getheader("X-Source-Fingerprint"),
+            }
+        except APIError:
+            raise
+        except (OSError, socket.timeout, http.client.HTTPException, ValueError) as exc:
+            raise APIError(f"Could not load Analyzer edit state: {exc}") from exc
+        finally:
+            connection.close()
+
+    def put_run_analysis_state(
+        self,
+        run_id,
+        state_path,
+        *,
+        base_etag=None,
+        request_id=None,
+        progress=None,
+    ):
+        headers = {
+            "X-Idempotency-Key": str(request_id or uuid.uuid4()),
+            "X-Filename": quote(Path(state_path).name, safe=""),
+        }
+        if base_etag:
+            headers["If-Match"] = base_etag
+        else:
+            headers["If-None-Match"] = "*"
+        payload, response_headers = self._file_request(
+            "PUT",
+            f"/api/v1/runs/{run_id}/analysis-state",
+            state_path,
+            content_type="application/json; charset=utf-8",
+            headers=headers,
+            progress=progress,
+        )
+        if isinstance(payload, dict):
+            payload.setdefault("etag", response_headers.get("etag"))
+            payload.setdefault(
+                "revision", int(response_headers.get("x-analysis-revision") or 0)
+            )
+        return payload
+
+    def finalize_run_analysis(
+        self,
+        run_id,
+        bundle_path,
+        *,
+        base_etag=None,
+        request_id=None,
+        progress=None,
+    ):
+        headers = {
+            "X-Idempotency-Key": str(request_id or uuid.uuid4()),
+            "X-Filename": quote(Path(bundle_path).name, safe=""),
+        }
+        if base_etag:
+            headers["If-Match"] = base_etag
+        else:
+            headers["If-None-Match"] = "*"
+        payload, response_headers = self._file_request(
+            "POST",
+            f"/api/v1/runs/{run_id}/analysis/finalize",
+            bundle_path,
+            content_type="application/zip",
+            headers=headers,
+            progress=progress,
+        )
+        if isinstance(payload, dict):
+            payload.setdefault("etag", response_headers.get("etag"))
+            payload.setdefault(
+                "revision", int(response_headers.get("x-analysis-revision") or 0)
+            )
+        return payload
+
+    def resolve_run_results_by_sha(self, sha256_values):
+        return self._json_request(
+            "POST",
+            "/api/v1/run-results/resolve",
+            {"sha256": list(sha256_values)},
+        )
+
     def login(self, username, password):
         response = self._json_request(
             "POST", "/api/v1/auth/login",
@@ -139,10 +288,16 @@ class AutoScriptAPI:
     def list_experiments(self):
         return self._json_request("GET", "/api/v1/experiments")
 
+    def get_experiment(self, experiment_id):
+        return self._json_request("GET", f"/api/v1/experiments/{experiment_id}")
+
     def list_experiment_runs(self, experiment_id):
         return self._json_request(
             "GET", f"/api/v1/experiments/{experiment_id}/runs"
         )
+
+    def get_experiment_run(self, run_id):
+        return self._json_request("GET", f"/api/v1/runs/{run_id}")
 
     def update_run_analysis(self, run_id, completed):
         return self._json_request(
@@ -222,6 +377,78 @@ class AutoScriptAPI:
             raise APIError(f"Could not upload Block to the AutoScript API: {exc}") from exc
         finally:
             connection.close()
+
+    def stage_block(
+        self,
+        package_path,
+        block_name,
+        request_id=None,
+        progress=None,
+    ):
+        """Upload an immutable Block asset without changing a live Experiment."""
+        package_path = Path(package_path)
+        request_id = str(request_id or uuid.uuid4())
+        total = package_path.stat().st_size
+        connection = self._connection()
+        try:
+            connection.putrequest("POST", self._path("/api/v1/staged-blocks"))
+            connection.putheader("Accept", "application/json")
+            if self.token:
+                connection.putheader("Authorization", f"Bearer {self.token}")
+            connection.putheader("Content-Type", "application/zip")
+            connection.putheader("Content-Length", str(total))
+            connection.putheader("X-Filename", quote(package_path.name, safe=""))
+            connection.putheader("X-Block-Name", quote(block_name, safe=""))
+            connection.putheader("X-Idempotency-Key", request_id)
+            connection.endheaders()
+
+            sent = 0
+            with package_path.open("rb") as package:
+                while True:
+                    chunk = package.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    connection.send(chunk)
+                    sent += len(chunk)
+                    if progress:
+                        progress(sent, total)
+            response = connection.getresponse()
+            response_body = response.read()
+            if response.status >= 400:
+                raise self._error_from_response(response, response_body)
+            return json.loads(response_body.decode("utf-8"))
+        except APIError:
+            raise
+        except (OSError, socket.timeout, http.client.HTTPException) as exc:
+            raise APIError(
+                f"Could not stage Block with the AutoScript API: {exc}"
+            ) from exc
+        finally:
+            connection.close()
+
+    def publish_experiment(
+        self,
+        name,
+        blocks,
+        request_id,
+        *,
+        experiment_id=None,
+        expected_current_revision_id=None,
+        description=None,
+    ):
+        """Atomically publish an ordered Block set and immutable revision."""
+        payload = {
+            "request_id": str(request_id),
+            "name": name,
+            "description": description,
+            "blocks": list(blocks),
+        }
+        if experiment_id is None:
+            path = "/api/v1/experiments/publish"
+        else:
+            path = f"/api/v1/experiments/{experiment_id}/publish"
+            payload["expected_current_revision_id"] = expected_current_revision_id
+        return self._json_request("POST", path, payload)
 
     def upload_result(self, experiment_id, result_path, progress=None):
         """Upload one exact Runner JSON artifact; retries are server-idempotent."""

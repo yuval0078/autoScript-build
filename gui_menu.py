@@ -1,4 +1,3 @@
-import sys
 import os
 import json
 import subprocess
@@ -9,10 +8,12 @@ import time
 import stat
 import uuid
 from pathlib import Path
-from app_paths import ensure_dir, user_data_dir, asset_path, source_script_path
+from app_paths import ensure_dir, user_data_dir, asset_path
 from archive_utils import safe_extract_zip
 from autoscript_api import APIError, AutoScriptAPI, get_session_token
+from component_runtime import component_launch_command
 from experiment_packages import unpack_experiment_package
+from runner_launch_contract import write_runtime_session_seed
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
                              QLabel, QFileDialog, QMessageBox, QApplication,
                              QDialog, QToolButton, QMenu, QGridLayout,
@@ -884,10 +885,8 @@ class MainMenu(QWidget):
             with open(session_plan_path, 'w', encoding='utf-8') as handle:
                 json.dump(session_plan, handle, ensure_ascii=False, indent=2)
 
-            from tablet_experiment import load_experiment_config, write_runtime_session_seed
             for config_file in config_files:
                 write_runtime_session_seed(str(config_file), session_seed)
-                load_experiment_config(str(config_file))
             
             try:
                 summaries = []
@@ -922,30 +921,7 @@ class MainMenu(QWidget):
                 print(f"Error calculating pages: {e}")
                 QApplication.restoreOverrideCursor()
             
-            if getattr(sys, 'frozen', False):
-                exe_dir = Path(sys.executable).parent
-                experiment_exe = exe_dir / "ExperimentRunner.exe"
-                
-                if experiment_exe.exists():
-                    command = [str(experiment_exe)]
-                    if test_mode:
-                        command.append("--test-mode")
-                    command.extend(["--session-plan", str(session_plan_path)])
-                    command.extend(str(path) for path in config_files)
-                    subprocess.Popen(command, env=self._api_child_environment())
-                else:
-                    QMessageBox.critical(self, "Error", f"ExperimentRunner.exe not found at {experiment_exe}")
-            else:
-                runner_script = source_script_path("tablet_experiment.py")
-                if not runner_script.exists():
-                    QMessageBox.critical(self, "Error", f"tablet_experiment.py not found at {runner_script}")
-                    return
-                command = [sys.executable, str(runner_script)]
-                if test_mode:
-                    command.append("--test-mode")
-                command.extend(["--session-plan", str(session_plan_path)])
-                command.extend(str(path) for path in config_files)
-                subprocess.Popen(command, env=self._api_child_environment())
+            self.launch_runner(config_files, session_plan_path, test_mode=test_mode)
             
         except Exception as e:
             QApplication.restoreOverrideCursor()
@@ -1052,8 +1028,7 @@ class MainMenu(QWidget):
         if not file_path:
             return
 
-        if self.parent.new_experiment.import_experiment_zip(file_path):
-            self.parent.show_new_experiment()
+        self.parent.open_builder_import(file_path)
 
     @staticmethod
     def _api_child_environment():
@@ -1061,36 +1036,63 @@ class MainMenu(QWidget):
         token = get_session_token()
         if token:
             environment["AUTOSCRIPT_API_TOKEN"] = token
+        else:
+            environment.pop("AUTOSCRIPT_API_TOKEN", None)
         return environment
 
+    def _offer_component_install(self, component, display_name):
+        answer = QMessageBox.question(
+            self,
+            f"{display_name} Not Installed",
+            f"The {display_name} component is not installed. Open the Updates menu now?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if answer == QMessageBox.Yes and hasattr(self.parent, "show_component_updates"):
+            self.parent.show_component_updates()
+
+    def launch_runner(self, config_files, session_plan_path, test_mode=False):
+        """Resolve and launch the independently installed Runner component."""
+
+        arguments = []
+        if test_mode:
+            arguments.append("--test-mode")
+        arguments.extend(["--session-plan", str(session_plan_path)])
+        arguments.extend(str(Path(path).resolve()) for path in config_files)
+        try:
+            command = component_launch_command(
+                "runner",
+                arguments,
+                source_script="tablet_experiment.py",
+                legacy_executable="ExperimentRunner.exe",
+                manager=getattr(self.parent, "component_manager", None),
+            )
+            if command is None:
+                self._offer_component_install("runner", "Runner")
+                return None
+            return subprocess.Popen(command, env=self._api_child_environment())
+        except Exception as exc:
+            QMessageBox.critical(self, "Runner Launch Failed", str(exc))
+            return None
+
     def launch_analyzer(self, file_paths=None, extra_args=None):
-        """Launch the results analyzer script"""
+        """Resolve and launch the independently installed Analyzer component."""
+
         file_paths = [str(Path(path).resolve()) for path in (file_paths or [])]
         extra_args = [str(argument) for argument in (extra_args or [])]
         try:
-            if getattr(sys, 'frozen', False):
-                # Running as packaged executable - launch Analyzer.exe
-                exe_dir = Path(sys.executable).parent
-                analyzer_exe = exe_dir / "Analyzer.exe"
-                
-                if analyzer_exe.exists():
-                    return subprocess.Popen(
-                        [str(analyzer_exe), *extra_args, *file_paths],
-                        env=self._api_child_environment(),
-                    )
-                else:
-                    QMessageBox.critical(self, "Error", f"Analyzer.exe not found at {analyzer_exe}")
-            else:
-                # Running as script - launch as subprocess
-                script_path = source_script_path("analyzer_refactored.py")
-                if script_path.exists():
-                    return subprocess.Popen(
-                        [sys.executable, str(script_path), *extra_args, *file_paths],
-                        env=self._api_child_environment(),
-                    )
-                else:
-                    QMessageBox.critical(self, "Error", f"analyzer_refactored.py not found at {script_path}")
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to launch analyzer: {e}")
+            command = component_launch_command(
+                "analyzer",
+                [*extra_args, *file_paths],
+                source_script="analyzer_refactored.py",
+                legacy_executable="Analyzer.exe",
+                manager=getattr(self.parent, "component_manager", None),
+            )
+            if command is None:
+                self._offer_component_install("analyzer", "Analyzer")
+                return None
+            return subprocess.Popen(command, env=self._api_child_environment())
+        except Exception as exc:
+            QMessageBox.critical(self, "Analyzer Launch Failed", str(exc))
         return None
 

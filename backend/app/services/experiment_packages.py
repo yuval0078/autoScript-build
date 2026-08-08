@@ -16,6 +16,27 @@ class BlockPackageMetadata:
     name: str
     app_version: str | None
     schema_version: str | None
+    expected_word_count: int
+    grid_rows: int
+    grid_cols: int
+
+
+def _expected_word_count(config):
+    """Mirror the Runner's deterministic prompt-count rules without shuffling."""
+    groups = config.get("groups", [])
+    if config.get("order") == "stiff":
+        known_ids = {
+            word.get("id")
+            for group in groups
+            for word in group.get("words", [])
+        }
+        return sum(word_id in known_ids for word_id in config.get("sequence", []))
+
+    repetitions = config.get("repetitions", {})
+    return sum(
+        len(group.get("words", [])) * int(repetitions.get(group.get("name", ""), 1))
+        for group in groups
+    )
 
 
 def _schema_path():
@@ -105,6 +126,9 @@ def validate_block_package(package_path, max_uncompressed_bytes):
             name=config["name"],
             app_version=config.get("app_version"),
             schema_version=config.get("schema_version"),
+            expected_word_count=_expected_word_count(config),
+            grid_rows=int(config["grid"]["rows"]),
+            grid_cols=int(config["grid"]["cols"]),
         )
 
 

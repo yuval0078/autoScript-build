@@ -29,6 +29,8 @@ class Settings(BaseSettings):
     bootstrap_admin_password: str | None = None
     max_upload_bytes: int = 512 * 1024 * 1024
     max_uncompressed_package_bytes: int = 2 * 1024 * 1024 * 1024
+    staged_block_ttl_hours: int = Field(default=24, ge=1, le=24 * 30)
+    analysis_draft_retention: int = Field(default=20, ge=1, le=1000)
 
 
 @lru_cache

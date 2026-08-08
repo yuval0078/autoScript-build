@@ -93,6 +93,8 @@ def find_csv_header(tree):
 class CurrentDataContractTests(unittest.TestCase):
     def test_schema_files_are_valid_json(self):
         filenames = [
+            "analysis-finalize-manifest.schema.json",
+            "analysis-state.schema.json",
             "common.schema.json",
             "experiment-bundle.schema.json",
             "experiment-package.schema.json",
@@ -127,10 +129,23 @@ class CurrentDataContractTests(unittest.TestCase):
             {"block_name", "block_id", "block_index", "block_count"},
         )
         self.assertLessEqual(block_required, set(emitted_keys))
+        completeness_required = set(schema["allOf"][1]["then"]["required"])
+        self.assertLessEqual(completeness_required, set(emitted_keys))
+        cloud_identity_required = set(schema["allOf"][2]["then"]["required"])
+        self.assertEqual(
+            cloud_identity_required,
+            {"experiment_revision_id", "experiment_revision_number", "server_run_id"},
+        )
+        self.assertLessEqual(cloud_identity_required, set(emitted_keys))
 
     def test_trainable_schema_matches_analyzer_participant_and_word_objects(self):
         tree = parse_source("analyzer_refactored.py")
         participant_keys = find_name_dict_keys(tree, "p_output")
+        current_participant_keys = find_name_dict_keys(
+            tree,
+            "participant_output",
+            function_name="build_trainable_payload",
+        )
         word_keys = find_name_dict_keys(tree, "word_entry")
         schema = json.loads(
             (SCHEMA_ROOT / "trainable-export.schema.json").read_text(
@@ -140,6 +155,12 @@ class CurrentDataContractTests(unittest.TestCase):
         participant_schema = schema["$defs"]["participant"]
         self.assertLessEqual(set(participant_schema["required"]), set(participant_keys))
         self.assertLessEqual(set(participant_keys), set(participant_schema["properties"]))
+        self.assertLessEqual(
+            set(participant_schema["required"]), set(current_participant_keys)
+        )
+        self.assertLessEqual(
+            set(current_participant_keys), set(participant_schema["properties"])
+        )
         self.assertEqual(
             set(schema["$defs"]["trainableWord"]["required"]),
             set(word_keys),

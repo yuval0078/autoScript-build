@@ -209,6 +209,36 @@ class DataContractFixtureTests(unittest.TestCase):
             payload.pop(key)
         validator.validate(payload)
 
+    def test_current_raw_run_requires_revision_and_server_run_identity(self):
+        validator = load_validator("raw-run.schema.json")
+        payload = raw_run_fixture()
+        payload.update(
+            {
+                "schema_version": "1.3",
+                "experiment_revision_id": "revision-1",
+                "experiment_revision_number": 1,
+                "server_run_id": "run-1",
+            }
+        )
+        validator.validate(payload)
+        for field in (
+            "block_name",
+            "block_id",
+            "block_index",
+            "block_count",
+            "block_completed",
+            "experiment_completed",
+            "completed_word_count",
+            "expected_word_count",
+            "experiment_revision_id",
+            "experiment_revision_number",
+            "server_run_id",
+        ):
+            with self.subTest(field=field):
+                candidate = dict(payload)
+                candidate.pop(field)
+                self.assertTrue(list(validator.iter_errors(candidate)))
+
     def test_single_and_multi_participant_trainable_files_are_valid(self):
         validator = load_validator("trainable-export.schema.json")
         participant = trainable_export_fixture()

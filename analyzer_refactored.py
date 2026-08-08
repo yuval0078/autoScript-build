@@ -13,10 +13,14 @@ Refactored version with:
 import sys
 import os
 import json
+import hashlib
 import math
 import csv
 import time
 import argparse
+import uuid
+import zipfile
+from pathlib import Path
 from typing import List, Dict, Tuple, Optional, Any, Set
 from dataclasses import dataclass, field
 
@@ -46,6 +50,16 @@ HIT_THRESHOLD_PX = 30
 LETTER_Y_OFFSET = 40
 CANVAS_PADDING = 50
 CANVAS_WORD_SCALE = 1.0
+
+
+def analyzer_version():
+    """Return the independently managed Analyzer producer version."""
+    try:
+        from component_versions import get_component_version
+
+        return get_component_version("analyzer")
+    except Exception:
+        return "0.0"
 
 # Selection colors
 STROKE_SELECTED_COLOR = QColor(0, 120, 215)  # Blue for selected strokes
@@ -430,6 +444,9 @@ class ParticipantData:
     block_index: int = 1
     block_count: int = 1
     session_id: Optional[str] = None
+    server_run_id: Optional[str] = None
+    source_result_id: Optional[str] = None
+    source_sha256: Optional[str] = None
     
     # Cached computations per word
     _stroke_cache: Dict[int, Tuple[List[int], List[int]]] = field(default_factory=dict, repr=False)
@@ -450,6 +467,7 @@ class ParticipantData:
                 words=data,
                 experiment_name='Unknown',
                 block_name='Legacy data',
+                source_sha256=_file_sha256(file_path),
             )
         else:
             identity = _result_identity(data)
@@ -463,6 +481,8 @@ class ParticipantData:
                 age=data.get('participant_age'),
                 gender=data.get('participant_gender'),
                 session_id=data.get('session_id'),
+                server_run_id=data.get('server_run_id'),
+                source_sha256=_file_sha256(file_path),
                 **identity,
             )
     
@@ -498,6 +518,7 @@ def build_analysis_state(
     written_words: Dict[int, str],
     word_correctness: Dict[int, bool],
     train_mode: Dict[int, str],
+    run_id: Optional[str] = None,
 ):
     """Serialize the editable Analyzer workspace for one participant run."""
     offsets = _participant_offsets(participants)
@@ -521,14 +542,45 @@ def build_analysis_state(
             flat_index += 1
         sources.append(
             {
+                "result_id": participant.source_result_id,
+                "raw_sha256": participant.source_sha256,
                 "session_id": participant.session_id,
                 "block_id": participant.block_id,
                 "block_index": participant.block_index,
                 "block_name": participant.block_name,
+                "word_count": len(participant.words),
                 "words": words,
             }
         )
-    return {"schema_version": "1.0", "sources": sources}
+    sources = sorted(sources, key=lambda item: item.get("block_index") or 0)
+    identity_rows = [
+        {
+            "id": source.get("result_id"),
+            "sha256": source.get("raw_sha256"),
+            "block_index": source.get("block_index"),
+        }
+        for source in sources
+    ]
+    source_fingerprint = hashlib.sha256(
+        json.dumps(
+            identity_rows, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+    ).hexdigest()
+    session_ids = {source.get("session_id") for source in sources if source.get("session_id")}
+    experiment_ids = {
+        str(participants[index].experiment_id)
+        for index in participant_indices
+        if participants[index].experiment_id is not None
+    }
+    return {
+        "schema_version": "1.1",
+        "analyzer_version": analyzer_version(),
+        "run_id": run_id,
+        "experiment_id": next(iter(experiment_ids)) if len(experiment_ids) == 1 else None,
+        "session_id": next(iter(session_ids)) if len(session_ids) == 1 else None,
+        "source_fingerprint": source_fingerprint,
+        "sources": sources,
+    }
 
 
 def apply_analysis_state(
@@ -549,6 +601,12 @@ def apply_analysis_state(
         match = None
         for index, participant in enumerate(participants):
             if source.get("session_id") != participant.session_id:
+                continue
+            source_result_id = source.get("result_id")
+            if source_result_id and source_result_id != participant.source_result_id:
+                continue
+            source_sha256 = source.get("raw_sha256")
+            if source_sha256 and source_sha256 != participant.source_sha256:
                 continue
             source_block_id = source.get("block_id")
             if source_block_id and source_block_id == participant.block_id:
@@ -587,6 +645,7 @@ def build_trainable_payload(
     written_words: Dict[int, str],
     word_correctness: Dict[int, bool],
     train_mode: Dict[int, str],
+    run_id: Optional[str] = None,
 ):
     """Build a trainable artifact for an explicit set of source files."""
     offsets = _participant_offsets(participants)
@@ -595,6 +654,10 @@ def build_trainable_payload(
         participant = participants[participant_index]
         flat_idx = offsets[participant_index]
         participant_output = {
+            'analyzer_version': analyzer_version(),
+            'run_id': run_id or participant.server_run_id,
+            'source_result_id': participant.source_result_id,
+            'source_sha256': participant.source_sha256,
             'experiment_name': participant.experiment_name,
             'experiment_id': participant.experiment_id,
             'block_name': participant.block_name,
@@ -658,6 +721,58 @@ def build_trainable_payload(
     return output[0] if len(output) == 1 else output
 
 
+def _file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as source:
+        while True:
+            chunk = source.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def write_analysis_finalize_bundle(
+    bundle_path,
+    *,
+    run_id,
+    session_id,
+    completed,
+    source_fingerprint,
+    state_path,
+    csv_path,
+    trainable_path,
+):
+    """Create the single, checksummed payload used by atomic finalization."""
+    sources = {
+        "analysis_state.json": Path(state_path),
+        "analysis.csv": Path(csv_path),
+        "trainable.json": Path(trainable_path),
+    }
+    manifest = {
+        "schema_version": "1.0",
+        "analyzer_version": analyzer_version(),
+        "run_id": str(run_id),
+        "session_id": str(session_id),
+        "completed": bool(completed),
+        "source_fingerprint": str(source_fingerprint),
+        "files": {
+            name: {"sha256": _file_sha256(path)} for name, path in sources.items()
+        },
+    }
+    bundle_path = Path(bundle_path)
+    temporary = bundle_path.with_suffix(".part")
+    with zipfile.ZipFile(temporary, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(
+            "manifest.json",
+            json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2),
+        )
+        for name, source in sources.items():
+            archive.write(source, name)
+    temporary.replace(bundle_path)
+    return manifest
+
+
 def write_analysis_csv(
     participants: List[ParticipantData],
     participant_indices: List[int],
@@ -696,11 +811,9 @@ def write_analysis_csv(
         for participant in selected:
             for word_index, word_data in enumerate(participant.words):
                 pen_events = word_data.get('pen_events', [])
-                if not pen_events:
-                    continue
                 audio_start = (
                     word_data.get('audio_start_time')
-                    or pen_events[0]['absolute_time']
+                    or (pen_events[0]['absolute_time'] if pen_events else 0)
                 )
                 audio_end = word_data.get('audio_end_time')
                 stroke_starts, stroke_ends = find_stroke_indices(
@@ -730,7 +843,7 @@ def write_analysis_csv(
 
                 assigned_letters = word_data.get('assigned_letters', {})
                 letter_triplets = []
-                if assigned_letters:
+                if assigned_letters and pen_events:
                     sorted_indices = get_sorted_letter_indices(assigned_letters)
                     last_event_index = (
                         stroke_ends[-1] if stroke_ends else len(pen_events) - 1
@@ -1239,6 +1352,8 @@ class PenDataPlayer(QMainWindow):
         self.analysis_context = None
         self.analysis_context_saved = False
         self._pending_analysis_states = []
+        self._context_sources_by_path = {}
+        self._last_cloud_state_sha = {}
         
         self._init_ui()
         self.analysis_save_timer = QTimer(self)
@@ -1249,7 +1364,15 @@ class PenDataPlayer(QMainWindow):
         self.analysis_context = context if isinstance(context, dict) else None
         self.analysis_context_saved = False
         self._pending_analysis_states = []
+        self._context_sources_by_path = {}
         for run in (self.analysis_context or {}).get('runs', []):
+            for source in run.get('results', []):
+                source_path = source.get('path')
+                if source_path:
+                    self._context_sources_by_path[os.path.normcase(os.path.abspath(source_path))] = {
+                        **source,
+                        'run_id': run.get('id'),
+                    }
             state_path = run.get('analysis_state_path')
             if not state_path:
                 continue
@@ -1275,6 +1398,24 @@ class PenDataPlayer(QMainWindow):
         if restored:
             print(f"Restored Analyzer edit state for {restored} word(s).")
 
+    def _participant_indices_for_run(self, run):
+        """Resolve cloud sources by immutable Run ID, with legacy-only fallback."""
+        run_id = str(run.get('id'))
+        exact = [
+            index for index, participant in enumerate(self.participants)
+            if participant.server_run_id and str(participant.server_run_id) == run_id
+        ]
+        if exact:
+            return exact
+        # Never mix known cloud Runs merely because their legacy session labels
+        # collide. Session matching exists only for old context files lacking IDs.
+        if any(participant.server_run_id for participant in self.participants):
+            return []
+        return [
+            index for index, participant in enumerate(self.participants)
+            if participant.session_id == run.get('session_id')
+        ]
+
     def _save_cloud_analysis_state(self, api=None):
         if not self.analysis_context or not self.participants:
             return
@@ -1283,13 +1424,11 @@ class PenDataPlayer(QMainWindow):
         if api is None:
             from autoscript_api import AutoScriptAPI
             api = AutoScriptAPI(base_url=self.analysis_context.get('api_url'), timeout=60)
+        from analysis_sync_queue import enqueue_analysis_state, drain_analysis_queue
         output_root = os.path.abspath(self.analysis_context['output_dir'])
         os.makedirs(output_root, exist_ok=True)
         for run in self.analysis_context.get('runs', []):
-            participant_indices = [
-                index for index, participant in enumerate(self.participants)
-                if participant.session_id == run.get('session_id')
-            ]
+            participant_indices = self._participant_indices_for_run(run)
             if not participant_indices:
                 continue
             run_dir = os.path.join(output_root, str(run['id']))
@@ -1301,17 +1440,173 @@ class PenDataPlayer(QMainWindow):
                 self.written_words,
                 self.word_correctness,
                 self.train_mode,
+                run_id=run['id'],
             )
-            state.update({"run_id": run['id'], "session_id": run.get('session_id')})
+            state_digest = hashlib.sha256(
+                json.dumps(
+                    state, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+                ).encode("utf-8")
+            ).hexdigest()
+            if getattr(self, '_last_cloud_state_sha', {}).get(str(run['id'])) == state_digest:
+                continue
             with open(state_path, 'w', encoding='utf-8') as state_file:
                 json.dump(state, state_file, ensure_ascii=False, indent=2)
-            api.upload_run_artifact(run['id'], 'analysis_state', state_path)
+            enqueue_analysis_state(
+                run['id'], state_path, base_etag=run.get('analysis_etag')
+            )
+            if not hasattr(self, '_last_cloud_state_sha'):
+                self._last_cloud_state_sha = {}
+            self._last_cloud_state_sha[str(run['id'])] = state_digest
+        _count, errors, outcomes = drain_analysis_queue(api)
+        for run in self.analysis_context.get('runs', []):
+            outcome = outcomes.get(str(run['id'])) or outcomes.get(run['id'])
+            if outcome and outcome.get('etag'):
+                run['analysis_etag'] = outcome['etag']
+                run['analysis_revision'] = outcome.get('revision')
+        return errors
 
     def _autosave_cloud_analysis_state(self):
         try:
-            self._save_cloud_analysis_state()
+            if self.analysis_context:
+                self._save_cloud_analysis_state()
+            else:
+                self._save_local_analysis_state()
         except Exception as exc:
             print(f"Analyzer edit-state autosave failed: {exc}")
+
+    def _save_local_analysis_state(self):
+        if self.analysis_context or not self.participants:
+            return None
+        if self.current_word_index >= 0:
+            self._save_letters_to_word_data()
+        from analysis_local_state import save_local_analysis_state
+        state = build_analysis_state(
+            self.participants,
+            list(range(len(self.participants))),
+            self.written_words,
+            self.word_correctness,
+            self.train_mode,
+        )
+        return save_local_analysis_state(
+            [participant.file_path for participant in self.participants], state
+        )
+
+    def _restore_local_analysis_state(self):
+        if self.analysis_context or not self.participants:
+            return 0
+        from analysis_local_state import load_local_analysis_state
+        record = load_local_analysis_state(
+            [participant.file_path for participant in self.participants]
+        )
+        if not record:
+            return 0
+        return apply_analysis_state(
+            self.participants,
+            record.get('state'),
+            self.written_words,
+            self.word_correctness,
+            self.train_mode,
+        )
+
+    def _try_associate_manual_sources(self):
+        """Associate manually opened files only when every exact hash resolves."""
+        if self.analysis_context or not self.participants:
+            return False
+        try:
+            from analysis_local_state import file_sha256
+            from app_paths import ensure_dir, user_data_dir
+            from autoscript_api import APIError, AutoScriptAPI
+
+            hashes = [file_sha256(participant.file_path) for participant in self.participants]
+            api = AutoScriptAPI(timeout=10)
+            resolution = api.resolve_run_results_by_sha(hashes)
+            matches = resolution.get('results', []) if isinstance(resolution, dict) else []
+            by_run = {}
+            for match in matches:
+                run_id = match.get('run_id')
+                if run_id and match.get('sha256') in hashes:
+                    by_run.setdefault(str(run_id), {}).setdefault(
+                        match.get('sha256'), []
+                    ).append(match)
+            candidates = {}
+            for candidate_run_id, by_hash in by_run.items():
+                if any(len(by_hash.get(digest, [])) != 1 for digest in hashes):
+                    continue
+                candidate = [by_hash[digest][0] for digest in hashes]
+                if (
+                    len({item.get('id') for item in candidate}) == len(candidate)
+                    and len({item.get('block_index') for item in candidate}) == len(candidate)
+                ):
+                    candidates[candidate_run_id] = candidate
+            if not candidates:
+                return False
+            runs = {
+                candidate_run_id: api.get_experiment_run(candidate_run_id)
+                for candidate_run_id in candidates
+            }
+            if len(candidates) == 1:
+                run_id = next(iter(candidates))
+            else:
+                labels = {}
+                for candidate_run_id, candidate_run in runs.items():
+                    label = (
+                        f"{candidate_run.get('source_experiment_name', 'Experiment')} — "
+                        f"participant {candidate_run.get('participant_number', '?')} — "
+                        f"{candidate_run.get('session_id', '')} — {candidate_run_id[:8]}"
+                    )
+                    labels[label] = candidate_run_id
+                chosen, accepted = QInputDialog.getItem(
+                    self,
+                    "Associate Analysis",
+                    "These exact files occur in more than one cloud Run. Choose one:",
+                    sorted(labels),
+                    0,
+                    False,
+                )
+                if not accepted:
+                    return False
+                run_id = labels[chosen]
+            selected = candidates[run_id]
+            run = runs[run_id]
+            context_run = {
+                'id': run_id,
+                'session_id': run.get('session_id'),
+                'analysis_etag': None,
+                'analysis_revision': 0,
+                'results': [],
+            }
+            for participant, digest, match in zip(self.participants, hashes, selected):
+                participant.server_run_id = run_id
+                participant.source_result_id = match.get('id')
+                participant.source_sha256 = digest
+                context_run['results'].append({
+                    **match,
+                    'path': participant.file_path,
+                })
+            try:
+                saved = api.get_run_analysis_state(run_id)
+            except APIError as exc:
+                if exc.status_code != 404:
+                    raise
+            else:
+                context_run['analysis_etag'] = saved.get('etag')
+                context_run['analysis_revision'] = saved.get('revision', 0)
+                self._pending_analysis_states.append(saved['state'])
+            output_dir = ensure_dir(
+                user_data_dir() / 'analyzer_exports' / f'manual_{uuid.uuid4().hex[:10]}'
+            )
+            self.analysis_context = {
+                'api_url': api.base_url,
+                'experiment_id': str(run.get('experiment_id')),
+                'experiment_name': run.get('source_experiment_name'),
+                'runs': [context_run],
+                'output_dir': str(output_dir),
+            }
+            print(f"Associated manual Analyzer inputs with cloud Run {run_id} by SHA-256.")
+            return True
+        except Exception as exc:
+            print(f"Manual cloud association was unavailable: {exc}")
+            return False
 
     def _finalize_cloud_analysis(self, completed):
         if not self.analysis_context:
@@ -1327,14 +1622,10 @@ class PenDataPlayer(QMainWindow):
         )
         output_root = os.path.abspath(self.analysis_context['output_dir'])
         os.makedirs(output_root, exist_ok=True)
-        self._save_cloud_analysis_state(api)
+        from analysis_sync_queue import enqueue_analysis_finalize, drain_analysis_queue
         for run in self.analysis_context.get('runs', []):
             session_id = run.get('session_id')
-            participant_indices = [
-                index
-                for index, participant in enumerate(self.participants)
-                if participant.session_id == session_id
-            ]
+            participant_indices = self._participant_indices_for_run(run)
             if not participant_indices:
                 raise RuntimeError(
                     f"No loaded result files match session {session_id}."
@@ -1343,6 +1634,18 @@ class PenDataPlayer(QMainWindow):
             os.makedirs(run_dir, exist_ok=True)
             csv_path = os.path.join(run_dir, 'analysis.csv')
             json_path = os.path.join(run_dir, 'trainable.json')
+            state_path = os.path.join(run_dir, 'analysis_state.json')
+            bundle_path = os.path.join(run_dir, 'analysis_finalize.zip')
+            state = build_analysis_state(
+                self.participants,
+                participant_indices,
+                self.written_words,
+                self.word_correctness,
+                self.train_mode,
+                run_id=run['id'],
+            )
+            with open(state_path, 'w', encoding='utf-8') as state_file:
+                json.dump(state, state_file, ensure_ascii=False, indent=2)
             write_analysis_csv(self.participants, participant_indices, csv_path)
             trainable = build_trainable_payload(
                 self.participants,
@@ -1350,15 +1653,34 @@ class PenDataPlayer(QMainWindow):
                 self.written_words,
                 self.word_correctness,
                 self.train_mode,
+                run_id=run['id'],
             )
             with open(json_path, 'w', encoding='utf-8') as output_file:
                 json.dump(trainable, output_file, ensure_ascii=False, indent=2)
-            api.upload_run_artifact(run['id'], 'analysis_csv', csv_path)
-            api.upload_run_artifact(run['id'], 'trainable_json', json_path)
-            api.update_run_analysis(run['id'], completed)
+            write_analysis_finalize_bundle(
+                bundle_path,
+                run_id=run['id'],
+                session_id=session_id,
+                completed=completed,
+                source_fingerprint=state['source_fingerprint'],
+                state_path=state_path,
+                csv_path=csv_path,
+                trainable_path=json_path,
+            )
+            enqueue_analysis_finalize(
+                run['id'], bundle_path, base_etag=run.get('analysis_etag')
+            )
+        return drain_analysis_queue(api)
 
     def closeEvent(self, event):
-        if not self.analysis_context or self.analysis_context_saved:
+        if not self.analysis_context:
+            try:
+                self._save_local_analysis_state()
+            except Exception as exc:
+                QMessageBox.warning(self, "Local Save Failed", str(exc))
+            event.accept()
+            return
+        if self.analysis_context_saved:
             event.accept()
             return
         answer = QMessageBox.question(
@@ -1372,8 +1694,15 @@ class PenDataPlayer(QMainWindow):
         completed = answer == QMessageBox.Yes
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
-            self._finalize_cloud_analysis(completed)
+            _count, errors, _outcomes = self._finalize_cloud_analysis(completed)
             self.analysis_context_saved = True
+            if errors:
+                QMessageBox.information(
+                    self,
+                    "Analysis Queued",
+                    "The analysis was saved safely on this computer and will "
+                    "synchronize when the API is available.\n\n" + "\n".join(errors),
+                )
         except Exception as exc:
             QMessageBox.critical(
                 self,
@@ -2081,6 +2410,17 @@ class PenDataPlayer(QMainWindow):
             
             try:
                 participant = ParticipantData.from_file(file_path)
+                source = self._context_sources_by_path.get(
+                    os.path.normcase(os.path.abspath(file_path)), {}
+                )
+                if source.get('sha256'):
+                    source_sha256 = source['sha256']
+                else:
+                    from analysis_local_state import file_sha256
+                    source_sha256 = file_sha256(file_path)
+                participant.server_run_id = source.get('run_id') or participant.server_run_id
+                participant.source_result_id = source.get('id')
+                participant.source_sha256 = source_sha256
                 self.participants.append(participant)
                 newly_added += 1
                 print(f"Loaded: {file_path} (Participant {participant.participant_number})")
@@ -2090,12 +2430,20 @@ class PenDataPlayer(QMainWindow):
         
         if self.participants:
             self._rebuild_flattened_data()
+            restored_local = self._restore_local_analysis_state()
+            if restored_local:
+                print(f"Restored local Analyzer edit state for {restored_local} word(s).")
+            self._try_associate_manual_sources()
+            # A matching cloud revision is authoritative when it exists. When
+            # the API has no state yet, the locally restored draft remains.
             self._restore_pending_analysis_states()
             self._populate_tree()
             self._update_loaded_label()
             self.export_btn.setEnabled(True)
             self.export_json_btn.setEnabled(True)
             self.setFocus()
+            if not self.analysis_save_timer.isActive():
+                self.analysis_save_timer.start()
             
             if newly_added > 0 and show_summary:
                 QMessageBox.information(self, "Files Loaded", 

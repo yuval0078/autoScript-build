@@ -60,6 +60,9 @@ app_version
 experiment_name
 experiment_id
 experiment_version
+experiment_revision_id
+experiment_revision_number
+server_run_id
 block_name
 block_id
 block_index
@@ -82,8 +85,11 @@ words
 
 Current details:
 
-- Newly emitted files use `schema_version: "1.2"`. Version 1.0 files without
-  Block identity remain schema-valid and loadable by the Analyzer.
+- Newly emitted files use `schema_version: "1.3"`. Version 1.0 files without
+  Block identity remain schema-valid and loadable by the Analyzer. Version 1.3
+  requires the Block/completeness fields plus explicit revision and server Run
+  keys; the latter may be `null` for a local run or when cloud Run creation was
+  unavailable.
 - `experiment_id` is the cloud Experiment UUID for cloud runs and falls back
   to the local/legacy experiment identity when no cloud record exists.
 - In the manifest compatibility path, `experiment_id` and `experiment_version` can be `null` when the manifest omits them.
@@ -110,6 +116,10 @@ Schema: `schemas/data-contracts/raw-run.schema.json`.
 A participant object contains source identity plus participant metadata:
 
 ```text
+analyzer_version
+run_id
+source_result_id
+source_sha256
 participant_number
 experiment_name
 experiment_id
@@ -149,6 +159,13 @@ The static columns are:
 
 ```text
 Exp Step
+Experiment
+Experiment ID
+Block
+Block ID
+Block Index
+Block Count
+Session ID
 Participant
 Age
 Gender
@@ -180,6 +197,33 @@ Screenshot File
 
 The number of CSV columns is therefore data-dependent. See `docs/data-contracts/analysis-csv.md`.
 
+## 5. Analyzer edit state and atomic finalization
+
+Cloud edit state uses schema `1.1`. It identifies the Run and session, includes
+an `analyzer_version`, and carries a canonical source fingerprint over every
+ordered immutable result ID, SHA-256 and Block index. Each source contains the
+exact result/Block identity and one editable annotation object per stored word.
+
+Schema: `schemas/data-contracts/analysis-state.schema.json`.
+
+Closing a cloud-associated Analyzer creates one ZIP with exactly:
+
+```text
+manifest.json
+analysis_state.json
+analysis.csv
+trainable.json
+```
+
+The manifest records the Run/session, the user's completed/not-completed
+answer, source fingerprint, Analyzer producer version and SHA-256 of each
+payload. The API validates identity and coverage against immutable RunResults,
+then publishes the three artifacts and status as one analysis revision. An
+autosave uses ETag/`If-Match`; stale concurrent edits return a conflict rather
+than overwriting newer work.
+
+Schema: `schemas/data-contracts/analysis-finalize-manifest.schema.json`.
+
 ## Server metadata and immutable storage
 
 The backend stores existing files unchanged in object storage and keeps
@@ -201,9 +245,10 @@ These are **database fields**, not claims about the current JSON output. A later
 | File | Current usable identity | Limitation |
 | --- | --- | --- |
 | Experiment ZIP | `name`; word `id` values | No stable experiment-version identity |
-| Raw result | `session_id`; `experiment_id`; `experiment_version` | `experiment_id` commonly equals the name |
-| Trainable JSON | experiment, Block, session, participant, and timestamp | No server run UUID inside the file |
-| CSV | experiment, Block, session, participant, word, and cell | No server run UUID inside the file |
+| Raw result | `session_id`; `experiment_id`; `experiment_version`; `experiment_revision_id`; `server_run_id` | Revision/Run IDs are null for local and legacy execution |
+| Trainable JSON | Run/result checksum, experiment, Block, session, participant, and timestamp | Older exports may omit server IDs |
+| CSV | experiment, Block, session, participant, word, and cell | Run identity is validated through the finalization manifest |
+| Analysis state | Run, session, exact source-result IDs/checksums, Block identity, and editable word annotations | Legacy state artifacts may omit the new producer and source fields |
 
 ## Server-side versioning rules for the current files
 
@@ -226,3 +271,15 @@ keeps the user-selected local JSON copies. Analyzer CSV/trainable exports are
 persisted as immutable per-run artifacts. Each run stores a tri-state analysis
 status: not started (`null`), explicitly not completed (`false`), or completed
 (`true`).
+
+Editable Analyzer state uses an optimistic concurrency token returned as an
+HTTP `ETag`. Autosaves create immutable draft revisions. Atomic finalization
+uploads one ZIP containing a checksummed manifest, the current edit state, CSV,
+and trainable JSON; the server exposes the new artifacts and completion status
+only after the complete group is validated and committed.
+
+The optional `analyzer_version` producer field starts at `0.0` and follows the
+independently installed Analyzer component. Validators continue to accept
+older state/export files where that field is absent. Manually opened legacy
+JSON uses a local, path-independent workspace identity derived from the ordered
+SHA-256 values of the exact input bytes.

@@ -5,6 +5,7 @@ import re
 import tempfile
 import uuid
 import zipfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import quote, unquote
 
@@ -21,27 +22,33 @@ from ..dependencies import get_current_user
 from ..models import (
     Experiment,
     ExperimentBlock,
+    ExperimentPublishOperation,
     ExperimentRun,
     ExperimentRevision,
     ExperimentRevisionBlock,
     ExperimentVersion,
     RunArtifact,
     RunResult,
+    StagedBlockAsset,
     User,
 )
 from ..schemas import (
     BlockReorder,
     ExperimentBlockResponse,
     ExperimentCreate,
+    ExperimentPublishCreate,
+    ExperimentPublishUpdate,
     ExperimentResponse,
     ExperimentRevisionResponse,
     ExperimentUpdate,
     ExperimentVersionResponse,
+    StagedBlockAssetResponse,
 )
 from ..services.experiment_packages import (
     PackageValidationError,
     validate_block_package,
 )
+from ..services.object_cleanup import drain_object_deletions, queue_object_deletions
 from ..services.storage import get_object_storage
 
 
@@ -72,6 +79,9 @@ def _block_response(block):
         name=block.name,
         schema_version=block.schema_version,
         app_version=block.app_version,
+        expected_word_count=block.expected_word_count,
+        grid_rows=block.grid_rows,
+        grid_cols=block.grid_cols,
         original_filename=block.original_filename,
         sha256=block.sha256,
         size_bytes=block.size_bytes,
@@ -87,13 +97,31 @@ def _experiment_response(experiment):
         reverse=True,
     )
     blocks = sorted(experiment.blocks, key=lambda block: block.position)
-    current_revision = max(experiment.revisions, key=lambda item: item.revision_number, default=None)
+    current_revision = next(
+        (
+            item
+            for item in experiment.revisions
+            if item.id == experiment.current_revision_id
+        ),
+        None,
+    )
+    if current_revision is None and experiment.current_revision_id is None:
+        # Compatibility for legacy rows created before the explicit pointer.
+        current_revision = max(
+            experiment.revisions,
+            key=lambda item: item.revision_number,
+            default=None,
+        )
     return ExperimentResponse(
         id=experiment.id,
         name=experiment.name,
         description=experiment.description,
         owner_id=experiment.owner_id,
         created_at=experiment.created_at,
+        current_revision_id=(
+            experiment.current_revision_id
+            or (current_revision.id if current_revision is not None else None)
+        ),
         blocks=[_block_response(block) for block in blocks],
         versions=[_version_response(version) for version in versions],
         current_revision=_revision_response(current_revision) if current_revision else None,
@@ -116,6 +144,9 @@ def _revision_response(revision):
                 "position": block.position,
                 "same_page_as_previous": block.same_page_as_previous,
                 "name": block.name,
+                "expected_word_count": block.expected_word_count,
+                "grid_rows": block.grid_rows,
+                "grid_cols": block.grid_cols,
                 "sha256": block.sha256,
                 "size_bytes": block.size_bytes,
             }
@@ -231,6 +262,11 @@ def _storage_key_is_referenced(database, storage_key):
             )
         )
         or database.scalar(
+            select(func.count(StagedBlockAsset.id)).where(
+                StagedBlockAsset.storage_key == storage_key
+            )
+        )
+        or database.scalar(
             select(func.count(ExperimentRevisionBlock.id)).where(
                 ExperimentRevisionBlock.storage_key == storage_key
             )
@@ -250,6 +286,492 @@ def _storage_key_is_referenced(database, storage_key):
                 RunArtifact.storage_key == storage_key
             )
         )
+    )
+
+
+def _staged_block_response(asset):
+    return StagedBlockAssetResponse(
+        id=asset.id,
+        request_id=asset.request_id,
+        name=asset.name,
+        schema_version=asset.schema_version,
+        app_version=asset.app_version,
+        expected_word_count=asset.expected_word_count,
+        grid_rows=asset.grid_rows,
+        grid_cols=asset.grid_cols,
+        original_filename=asset.original_filename,
+        sha256=asset.sha256,
+        size_bytes=asset.size_bytes,
+        created_at=asset.created_at,
+        expires_at=asset.expires_at,
+    )
+
+
+def _cleanup_expired_staged_blocks(database, storage, owner_id):
+    """Delete expired staging rows first, then best-effort delete their objects."""
+    now = datetime.now(timezone.utc)
+    expired = database.scalars(
+        select(StagedBlockAsset).where(
+            StagedBlockAsset.owner_id == owner_id,
+            StagedBlockAsset.expires_at <= now,
+        )
+    ).all()
+    if not expired:
+        return
+    storage_keys = [asset.storage_key for asset in expired]
+    for asset in expired:
+        database.delete(asset)
+    database.commit()
+    for storage_key in storage_keys:
+        if not _storage_key_is_referenced(database, storage_key):
+            try:
+                storage.remove_object(storage_key)
+            except Exception:
+                # The DB row is authoritative. A storage lifecycle policy may
+                # remove a leaked staging object if this best-effort call fails.
+                pass
+
+
+def _publish_payload_sha256(payload, experiment_id=None):
+    canonical = {
+        "target_experiment_id": str(experiment_id) if experiment_id else None,
+        "payload": payload.model_dump(mode="json"),
+    }
+    encoded = json.dumps(
+        canonical,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _idempotent_publish_result(
+    database,
+    actor,
+    request_id,
+    payload_sha256,
+    experiment_id=None,
+):
+    operation = database.scalar(
+        select(ExperimentPublishOperation).where(
+            ExperimentPublishOperation.owner_id == actor.id,
+            ExperimentPublishOperation.request_id == request_id,
+        )
+    )
+    if operation is None:
+        return None
+    if (
+        operation.payload_sha256 != payload_sha256
+        or (experiment_id is not None and operation.experiment_id != experiment_id)
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="This publish request ID was already used for a different request.",
+        )
+    return _owned_experiment(database, actor, operation.experiment_id)
+
+
+def _validate_publish_page_layout(sources, references):
+    group = []
+    for source, reference in zip(sources, references):
+        if not reference.same_page_as_previous and group:
+            _validate_publish_page_group(group)
+            group = []
+        group.append(source)
+    if group:
+        _validate_publish_page_group(group)
+
+
+def _validate_publish_page_group(group):
+    if len(group) < 2:
+        return
+    metrics = [
+        (item.grid_rows, item.grid_cols, item.expected_word_count) for item in group
+    ]
+    # Older live Blocks may predate authoritative metrics. Preserve their
+    # reorderability; newly staged assets always have complete metrics.
+    if any(value is None for item in metrics for value in item):
+        return
+    rows, cols, _ = metrics[0]
+    if any(item[0] != rows or item[1] != cols for item in metrics):
+        raise HTTPException(
+            status_code=422,
+            detail="Blocks sharing a page must use the same grid.",
+        )
+    if sum(item[2] for item in metrics) > rows * cols:
+        raise HTTPException(
+            status_code=422,
+            detail="Blocks sharing a page exceed the grid capacity.",
+        )
+
+
+@router.post(
+    "/staged-blocks",
+    response_model=StagedBlockAssetResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def stage_block(
+    request: Request,
+    response: Response,
+    x_block_name: str = Header(alias="X-Block-Name"),
+    x_idempotency_key: str = Header(alias="X-Idempotency-Key"),
+    x_filename: str | None = Header(default=None, alias="X-Filename"),
+    database: Session = Depends(get_db),
+    storage=Depends(get_object_storage),
+    actor: User = Depends(get_current_user),
+):
+    """Store one validated immutable Block without changing a live Experiment."""
+    try:
+        request_id = str(uuid.UUID(x_idempotency_key))
+    except (ValueError, AttributeError) as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="X-Idempotency-Key must be a UUID.",
+        ) from exc
+    filename = _safe_zip_filename(x_filename)
+    block_name = _safe_block_name(x_block_name)
+    _cleanup_expired_staged_blocks(database, storage, actor.id)
+    upload_path, sha256, size_bytes, metadata = await _receive_package(request)
+    storage_key = None
+    try:
+        if metadata.name != block_name:
+            raise HTTPException(
+                status_code=422,
+                detail="X-Block-Name must match the name in the block package.",
+            )
+        existing = database.scalar(
+            select(StagedBlockAsset).where(
+                StagedBlockAsset.owner_id == actor.id,
+                StagedBlockAsset.request_id == request_id,
+            )
+        )
+        if existing is not None:
+            if (
+                existing.sha256 != sha256
+                or existing.name != block_name
+                or existing.original_filename != filename
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="This staging idempotency key was already used for different content.",
+                )
+            response.status_code = status.HTTP_200_OK
+            return _staged_block_response(existing)
+
+        asset_id = uuid.uuid4()
+        storage_key = f"staging/{actor.id}/blocks/{asset_id}/{sha256}.zip"
+        storage.put_file(storage_key, upload_path, "application/zip")
+        asset = StagedBlockAsset(
+            id=asset_id,
+            owner_id=actor.id,
+            request_id=request_id,
+            name=block_name,
+            schema_version=metadata.schema_version,
+            app_version=metadata.app_version,
+            expected_word_count=metadata.expected_word_count,
+            grid_rows=metadata.grid_rows,
+            grid_cols=metadata.grid_cols,
+            storage_key=storage_key,
+            original_filename=filename,
+            sha256=sha256,
+            size_bytes=size_bytes,
+            expires_at=datetime.now(timezone.utc)
+            + timedelta(hours=get_settings().staged_block_ttl_hours),
+        )
+        database.add(asset)
+        database.commit()
+        database.refresh(asset)
+        return _staged_block_response(asset)
+    except IntegrityError as exc:
+        database.rollback()
+        if storage_key is not None:
+            try:
+                storage.remove_object(storage_key)
+            except Exception:
+                pass
+        existing = database.scalar(
+            select(StagedBlockAsset).where(
+                StagedBlockAsset.owner_id == actor.id,
+                StagedBlockAsset.request_id == request_id,
+            )
+        )
+        if existing is not None and (
+            existing.sha256 == sha256
+            and existing.name == block_name
+            and existing.original_filename == filename
+        ):
+            response.status_code = status.HTTP_200_OK
+            return _staged_block_response(existing)
+        raise HTTPException(
+            status_code=409,
+            detail="This staging idempotency key was committed for different content.",
+        ) from exc
+    except Exception:
+        database.rollback()
+        if storage_key is not None:
+            try:
+                storage.remove_object(storage_key)
+            except Exception:
+                pass
+        raise
+    finally:
+        upload_path.unlink(missing_ok=True)
+
+
+def _resolve_publish_sources(database, actor, payload, experiment=None):
+    existing_blocks = {
+        block.id: block for block in (experiment.blocks if experiment is not None else [])
+    }
+    staged_ids = [
+        reference.id for reference in payload.blocks if reference.source == "staged"
+    ]
+    staged_assets = {}
+    if staged_ids:
+        now = datetime.now(timezone.utc)
+        staged_assets = {
+            asset.id: asset
+            for asset in database.scalars(
+                select(StagedBlockAsset)
+                .where(
+                    StagedBlockAsset.id.in_(staged_ids),
+                    StagedBlockAsset.owner_id == actor.id,
+                    StagedBlockAsset.expires_at > now,
+                )
+                .with_for_update()
+            ).all()
+        }
+
+    sources = []
+    for reference in payload.blocks:
+        if reference.source == "existing":
+            if experiment is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail="A new Experiment cannot reference an existing live Block.",
+                )
+            source = existing_blocks.get(reference.id)
+            if source is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail="An existing Block reference does not belong to this Experiment.",
+                )
+        else:
+            source = staged_assets.get(reference.id)
+            if source is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="A staged Block is missing or expired.",
+                )
+        sources.append(source)
+    _validate_publish_page_layout(sources, payload.blocks)
+    return sources
+
+
+def _atomic_publish_experiment(
+    database,
+    storage,
+    actor,
+    payload,
+    *,
+    experiment_id=None,
+):
+    payload_sha256 = _publish_payload_sha256(payload, experiment_id)
+    request_id = str(payload.request_id)
+    prior_result = _idempotent_publish_result(
+        database, actor, request_id, payload_sha256, experiment_id
+    )
+    if prior_result is not None:
+        return prior_result
+
+    if experiment_id is None:
+        experiment = None
+    else:
+        experiment = _owned_experiment(database, actor, experiment_id, lock=True)
+        # A same-request concurrent writer may have committed while this
+        # transaction waited for the Experiment row lock.
+        prior_result = _idempotent_publish_result(
+            database, actor, request_id, payload_sha256, experiment_id
+        )
+        if prior_result is not None:
+            return prior_result
+        if experiment.current_revision_id != payload.expected_current_revision_id:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "The Experiment changed since it was loaded. Reload it before saving."
+                ),
+            )
+
+    sources = _resolve_publish_sources(database, actor, payload, experiment)
+    copied_keys = []
+    old_live_keys = []
+    try:
+        if experiment is None:
+            experiment = Experiment(
+                id=uuid.uuid4(),
+                name=payload.name,
+                description=payload.description,
+                owner_id=actor.id,
+            )
+            database.add(experiment)
+            # Detect a duplicate name while the Experiment is still inside the
+            # transaction. A later rollback cannot leave an empty shell.
+            database.flush()
+
+        revision_number = (
+            database.scalar(
+                select(func.max(ExperimentRevision.revision_number)).where(
+                    ExperimentRevision.experiment_id == experiment.id
+                )
+            )
+            or 0
+        ) + 1
+        revision = ExperimentRevision(
+            id=uuid.uuid4(),
+            experiment_id=experiment.id,
+            revision_number=revision_number,
+            name=payload.name,
+            created_by=actor.id,
+        )
+
+        live_blocks = []
+        revision_blocks = []
+        for position, (source, reference) in enumerate(zip(sources, payload.blocks)):
+            live_id = uuid.uuid4()
+            revision_block_id = uuid.uuid4()
+            live_key = (
+                f"experiments/{experiment.id}/blocks/{live_id}/{source.sha256}.zip"
+            )
+            revision_key = (
+                f"experiments/{experiment.id}/revisions/{revision.id}/blocks/"
+                f"{revision_block_id}/{source.sha256}.zip"
+            )
+            storage.copy_object(source.storage_key, live_key)
+            copied_keys.append(live_key)
+            storage.copy_object(source.storage_key, revision_key)
+            copied_keys.append(revision_key)
+            common = {
+                "position": position,
+                "same_page_as_previous": bool(reference.same_page_as_previous),
+                "name": source.name,
+                "schema_version": source.schema_version,
+                "app_version": source.app_version,
+                "expected_word_count": source.expected_word_count,
+                "grid_rows": source.grid_rows,
+                "grid_cols": source.grid_cols,
+                "original_filename": source.original_filename,
+                "sha256": source.sha256,
+                "size_bytes": source.size_bytes,
+            }
+            live_blocks.append(
+                ExperimentBlock(
+                    id=live_id,
+                    experiment_id=experiment.id,
+                    storage_key=live_key,
+                    created_by=actor.id,
+                    **common,
+                )
+            )
+            revision_blocks.append(
+                ExperimentRevisionBlock(
+                    id=revision_block_id,
+                    revision_id=revision.id,
+                    source_block_id=live_id,
+                    storage_key=revision_key,
+                    **common,
+                )
+            )
+
+        old_live_keys = [block.storage_key for block in experiment.blocks]
+        for block in list(experiment.blocks):
+            database.delete(block)
+        database.flush()
+
+        experiment.name = payload.name
+        experiment.description = payload.description
+        database.add_all(live_blocks)
+        database.add(revision)
+        database.add_all(revision_blocks)
+        database.flush()
+        experiment.current_revision_id = revision.id
+        consumed_at = datetime.now(timezone.utc)
+        for source in sources:
+            if isinstance(source, StagedBlockAsset):
+                source.consumed_at = source.consumed_at or consumed_at
+        database.add(
+            ExperimentPublishOperation(
+                owner_id=actor.id,
+                request_id=request_id,
+                payload_sha256=payload_sha256,
+                experiment_id=experiment.id,
+                revision_id=revision.id,
+            )
+        )
+        database.commit()
+    except IntegrityError as exc:
+        database.rollback()
+        for storage_key in copied_keys:
+            try:
+                storage.remove_object(storage_key)
+            except Exception:
+                pass
+        # Covers an exact create retry that raced the first request and lost
+        # the unique request/name constraint after the winner committed.
+        prior_result = _idempotent_publish_result(
+            database, actor, request_id, payload_sha256, experiment_id
+        )
+        if prior_result is not None:
+            return prior_result
+        raise HTTPException(
+            status_code=409,
+            detail="The Experiment name or publish request conflicts with another save.",
+        ) from exc
+    except HTTPException:
+        database.rollback()
+        for storage_key in copied_keys:
+            try:
+                storage.remove_object(storage_key)
+            except Exception:
+                pass
+        raise
+    except Exception as exc:
+        database.rollback()
+        for storage_key in copied_keys:
+            try:
+                storage.remove_object(storage_key)
+            except Exception:
+                pass
+        raise HTTPException(
+            status_code=503,
+            detail="Publishing failed; the runnable Experiment was left unchanged.",
+        ) from exc
+
+    database.expire_all()
+    published = _owned_experiment(database, actor, experiment.id)
+    for storage_key in old_live_keys:
+        if not _storage_key_is_referenced(database, storage_key):
+            try:
+                storage.remove_object(storage_key)
+            except Exception:
+                pass
+    return published
+
+
+@router.post(
+    "/experiments/publish",
+    response_model=ExperimentResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_and_publish_experiment(
+    payload: ExperimentPublishCreate,
+    database: Session = Depends(get_db),
+    storage=Depends(get_object_storage),
+    actor: User = Depends(get_current_user),
+):
+    _cleanup_expired_staged_blocks(database, storage, actor.id)
+    return _experiment_response(
+        _atomic_publish_experiment(database, storage, actor, payload)
     )
 
 
@@ -302,6 +824,38 @@ def list_experiments(
     return [_experiment_response(experiment) for experiment in experiments]
 
 
+@router.get("/experiments/{experiment_id}", response_model=ExperimentResponse)
+def get_experiment(
+    experiment_id: uuid.UUID,
+    database: Session = Depends(get_db),
+    actor: User = Depends(get_current_user),
+):
+    return _experiment_response(_owned_experiment(database, actor, experiment_id))
+
+
+@router.post(
+    "/experiments/{experiment_id}/publish",
+    response_model=ExperimentResponse,
+)
+def update_and_publish_experiment(
+    experiment_id: uuid.UUID,
+    payload: ExperimentPublishUpdate,
+    database: Session = Depends(get_db),
+    storage=Depends(get_object_storage),
+    actor: User = Depends(get_current_user),
+):
+    _cleanup_expired_staged_blocks(database, storage, actor.id)
+    return _experiment_response(
+        _atomic_publish_experiment(
+            database,
+            storage,
+            actor,
+            payload,
+            experiment_id=experiment_id,
+        )
+    )
+
+
 @router.patch("/experiments/{experiment_id}", response_model=ExperimentResponse)
 def update_experiment(
     experiment_id: uuid.UUID,
@@ -343,11 +897,10 @@ def delete_experiment(
             *(artifact for run in experiment.runs for artifact in run.artifacts),
         ]
     }
+    queue_object_deletions(database, storage_keys)
     database.delete(experiment)
     database.commit()
-    for storage_key in storage_keys:
-        if not _storage_key_is_referenced(database, storage_key):
-            storage.remove_object(storage_key)
+    drain_object_deletions(database, storage)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
@@ -376,9 +929,12 @@ def _create_revision_snapshot(database, storage, actor, experiment):
                 id=revision_block_id, source_block_id=block.id, position=block.position,
                 same_page_as_previous=block.same_page_as_previous, name=block.name,
                 schema_version=block.schema_version, app_version=block.app_version,
+                expected_word_count=block.expected_word_count,
+                grid_rows=block.grid_rows, grid_cols=block.grid_cols,
                 storage_key=destination_key, original_filename=block.original_filename,
                 sha256=block.sha256, size_bytes=block.size_bytes,
             ))
+        experiment.current_revision_id = revision.id
         database.commit()
         database.refresh(revision)
         return revision
@@ -472,6 +1028,9 @@ def duplicate_experiment(
                     name=source_block.name,
                     schema_version=source_block.schema_version,
                     app_version=source_block.app_version,
+                    expected_word_count=source_block.expected_word_count,
+                    grid_rows=source_block.grid_rows,
+                    grid_cols=source_block.grid_cols,
                     storage_key=destination_key,
                     original_filename=source_block.original_filename,
                     sha256=source_block.sha256,
@@ -530,6 +1089,9 @@ async def upload_block(
             name=block_name,
             schema_version=metadata.schema_version,
             app_version=metadata.app_version,
+            expected_word_count=metadata.expected_word_count,
+            grid_rows=metadata.grid_rows,
+            grid_cols=metadata.grid_cols,
             original_filename=filename,
             sha256=sha256,
             size_bytes=size_bytes,
@@ -705,7 +1267,9 @@ def download_experiment_revision(
     actor: User = Depends(get_current_user),
 ):
     revision = database.scalar(
-        select(ExperimentRevision).join(Experiment).where(
+        select(ExperimentRevision)
+        .join(Experiment, ExperimentRevision.experiment_id == Experiment.id)
+        .where(
             ExperimentRevision.id == revision_id,
             Experiment.owner_id == actor.id,
             Experiment.archived_at.is_(None),
@@ -724,7 +1288,20 @@ def download_experiment(
     actor: User = Depends(get_current_user),
 ):
     experiment = _owned_experiment(database, actor, experiment_id)
-    revision = max(experiment.revisions, key=lambda item: item.revision_number, default=None)
+    revision = next(
+        (
+            item
+            for item in experiment.revisions
+            if item.id == experiment.current_revision_id
+        ),
+        None,
+    )
+    if revision is None and experiment.current_revision_id is None:
+        revision = max(
+            experiment.revisions,
+            key=lambda item: item.revision_number,
+            default=None,
+        )
     if revision is not None:
         return _revision_download_response(revision, storage)
     blocks = sorted(
@@ -856,6 +1433,9 @@ async def publish_experiment_version(
             block.name = metadata.name
             block.schema_version = metadata.schema_version
             block.app_version = metadata.app_version
+            block.expected_word_count = metadata.expected_word_count
+            block.grid_rows = metadata.grid_rows
+            block.grid_cols = metadata.grid_cols
             block.storage_key = storage_key
             block.original_filename = filename
             block.sha256 = sha256
@@ -869,6 +1449,9 @@ async def publish_experiment_version(
                 name=metadata.name,
                 schema_version=metadata.schema_version,
                 app_version=metadata.app_version,
+                expected_word_count=metadata.expected_word_count,
+                grid_rows=metadata.grid_rows,
+                grid_cols=metadata.grid_cols,
                 storage_key=storage_key,
                 original_filename=filename,
                 sha256=sha256,

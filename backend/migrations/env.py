@@ -5,6 +5,7 @@ from sqlalchemy import engine_from_config, pool
 
 from app.config import get_settings
 from app.models import Base
+from app import security_models  # noqa: F401 -- register standalone security tables
 
 
 config = context.config

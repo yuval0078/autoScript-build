@@ -4,6 +4,7 @@ from .config import get_settings
 from .database import get_session_factory
 from .models import User
 from .services.auth import hash_password
+from .services.object_cleanup import drain_object_deletions
 from .services.storage import get_object_storage
 
 
@@ -44,6 +45,9 @@ def main():
                 ))
                 database.commit()
                 print(f"Bootstrap administrator is ready: {settings.bootstrap_admin_username}")
+        # Analysis/result retention records object removals transactionally.
+        # Retry any storage cleanup that was interrupted by an earlier exit.
+        drain_object_deletions(database, storage)
 
 
 if __name__ == "__main__":

@@ -23,6 +23,8 @@ class RawResultMetadata:
     experiment_name: str
     source_experiment_id: str | None
     experiment_revision_id: str | None
+    experiment_revision_number: int | None
+    server_run_id: str | None
     block_name: str
     source_block_id: str | None
     block_index: int
@@ -109,6 +111,10 @@ def validate_raw_result(result_path) -> RawResultMetadata:
         raise RawResultValidationError(
             "Completed word count cannot exceed expected word count."
         )
+    if payload["schema_version"] in {"1.2", "1.3"} and completed_word_count != len(payload["words"]):
+        raise RawResultValidationError(
+            "Completed word count must equal the number of stored word records."
+        )
     block_completed = bool(
         payload.get("block_completed", completed_word_count == expected_word_count)
     )
@@ -129,6 +135,14 @@ def validate_raw_result(result_path) -> RawResultMetadata:
         experiment_revision_id=(
             None if payload.get("experiment_revision_id") is None
             else str(payload["experiment_revision_id"])
+        ),
+        experiment_revision_number=(
+            None if payload.get("experiment_revision_number") is None
+            else int(payload["experiment_revision_number"])
+        ),
+        server_run_id=(
+            None if payload.get("server_run_id") is None
+            else str(payload["server_run_id"])
         ),
         block_name=payload.get("block_name") or payload["experiment_name"],
         source_block_id=None if source_block_id is None else str(source_block_id),

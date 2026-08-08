@@ -11,7 +11,10 @@ import uuid
 from pathlib import Path
 from app_paths import ensure_dir, user_data_dir
 from archive_utils import safe_extract_zip
-from project_version import APP_VERSION
+from component_versions import get_component_version
+
+
+BUILDER_VERSION = get_component_version("builder")
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton, 
                              QLabel, QFileDialog, QListWidget, QListWidgetItem, 
                              QTextEdit, QMessageBox, QGroupBox, QSplitter, 
@@ -2226,7 +2229,7 @@ class ExperimentPropertiesPage(QWidget):
             config = {
                 "schema_version": "2.0",
                 "package_type": "block",
-                "app_version": APP_VERSION,
+                "app_version": BUILDER_VERSION,
                 "name": exp_name,
                 "block_name": exp_name,
                 "grid": {"rows": self.spin_rows.value(), "cols": self.spin_cols.value()},
