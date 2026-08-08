@@ -9,11 +9,19 @@ import hashlib
 import json
 import os
 import re
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+# Direct execution sets sys.path[0] to ``scripts`` rather than the repository
+# root.  The release workflow intentionally invokes this file directly, so
+# make the shared version contract importable in that mode as well.
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+if str(REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPOSITORY_ROOT))
 
 from component_versions import COMPONENT_NAMES, parse_component_version
 
