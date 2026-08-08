@@ -8,7 +8,7 @@ importing the Runner application merely to prepare a launch.
 
 from __future__ import annotations
 
-import os
+from pathlib import Path
 
 
 SESSION_SEED_SUFFIX = ".autoscript_session_seed"
@@ -17,7 +17,10 @@ SESSION_SEED_SUFFIX = ".autoscript_session_seed"
 def session_seed_path(config_path: str) -> str:
     """Return the stable sidecar path for an extracted Block config."""
 
-    return f"{os.path.abspath(config_path)}{SESSION_SEED_SUFFIX}"
+    # ``tempfile`` may expose an 8.3 path on Windows while other callers use
+    # the long form of the same directory.  Resolve once so both processes
+    # address the same sidecar regardless of which spelling they received.
+    return f"{Path(config_path).resolve()}{SESSION_SEED_SUFFIX}"
 
 
 def write_runtime_session_seed(config_path: str, session_seed: str) -> None:

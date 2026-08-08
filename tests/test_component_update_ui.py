@@ -119,7 +119,8 @@ class ComponentUpdateUiTests(unittest.TestCase):
                 executable=empty.root / "AutoScriptLauncher.exe",
                 legacy_executable="Builder.exe",
             )
-            self.assertEqual(fallback, [str(legacy), "--new"])
+            self.assertEqual(fallback[1:], ["--new"])
+            self.assertTrue(Path(fallback[0]).samefile(legacy))
 
     def test_launcher_delegates_without_embedding_credentials(self):
         with patch(
