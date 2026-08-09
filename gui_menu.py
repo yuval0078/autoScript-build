@@ -19,7 +19,7 @@ from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
                              QDialog, QToolButton, QMenu, QGridLayout,
                              QCheckBox, QInputDialog, QFrame, QScrollArea,
                              QLineEdit, QSizePolicy)
-from PyQt5.QtCore import Qt, QSize
+from PyQt5.QtCore import Qt, QSize, QSettings
 from PyQt5.QtGui import QFont, QIcon, QPixmap, QPainter, QColor
 
 
@@ -172,7 +172,12 @@ def _can_join_boundary(experiments, joined_boundaries, boundary_index):
     return total_words <= (rows * cols)
 
 
-def build_session_layout(experiments, joined_boundaries=None, recalibrate_between_pages=False):
+def build_session_layout(
+    experiments,
+    joined_boundaries=None,
+    recalibrate_between_pages=False,
+    save_results_locally=True,
+):
     """Build per-experiment page layout metadata for the session runner."""
     joined_boundaries = set(joined_boundaries or set())
     normalized_joins = {
@@ -225,6 +230,7 @@ def build_session_layout(experiments, joined_boundaries=None, recalibrate_betwee
     refresh_count = max(0, total_pages - 1)
     return {
         'recalibrate_between_pages': bool(recalibrate_between_pages and refresh_count > 0),
+        'save_results_locally': bool(save_results_locally),
         'page_count': total_pages,
         'refresh_count': refresh_count,
         'experiments': layout_entries,
@@ -236,16 +242,15 @@ def build_block_session_layout(
     blocks,
     recalibrate_between_blocks=False,
     joined_boundaries=None,
+    save_results_locally=True,
 ):
-    """Build a fixed-order Block plan with optional boundary-only recalibration."""
-    plan = build_session_layout(
+    """Build a fixed-order Block plan with optional per-page recalibration."""
+    return build_session_layout(
         blocks,
         joined_boundaries=joined_boundaries,
         recalibrate_between_pages=recalibrate_between_blocks,
+        save_results_locally=save_results_locally,
     )
-    for entry in plan.get("experiments", []):
-        entry["recalibrate_during_page_refresh"] = False
-    return plan
 
 
 class CombineToggleButton(QPushButton):
@@ -295,7 +300,14 @@ class CombineToggleButton(QPushButton):
 class ArrangeExperimentsDialog(QDialog):
     """Dialog for ordering local/legacy Blocks before a run."""
     
-    def __init__(self, experiments, parent=None, joined_boundaries=None):
+    def __init__(
+        self,
+        experiments,
+        parent=None,
+        joined_boundaries=None,
+        recalibrate_between_blocks=False,
+        save_results_locally=True,
+    ):
         super().__init__(parent)
         self.setWindowTitle("Arrange Blocks")
         self.experiments = [dict(exp) for exp in experiments]
@@ -309,6 +321,8 @@ class ArrangeExperimentsDialog(QDialog):
                 self.joined_boundaries.add(boundary_index)
         self.selected_index = 0
         self.has_page_refreshes = False
+        self.recalibrate_between_blocks = bool(recalibrate_between_blocks)
+        self.save_results_locally = bool(save_results_locally)
         
         layout = QVBoxLayout(self)
         layout.addWidget(QLabel("Choose the Block order for this experiment:"))
@@ -317,14 +331,6 @@ class ArrangeExperimentsDialog(QDialog):
         self.session_summary.setWordWrap(True)
         self.session_summary.setStyleSheet("color: #46505a; font-size: 12px;")
         layout.addWidget(self.session_summary)
-
-        self.recalibrate_toggle = QCheckBox("Re-calibrate between Blocks")
-        self.recalibrate_toggle.setChecked(True)
-        self.recalibrate_toggle.setToolTip(
-            "If enabled, a fresh calibration opens before the next Block starts."
-        )
-        self.recalibrate_toggle.toggled.connect(self._refresh_preview)
-        layout.addWidget(self.recalibrate_toggle)
 
         self.order_widget = QWidget()
         self.order_layout = QGridLayout(self.order_widget)
@@ -428,13 +434,13 @@ class ArrangeExperimentsDialog(QDialog):
     def _refresh_preview(self):
         preview = build_block_session_layout(
             self.experiments,
-            recalibrate_between_blocks=self.recalibrate_toggle.isChecked(),
+            recalibrate_between_blocks=self.recalibrate_between_blocks,
             joined_boundaries=self.joined_boundaries,
+            save_results_locally=self.save_results_locally,
         )
         refresh_count = preview.get('refresh_count', 0)
         page_count = preview.get('page_count', 0)
         self.has_page_refreshes = refresh_count > 0
-        self.recalibrate_toggle.setVisible(refresh_count > 0)
         self.session_summary.setText(
             f"Session preview: {len(self.experiments)} Blocks, "
             f"{page_count} page{'s' if page_count != 1 else ''}, "
@@ -466,9 +472,10 @@ class ArrangeExperimentsDialog(QDialog):
         return build_block_session_layout(
             self.experiments,
             recalibrate_between_blocks=(
-                self.recalibrate_toggle.isChecked() and self.has_page_refreshes
+                self.recalibrate_between_blocks and self.has_page_refreshes
             ),
             joined_boundaries=self.joined_boundaries,
+            save_results_locally=self.save_results_locally,
         )
 
 
@@ -481,6 +488,7 @@ class MainMenu(QWidget):
         self.api = AutoScriptAPI(timeout=10)
         self.experiments = []
         self.experiment_cards = []
+        self.run_settings = QSettings("AutoScript", "Interface")
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(38, 28, 38, 28)
@@ -525,6 +533,65 @@ class MainMenu(QWidget):
         header.addWidget(new_experiment)
         layout.addLayout(header)
 
+        settings_frame = QFrame()
+        settings_frame.setObjectName("runSettings")
+        settings_frame.setStyleSheet(
+            "QFrame#runSettings { background: #f7fafc; border: 1px solid #d7e1ea; "
+            "border-radius: 9px; } "
+            "QCheckBox { color: #263746; font-size: 13px; spacing: 8px; } "
+            "QCheckBox::indicator { width: 34px; height: 18px; border-radius: 9px; "
+            "background: #a9b6c2; } "
+            "QCheckBox::indicator:checked { background: #2d74b8; }"
+        )
+        settings_layout = QHBoxLayout(settings_frame)
+        settings_layout.setContentsMargins(14, 10, 14, 10)
+        settings_layout.setSpacing(22)
+
+        settings_title = QLabel("Run settings")
+        settings_title.setStyleSheet(
+            "font-size: 14px; font-weight: 650; color: #172230; border: 0;"
+        )
+        settings_layout.addWidget(settings_title)
+
+        self.recalibrate_between_blocks_toggle = QCheckBox(
+            "Re-calibrate between pages"
+        )
+        self.recalibrate_between_blocks_toggle.setObjectName(
+            "recalibrateBetweenBlocksToggle"
+        )
+        self.recalibrate_between_blocks_toggle.setToolTip(
+            "Open a fresh calibration before a Block that starts on a new page."
+        )
+        self.recalibrate_between_blocks_toggle.setChecked(
+            self._stored_bool("run/recalibrate_between_blocks", True)
+        )
+        self.recalibrate_between_blocks_toggle.toggled.connect(
+            lambda checked: self.run_settings.setValue(
+                "run/recalibrate_between_blocks", bool(checked)
+            )
+        )
+        settings_layout.addWidget(self.recalibrate_between_blocks_toggle)
+
+        self.save_results_locally_toggle = QCheckBox(
+            "Save result data locally after run"
+        )
+        self.save_results_locally_toggle.setObjectName("saveResultsLocallyToggle")
+        self.save_results_locally_toggle.setToolTip(
+            "Automatically keep a local JSON copy after every run in "
+            f"{user_data_dir() / 'results'}. Cloud saving is always enabled."
+        )
+        self.save_results_locally_toggle.setChecked(
+            self._stored_bool("run/save_results_locally", True)
+        )
+        self.save_results_locally_toggle.toggled.connect(
+            lambda checked: self.run_settings.setValue(
+                "run/save_results_locally", bool(checked)
+            )
+        )
+        settings_layout.addWidget(self.save_results_locally_toggle)
+        settings_layout.addStretch()
+        layout.addWidget(settings_frame)
+
         self.search = QLineEdit()
         self.search.setPlaceholderText("Search experiments…")
         self.search.setClearButtonEnabled(True)
@@ -552,6 +619,18 @@ class MainMenu(QWidget):
         layout.addWidget(scroll, 1)
 
         self.refresh_experiments()
+
+    def _stored_bool(self, key, default):
+        value = self.run_settings.value(key, default)
+        if isinstance(value, str):
+            return value.strip().casefold() in {"1", "true", "yes", "on"}
+        return bool(value)
+
+    def _run_recalibration_enabled(self):
+        return self.recalibrate_between_blocks_toggle.isChecked()
+
+    def _local_result_save_enabled(self):
+        return self.save_results_locally_toggle.isChecked()
 
     @staticmethod
     def _icon_button_style(color):
@@ -857,6 +936,8 @@ class MainMenu(QWidget):
                     experiments,
                     self,
                     joined_boundaries=joined_boundaries,
+                    recalibrate_between_blocks=self._run_recalibration_enabled(),
+                    save_results_locally=self._local_result_save_enabled(),
                 )
                 if arrange_dialog.exec_() != QDialog.Accepted:
                     return
@@ -864,24 +945,11 @@ class MainMenu(QWidget):
                 session_plan = arrange_dialog.session_plan()
                 QApplication.setOverrideCursor(Qt.WaitCursor)
             else:
-                recalibrate_between_blocks = False
-                if len(experiments) > 1:
-                    QApplication.restoreOverrideCursor()
-                    answer = QMessageBox.question(
-                        self,
-                        "Re-calibrate Between Blocks",
-                        "This experiment contains multiple Blocks.\n\n"
-                        "Re-calibrate before each next Block?",
-                        QMessageBox.Yes | QMessageBox.No,
-                        QMessageBox.Yes,
-                    )
-                    recalibrate_between_blocks = answer == QMessageBox.Yes
-                    QApplication.setOverrideCursor(Qt.WaitCursor)
-
                 session_plan = build_block_session_layout(
                     experiments,
-                    recalibrate_between_blocks=recalibrate_between_blocks,
+                    recalibrate_between_blocks=self._run_recalibration_enabled(),
                     joined_boundaries=joined_boundaries,
+                    save_results_locally=self._local_result_save_enabled(),
                 )
 
             for final_block_index, experiment in enumerate(experiments, start=1):
@@ -921,11 +989,13 @@ class MainMenu(QWidget):
                 refresh_count = session_plan.get('refresh_count', 0)
                 page_count = session_plan.get('page_count', 0)
                 recalibration_label = "on" if session_plan.get('recalibrate_between_pages') else "off"
+                local_save_label = "on" if session_plan.get('save_results_locally') else "off"
                 msg = (
                     f"Experiment Loaded: {session_name}\n\n"
                     + "\n".join(summaries)
                     + f"\n\n{len(experiments)} Blocks, {page_count} pages, {refresh_count} refreshes."
-                    + f"\nRe-calibrate between Blocks: {recalibration_label}."
+                    + f"\nRe-calibrate between pages: {recalibration_label}."
+                    + f"\nSave result data locally: {local_save_label}."
                     + f"\n\nClick OK to start in {run_label}."
                 )
                 QMessageBox.information(self, "Experiment Info", msg)

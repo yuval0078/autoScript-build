@@ -33,6 +33,15 @@ SPEC_ROOT = ROOT / "packaging" / "pyinstaller"
 
 
 class RunnerLaunchContractTests(unittest.TestCase):
+    def test_main_menu_exposes_persistent_run_settings(self):
+        source = (ROOT / "gui_menu.py").read_text(encoding="utf-8")
+
+        self.assertIn('QSettings("AutoScript", "Interface")', source)
+        self.assertIn('"recalibrateBetweenBlocksToggle"', source)
+        self.assertIn('"saveResultsLocallyToggle"', source)
+        self.assertIn('"run/recalibrate_between_blocks"', source)
+        self.assertIn('"run/save_results_locally"', source)
+
     def test_experiment_card_metadata_pluralizes_blocks_and_distinct_participants(self):
         self.assertEqual(
             experiment_card_metadata(

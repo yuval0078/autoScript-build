@@ -12,6 +12,7 @@ from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtWidgets import (
     QApplication,
     QCheckBox,
+    QDialog,
     QFileDialog,
     QFrame,
     QHBoxLayout,
@@ -27,39 +28,47 @@ from app_paths import ensure_dir, user_data_dir
 from autoscript_api import APIError, AutoScriptAPI
 
 
-def run_status(run):
-    """Return semantic status, color, and explicit human-readable labels."""
-    if not run.get("complete", False):
-        return (
-            "incomplete",
-            "#c62828",
-            "#fff0f0",
-            "Data incomplete",
-            _analysis_label(run),
-        )
-    if run.get("analysis_completed") is not True:
-        return (
-            "analysis_pending",
-            "#b26a00",
-            "#fff7e3",
-            "Data complete",
-            _analysis_label(run),
-        )
-    return (
-        "complete",
-        "#237a3b",
-        "#eef9f0",
-        "Data complete",
-        "Analysis completed",
+ARTIFACT_TAGS = (
+    ("raw_data", "Raw data"),
+    ("analysis_csv", "Analyzed CSV"),
+    ("trainable_json", "Trainable Json"),
+)
+
+
+def cloud_file_count(run, kind):
+    """Return an artifact count while remaining compatible with older APIs."""
+    count_key = {
+        "raw_data": "raw_data_count",
+        "analysis_csv": "analyzed_csv_count",
+        "trainable_json": "trainable_json_count",
+    }[kind]
+    if count_key in run:
+        try:
+            return max(0, int(run[count_key]))
+        except (TypeError, ValueError):
+            return 0
+    if kind == "raw_data":
+        return len(run.get("results", []))
+    return sum(
+        1 for artifact in run.get("artifacts", []) if artifact.get("kind") == kind
     )
 
 
-def _analysis_label(run):
-    if run.get("analysis_completed") is True:
-        return "Analysis completed"
-    if run.get("analysis_completed") is False:
-        return "Analysis not completed"
-    return "Analysis not started"
+def run_cloud_file_tags(run):
+    """Return the visible cloud-file tags for one participant run."""
+    return [
+        (kind, label, cloud_file_count(run, kind))
+        for kind, label in ARTIFACT_TAGS
+        if cloud_file_count(run, kind) > 0
+    ]
+
+
+def analysis_copy_count(run):
+    """Best available estimate of saved analysis versions for Analyzer UX."""
+    return max(
+        cloud_file_count(run, "analysis_csv"),
+        cloud_file_count(run, "trainable_json"),
+    )
 
 
 def format_run_datetime(value):
@@ -127,7 +136,7 @@ class ExperimentResultsPage(QWidget):
             "↓ Analyzed CSV", lambda: self.download_artifacts("analysis_csv"), "#16788c"
         )
         self.training_button = self._toolbar_button(
-            "↓ Training JSON", lambda: self.download_artifacts("trainable_json"), "#6b4ca5"
+            "↓ Trainable Json", lambda: self.download_artifacts("trainable_json"), "#6b4ca5"
         )
         self.analyze_button = self._toolbar_button(
             "▶ Analyze selected", self.analyze_selected, "#198a43"
@@ -157,7 +166,7 @@ class ExperimentResultsPage(QWidget):
         column_layout.addWidget(self.select_all)
         column_layout.addSpacing(18)
         column_layout.addWidget(QLabel("Participant / run"), 1)
-        column_layout.addWidget(QLabel("Status"))
+        column_layout.addWidget(QLabel("Cloud files / actions"))
         layout.addWidget(column_header)
 
         self.status_label = QLabel("No participant runs yet.")
@@ -236,12 +245,11 @@ class ExperimentResultsPage(QWidget):
         self._update_actions()
 
     def _build_run_row(self, run):
-        _status, color, background, data_label, analysis_label = run_status(run)
         card = QFrame()
         card.setObjectName("resultCard")
         card.setStyleSheet(
-            f"QFrame#resultCard {{ background: {background}; border: 1px solid {color}; "
-            "border-radius: 9px; }}"
+            "QFrame#resultCard { background: white; border: 1px solid #d6e0e9; "
+            "border-radius: 9px; }"
         )
         row = QHBoxLayout(card)
         row.setContentsMargins(14, 11, 14, 11)
@@ -269,21 +277,65 @@ class ExperimentResultsPage(QWidget):
         row.addLayout(identity, 1)
 
         status_area = QVBoxLayout()
+        status_area.setSpacing(5)
         blocks = f"{run.get('result_count', 0)}/{run.get('block_count', 0)} Blocks"
         words = (
             f"{run.get('completed_word_count', 0)}/"
             f"{run.get('expected_word_count', 0)} words"
         )
-        data = QLabel(f"{data_label} — {words}, {blocks}")
+        completeness = "Data complete" if run.get("complete", False) else "Data incomplete"
+        data = QLabel(f"{completeness} — {words}, {blocks}")
         data.setAlignment(Qt.AlignRight)
-        data.setStyleSheet(f"font-weight: 700; color: {color};")
-        analysis = QLabel(analysis_label)
-        analysis.setAlignment(Qt.AlignRight)
-        analysis.setStyleSheet(f"color: {color};")
+        data.setStyleSheet("font-weight: 650; color: #536578;")
         status_area.addWidget(data)
-        status_area.addWidget(analysis)
+
+        tags = QHBoxLayout()
+        tags.setSpacing(6)
+        tags.addStretch()
+        for kind, label, _count in run_cloud_file_tags(run):
+            tags.addWidget(self._build_file_tag(run, kind, label))
+        status_area.addLayout(tags)
         row.addLayout(status_area)
+
+        analyze = QPushButton("Analyze")
+        analyze.setToolTip("Analyze only this participant run")
+        analyze.setStyleSheet(self._button_style("#198a43"))
+        analyze.setEnabled(cloud_file_count(run, "raw_data") > 0)
+        analyze.clicked.connect(lambda _checked=False, item=run: self.analyze_run(item))
+        row.addWidget(analyze)
         return card
+
+    def _build_file_tag(self, run, kind, label):
+        tag = QFrame()
+        tag.setObjectName("fileTag")
+        tag.setStyleSheet(
+            "QFrame#fileTag { background: #edf4fa; border: 1px solid #c8d9e8; "
+            "border-radius: 10px; }"
+        )
+        layout = QHBoxLayout(tag)
+        layout.setContentsMargins(8, 2, 3, 2)
+        layout.setSpacing(4)
+        text = QLabel(label)
+        text.setStyleSheet("color: #31536f; font-size: 11px; font-weight: 650;")
+        layout.addWidget(text)
+        download = QPushButton("↓")
+        download.setToolTip(f"Download {label}")
+        download.setFixedSize(23, 20)
+        download.setStyleSheet(
+            "QPushButton { border: 0; border-radius: 7px; color: #245f91; "
+            "font-weight: 800; } QPushButton:hover { background: #d6e8f6; }"
+        )
+        if kind == "raw_data":
+            download.clicked.connect(
+                lambda _checked=False, item=run: self._download_raw_runs([item])
+            )
+        else:
+            download.clicked.connect(
+                lambda _checked=False, item=run, artifact_kind=kind:
+                self.download_run_artifacts(item, artifact_kind)
+            )
+        layout.addWidget(download)
+        return tag
 
     def _selection_changed(self, run_id, state):
         if state == Qt.Checked:
@@ -333,7 +385,16 @@ class ExperimentResultsPage(QWidget):
         runs = self._selected_runs()
         if not runs:
             return
+        self._download_raw_runs(runs)
+
+    def _download_raw_runs(self, runs):
         default_name = f"{self._safe_name(self.experiment['name'])}_raw_results.zip"
+        if len(runs) == 1:
+            run = runs[0]
+            default_name = (
+                f"participant_{run['participant_number']}_"
+                f"{self._safe_name(run['session_id'])}_raw_data.zip"
+            )
         save_path, _ = QFileDialog.getSaveFileName(
             self, "Download Raw Results", default_name, "ZIP Files (*.zip)"
         )
@@ -365,74 +426,297 @@ class ExperimentResultsPage(QWidget):
             output_path.unlink(missing_ok=True)
             QMessageBox.critical(self, "Download Failed", str(exc))
 
-    def _latest_artifact(self, run, kind):
-        return next(
-            (artifact for artifact in run.get("artifacts", []) if artifact["kind"] == kind),
-            None,
+    def _analysis_copies(self, run, kind):
+        """Load versioned exports, with a flat-artifact fallback for older servers."""
+        try:
+            revisions = self.api.list_run_analysis_copies(run["id"])
+        except APIError as exc:
+            if exc.status_code != 404:
+                raise
+            revisions = []
+
+        copies = []
+        seen_artifacts = set()
+        field = "analyzed_csv" if kind == "analysis_csv" else "trainable_json"
+        for revision in revisions:
+            artifact = revision.get(field)
+            if not artifact:
+                continue
+            seen_artifacts.add(str(artifact.get("id")))
+            copies.append({**revision, "artifact": artifact, "legacy": False})
+
+        for artifact in run.get("artifacts", []):
+            if artifact.get("kind") != kind or str(artifact.get("id")) in seen_artifacts:
+                continue
+            copies.append({
+                "id": None,
+                "revision": None,
+                "created_at": artifact.get("created_at"),
+                "completed": run.get("analysis_completed"),
+                "is_current_editable": False,
+                "artifact": artifact,
+                "legacy": True,
+            })
+        copies.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
+        return copies
+
+    @staticmethod
+    def _artifact_details(kind):
+        if kind == "analysis_csv":
+            return "Analyzed CSV", ".csv", "analysis_csv"
+        return "Trainable Json", ".json", "trainable_json"
+
+    def _copy_filename(self, run, copy, kind, *, include_version=False):
+        _label, suffix, stem = self._artifact_details(kind)
+        filename = (
+            f"participant_{run['participant_number']}_"
+            f"{self._safe_name(run['session_id'])}_{stem}"
         )
+        if include_version:
+            created = self._safe_name(
+                format_run_datetime(copy.get("created_at")).replace(" ", "_").replace(":", "-")
+            )
+            revision = copy.get("revision")
+            filename += f"_{'r' + str(revision) if revision is not None else 'legacy'}_{created}"
+        return filename + suffix
+
+    def _download_artifact_entries(self, entries, kind, *, include_versions=False):
+        label, suffix, stem = self._artifact_details(kind)
+        if len(entries) == 1 and not include_versions:
+            run, copy = entries[0]
+            save_path, _ = QFileDialog.getSaveFileName(
+                self,
+                f"Download {label}",
+                self._copy_filename(run, copy, kind),
+                f"{label} (*{suffix})",
+            )
+            if not save_path:
+                return
+            output_path = Path(save_path).with_suffix(suffix)
+            self.api.download_run_artifact(copy["artifact"], output_path)
+        else:
+            default_name = f"{self._safe_name(self.experiment['name'])}_{stem}.zip"
+            save_path, _ = QFileDialog.getSaveFileName(
+                self, f"Download {label}", default_name, "ZIP Files (*.zip)"
+            )
+            if not save_path:
+                return
+            output_path = Path(save_path).with_suffix(".zip")
+            with tempfile.TemporaryDirectory(prefix="autoscript-artifact-export-") as temp_dir:
+                temp_root = Path(temp_dir)
+                with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as archive:
+                    for run, copy in entries:
+                        local_path = temp_root / f"{uuid.uuid4().hex}{suffix}"
+                        self.api.download_run_artifact(copy["artifact"], local_path)
+                        archive.write(
+                            local_path,
+                            self._copy_filename(
+                                run, copy, kind, include_version=include_versions
+                            ),
+                        )
+        QMessageBox.information(self, "Download Complete", f"Saved to:\n{output_path}")
+
+    def _download_artifact_entries_safely(
+        self, entries, kind, *, include_versions=False
+    ):
+        try:
+            self._download_artifact_entries(
+                entries, kind, include_versions=include_versions
+            )
+        except (APIError, OSError, ValueError) as exc:
+            QMessageBox.critical(self, "Download Failed", str(exc))
+
+    def download_run_artifacts(self, run, kind):
+        try:
+            copies = self._analysis_copies(run, kind)
+            if not copies:
+                raise ValueError("The requested cloud file is no longer available.")
+            if len(copies) > 1:
+                self._show_analysis_copies(run, kind, copies)
+            else:
+                self._download_artifact_entries([(run, copies[0])], kind)
+        except (APIError, OSError, ValueError) as exc:
+            QMessageBox.critical(self, "Download Failed", str(exc))
 
     def download_artifacts(self, kind):
         runs = self._selected_runs()
         if not runs:
             return
-        artifacts = [(run, self._latest_artifact(run, kind)) for run in runs]
-        missing = [run for run, artifact in artifacts if artifact is None]
-        if missing:
-            names = ", ".join(str(run["participant_number"]) for run in missing)
-            QMessageBox.warning(
-                self,
-                "Analysis Export Unavailable",
-                f"No {'CSV' if kind == 'analysis_csv' else 'training JSON'} is stored "
-                f"for participant(s): {names}.\n\nAnalyze them first and close the Analyzer.",
-            )
-            return
-
-        suffix = ".csv" if kind == "analysis_csv" else ".json"
-        label = "Analyzed CSV" if kind == "analysis_csv" else "Training JSON"
         try:
-            if len(artifacts) == 1:
-                run, artifact = artifacts[0]
-                default_name = (
-                    f"participant_{run['participant_number']}_"
-                    f"{self._safe_name(run['session_id'])}{suffix}"
+            copies_by_run = [(run, self._analysis_copies(run, kind)) for run in runs]
+            missing = [run for run, copies in copies_by_run if not copies]
+            if missing:
+                names = ", ".join(str(run["participant_number"]) for run in missing)
+                QMessageBox.warning(
+                    self,
+                    "Analysis Export Unavailable",
+                    f"No {self._artifact_details(kind)[0]} is stored for "
+                    f"participant(s): {names}.",
                 )
-                save_path, _ = QFileDialog.getSaveFileName(
-                    self, f"Download {label}", default_name, f"*{suffix}"
-                )
-                if not save_path:
+                return
+
+            if len(copies_by_run) == 1 and len(copies_by_run[0][1]) > 1:
+                run, copies = copies_by_run[0]
+                self._show_analysis_copies(run, kind, copies)
+                return
+
+            policy = "latest"
+            if any(len(copies) > 1 for _run, copies in copies_by_run):
+                policy = self._choose_duplicate_download(copies_by_run, kind)
+                if not policy:
                     return
-                output_path = Path(save_path).with_suffix(suffix)
-                self.api.download_run_artifact(artifact, output_path)
-            else:
-                default_name = (
-                    f"{self._safe_name(self.experiment['name'])}_"
-                    f"{'analysis_csv' if kind == 'analysis_csv' else 'training_json'}.zip"
-                )
-                save_path, _ = QFileDialog.getSaveFileName(
-                    self, f"Download {label}", default_name, "ZIP Files (*.zip)"
-                )
-                if not save_path:
-                    return
-                output_path = Path(save_path).with_suffix(".zip")
-                with tempfile.TemporaryDirectory(prefix="autoscript-artifact-export-") as temp_dir:
-                    temp_root = Path(temp_dir)
-                    with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as archive:
-                        for run, artifact in artifacts:
-                            filename = (
-                                f"participant_{run['participant_number']}_"
-                                f"{self._safe_name(run['session_id'])}{suffix}"
-                            )
-                            local_path = temp_root / f"{uuid.uuid4().hex}{suffix}"
-                            self.api.download_run_artifact(artifact, local_path)
-                            archive.write(local_path, filename)
-            QMessageBox.information(self, "Download Complete", f"Saved to:\n{output_path}")
+            entries = []
+            for run, copies in copies_by_run:
+                entries.extend((run, copy) for copy in (copies if policy == "all" else copies[:1]))
+            self._download_artifact_entries(
+                entries, kind, include_versions=policy == "all"
+            )
         except (APIError, OSError, ValueError) as exc:
             QMessageBox.critical(self, "Download Failed", str(exc))
+
+    def _choose_duplicate_download(self, copies_by_run, kind):
+        label, _suffix, _stem = self._artifact_details(kind)
+        dialog = QDialog(self)
+        dialog.setWindowTitle("How to manage duplicates?")
+        dialog.setMinimumWidth(520)
+        layout = QVBoxLayout(dialog)
+        heading = QLabel(f"Multiple {label} copies are stored in the cloud.")
+        heading.setStyleSheet("font-size: 15px; font-weight: 700;")
+        layout.addWidget(heading)
+        layout.addWidget(QLabel("Choose whether this download should include the latest copy or every copy."))
+        for run, copies in copies_by_run:
+            if len(copies) < 2:
+                continue
+            dates = ", ".join(format_run_datetime(copy.get("created_at")) for copy in copies)
+            item = QLabel(
+                f"Participant {run['participant_number']} — {len(copies)} copies\n{dates}"
+            )
+            item.setWordWrap(True)
+            item.setStyleSheet("background: #f2f6f9; padding: 8px; border-radius: 6px;")
+            layout.addWidget(item)
+        buttons = QHBoxLayout()
+        buttons.addStretch()
+        latest = QPushButton("Download latest")
+        all_copies = QPushButton("Download all")
+        cancel = QPushButton("Cancel")
+        for button in (latest, all_copies, cancel):
+            buttons.addWidget(button)
+        layout.addLayout(buttons)
+        dialog.choice = None
+        latest.clicked.connect(lambda: (setattr(dialog, "choice", "latest"), dialog.accept()))
+        all_copies.clicked.connect(lambda: (setattr(dialog, "choice", "all"), dialog.accept()))
+        cancel.clicked.connect(dialog.reject)
+        dialog.exec_()
+        return dialog.choice
+
+    def _show_analysis_copies(self, run, kind, copies):
+        label, _suffix, _stem = self._artifact_details(kind)
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"{label} copies")
+        dialog.setMinimumWidth(680)
+        layout = QVBoxLayout(dialog)
+        heading = QLabel(
+            f"Participant {run['participant_number']} has {len(copies)} {label} copies."
+        )
+        heading.setStyleSheet("font-size: 15px; font-weight: 700;")
+        layout.addWidget(heading)
+        layout.addWidget(QLabel("Download a specific copy, or choose which saved analysis to edit next."))
+
+        for copy in copies:
+            copy_row = QFrame()
+            copy_row.setStyleSheet(
+                "QFrame { background: #f3f6f9; border: 1px solid #d9e2ea; border-radius: 7px; }"
+            )
+            copy_layout = QHBoxLayout(copy_row)
+            revision = copy.get("revision")
+            description = f"Created {format_run_datetime(copy.get('created_at'))}"
+            if revision is not None:
+                description = f"Revision {revision} · {description}"
+            if copy.get("is_current_editable"):
+                description += " · Current editing version"
+            copy_layout.addWidget(QLabel(description), 1)
+            download = QPushButton("Download")
+            download.clicked.connect(
+                lambda _checked=False, item=copy:
+                self._download_artifact_entries_safely([(run, item)], kind)
+            )
+            copy_layout.addWidget(download)
+            use_current = QPushButton("Use for editing")
+            use_current.setEnabled(not copy.get("legacy") and not copy.get("is_current_editable"))
+            use_current.clicked.connect(
+                lambda _checked=False, item=copy:
+                self._set_copy_editable(dialog, run, item)
+            )
+            copy_layout.addWidget(use_current)
+            delete = QPushButton("Delete")
+            delete.setEnabled(not copy.get("legacy"))
+            delete.clicked.connect(
+                lambda _checked=False, item=copy:
+                self._delete_analysis_copy(dialog, run, item)
+            )
+            copy_layout.addWidget(delete)
+            layout.addWidget(copy_row)
+
+        footer = QHBoxLayout()
+        footer.addStretch()
+        latest = QPushButton("Download latest")
+        latest.clicked.connect(
+            lambda: self._download_artifact_entries_safely([(run, copies[0])], kind)
+        )
+        all_copies = QPushButton("Download all")
+        all_copies.clicked.connect(
+            lambda: self._download_artifact_entries_safely(
+                [(run, copy) for copy in copies], kind, include_versions=True
+            )
+        )
+        close = QPushButton("Close")
+        close.clicked.connect(dialog.accept)
+        for button in (latest, all_copies, close):
+            footer.addWidget(button)
+        layout.addLayout(footer)
+        dialog.exec_()
+
+    def _set_copy_editable(self, dialog, run, copy):
+        try:
+            self.api.set_run_analysis_copy_editable(run["id"], copy["id"])
+            dialog.accept()
+            self.refresh_runs()
+            QMessageBox.information(
+                self,
+                "Editing Version Updated",
+                "This analysis will be restored the next time the participant is opened in Analyzer.",
+            )
+        except APIError as exc:
+            QMessageBox.critical(self, "Update Failed", str(exc))
+
+    def _delete_analysis_copy(self, dialog, run, copy):
+        answer = QMessageBox.warning(
+            self,
+            "Delete Analyzed Copy",
+            "Permanently delete this analyzed CSV, trainable JSON, and its saved edit state?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        try:
+            self.api.delete_run_analysis_copy(run["id"], copy["id"])
+            dialog.accept()
+            self.refresh_runs()
+        except APIError as exc:
+            QMessageBox.critical(self, "Delete Failed", str(exc))
 
     def analyze_selected(self):
         runs = self._selected_runs()
         if not runs:
             return
+        self._analyze_runs(runs)
+
+    def analyze_run(self, run):
+        """Launch Analyzer with exactly one participant run."""
+        self._analyze_runs([run])
+
+    def _analyze_runs(self, runs):
         try:
             workspace = ensure_dir(
                 user_data_dir()
@@ -447,6 +731,7 @@ class ExperimentResultsPage(QWidget):
                 context_run = {
                     "id": run["id"],
                     "session_id": run["session_id"],
+                    "analysis_copy_count": analysis_copy_count(run),
                     "analysis_etag": None,
                     "analysis_revision": 0,
                     "results": [],

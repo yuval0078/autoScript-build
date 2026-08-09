@@ -1627,7 +1627,7 @@ class PenDataPlayer(QMainWindow):
             print(f"Manual cloud association was unavailable: {exc}")
             return False
 
-    def _finalize_cloud_analysis(self, completed):
+    def _finalize_cloud_analysis(self, completed=True, existing_policy="keep"):
         if not self.analysis_context:
             return
         if self.current_word_index >= 0:
@@ -1687,9 +1687,64 @@ class PenDataPlayer(QMainWindow):
                 trainable_path=json_path,
             )
             enqueue_analysis_finalize(
-                run['id'], bundle_path, base_etag=run.get('analysis_etag')
+                run['id'],
+                bundle_path,
+                base_etag=run.get('analysis_etag'),
+                existing_policy=existing_policy,
             )
         return drain_analysis_queue(api)
+
+    def _has_existing_analysis_copies(self):
+        cached = any(
+            int(run.get('analysis_copy_count', 0) or 0) > 0
+            for run in (self.analysis_context or {}).get('runs', [])
+        )
+        if cached:
+            return True
+        try:
+            from autoscript_api import AutoScriptAPI
+
+            api = AutoScriptAPI(
+                base_url=(self.analysis_context or {}).get('api_url'),
+                timeout=15,
+            )
+            return any(
+                bool(api.list_run_analysis_copies(run['id']))
+                for run in (self.analysis_context or {}).get('runs', [])
+            )
+        except Exception as exc:
+            # The durable sync queue still preserves a new export while offline.
+            # With no known prior copy, keeping versions is the lossless fallback.
+            print(f"Could not refresh existing analysis copies: {exc}")
+            return False
+
+    def _choose_existing_analysis_policy(self):
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Question)
+        dialog.setWindowTitle("Existing analyzed files")
+        dialog.setText(
+            "Analyzed CSV and trainable JSON files already exist for one or "
+            "more selected participants."
+        )
+        dialog.setInformativeText(
+            "Replace the existing analyzed copies, or keep them together with "
+            "this new version?"
+        )
+        replace_button = dialog.addButton(
+            "Replace existing", QMessageBox.AcceptRole
+        )
+        keep_button = dialog.addButton(
+            "Keep all versions", QMessageBox.ActionRole
+        )
+        dialog.addButton(QMessageBox.Cancel)
+        dialog.setDefaultButton(keep_button)
+        dialog.exec_()
+        clicked = dialog.clickedButton()
+        if clicked is replace_button:
+            return "replace"
+        if clicked is keep_button:
+            return "keep"
+        return None
 
     def closeEvent(self, event):
         if not self.analysis_context:
@@ -1704,16 +1759,30 @@ class PenDataPlayer(QMainWindow):
             return
         answer = QMessageBox.question(
             self,
-            "Analysis Status",
-            "Is the analysis completed for the selected participant run(s)?\n\n"
-            "Choose No to save the current analysis as not completed.",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
+            "Save Analysis Exports",
+            "Save analyzed CSV and trainable JSON?\n\n"
+            "Choose No to save only the current editable analysis state.",
+            QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
+            QMessageBox.Yes,
         )
-        completed = answer == QMessageBox.Yes
+        if answer == QMessageBox.Cancel:
+            event.ignore()
+            return
+        existing_policy = "keep"
+        if answer == QMessageBox.Yes and self._has_existing_analysis_copies():
+            existing_policy = self._choose_existing_analysis_policy()
+            if existing_policy is None:
+                event.ignore()
+                return
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
-            _count, errors, _outcomes = self._finalize_cloud_analysis(completed)
+            if answer == QMessageBox.Yes:
+                _count, errors, _outcomes = self._finalize_cloud_analysis(
+                    completed=True,
+                    existing_policy=existing_policy,
+                )
+            else:
+                errors = self._save_cloud_analysis_state() or []
             self.analysis_context_saved = True
             if errors:
                 QMessageBox.information(

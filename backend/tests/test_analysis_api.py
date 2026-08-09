@@ -361,6 +361,193 @@ class AnalysisApiTests(unittest.TestCase):
         )
         self.assertEqual(still_current.headers["etag"], finalized.headers["etag"])
 
+    def test_finalized_copies_can_be_listed_downloaded_restored_and_deleted(self):
+        draft = self.put_state(self.state())
+        self.assertEqual(draft.status_code, 200, draft.text)
+        first = self.client.post(
+            f"/api/v1/runs/{self.run['id']}/analysis/finalize",
+            content=self.bundle_bytes(self.state(), completed=True),
+            headers={
+                "Content-Type": "application/zip",
+                "X-Idempotency-Key": str(uuid.uuid4()),
+                "If-Match": draft.headers["etag"],
+            },
+        )
+        self.assertEqual(first.status_code, 200, first.text)
+        second = self.client.post(
+            f"/api/v1/runs/{self.run['id']}/analysis/finalize",
+            content=self.bundle_bytes(self.state(), completed=False),
+            headers={
+                "Content-Type": "application/zip",
+                "X-Idempotency-Key": str(uuid.uuid4()),
+                "If-Match": first.headers["etag"],
+            },
+        )
+        self.assertEqual(second.status_code, 200, second.text)
+
+        run = self.client.get(f"/api/v1/runs/{self.run['id']}").json()
+        self.assertEqual(run["raw_data_count"], 1)
+        self.assertEqual(run["analyzed_csv_count"], 2)
+        self.assertEqual(run["trainable_json_count"], 2)
+
+        copies = self.client.get(
+            f"/api/v1/runs/{self.run['id']}/analysis-copies"
+        )
+        self.assertEqual(copies.status_code, 200, copies.text)
+        self.assertEqual(
+            [copy["id"] for copy in copies.json()],
+            [second.json()["id"], first.json()["id"]],
+        )
+        self.assertTrue(copies.json()[0]["is_current_editable"])
+        self.assertFalse(copies.json()[1]["is_current_editable"])
+        self.assertFalse(copies.json()[0]["completed"])
+        self.assertTrue(copies.json()[1]["completed"])
+        csv_download = self.client.get(
+            copies.json()[0]["analyzed_csv"]["download_url"]
+        )
+        self.assertEqual(csv_download.status_code, 200, csv_download.text)
+        self.assertIn(b"Participant", csv_download.content)
+
+        restored = self.client.post(
+            f"/api/v1/runs/{self.run['id']}/analysis-copies/"
+            f"{first.json()['id']}/set-editable"
+        )
+        self.assertEqual(restored.status_code, 200, restored.text)
+        self.assertEqual(restored.json()["id"], first.json()["id"])
+        self.assertEqual(restored.headers["etag"], first.headers["etag"])
+        restored_state = self.client.get(
+            f"/api/v1/runs/{self.run['id']}/analysis-state"
+        )
+        self.assertEqual(restored_state.headers["etag"], first.headers["etag"])
+        self.assertTrue(
+            self.client.get(f"/api/v1/runs/{self.run['id']}").json()[
+                "analysis_completed"
+            ]
+        )
+
+        deleted_newer = self.client.delete(
+            f"/api/v1/runs/{self.run['id']}/analysis-copies/{second.json()['id']}"
+        )
+        self.assertEqual(deleted_newer.status_code, 204, deleted_newer.text)
+        remaining = self.client.get(
+            f"/api/v1/runs/{self.run['id']}/analysis-copies"
+        ).json()
+        self.assertEqual(len(remaining), 1)
+        self.assertTrue(remaining[0]["is_current_editable"])
+
+        deleted_current = self.client.delete(
+            f"/api/v1/runs/{self.run['id']}/analysis-copies/{first.json()['id']}"
+        )
+        self.assertEqual(deleted_current.status_code, 204, deleted_current.text)
+        self.assertEqual(
+            self.client.get(
+                f"/api/v1/runs/{self.run['id']}/analysis-copies"
+            ).json(),
+            [],
+        )
+        after_delete = self.client.get(f"/api/v1/runs/{self.run['id']}").json()
+        self.assertEqual(after_delete["analyzed_csv_count"], 0)
+        self.assertEqual(after_delete["trainable_json_count"], 0)
+        self.assertFalse(after_delete["analysis_completed"])
+        # The earlier draft is retained and becomes the current editable state.
+        fallback_state = self.client.get(
+            f"/api/v1/runs/{self.run['id']}/analysis-state"
+        )
+        self.assertEqual(fallback_state.status_code, 200, fallback_state.text)
+        self.assertEqual(fallback_state.headers["x-analysis-revision"], "1")
+
+        missing = self.client.post(
+            f"/api/v1/runs/{self.run['id']}/analysis-copies/"
+            f"{uuid.uuid4()}/set-editable"
+        )
+        self.assertEqual(missing.status_code, 404, missing.text)
+
+    def test_finalize_replace_policy_atomically_replaces_older_exports(self):
+        draft = self.put_state(self.state())
+        self.assertEqual(draft.status_code, 200, draft.text)
+        first = self.client.post(
+            f"/api/v1/runs/{self.run['id']}/analysis/finalize",
+            content=self.bundle_bytes(self.state(), completed=True),
+            headers={
+                "Content-Type": "application/zip",
+                "X-Idempotency-Key": str(uuid.uuid4()),
+                "If-Match": draft.headers["etag"],
+            },
+        )
+        self.assertEqual(first.status_code, 200, first.text)
+        first_artifact_urls = [
+            artifact["download_url"] for artifact in first.json()["artifacts"]
+        ]
+
+        request_id = uuid.uuid4()
+        replacement_bundle = self.bundle_bytes(self.state(), completed=False)
+        replacement_headers = {
+            "Content-Type": "application/zip",
+            "X-Idempotency-Key": str(request_id),
+            "If-Match": first.headers["etag"],
+            "X-Existing-Analysis-Policy": "replace",
+        }
+        replaced = self.client.post(
+            f"/api/v1/runs/{self.run['id']}/analysis/finalize",
+            content=replacement_bundle,
+            headers=replacement_headers,
+        )
+        self.assertEqual(replaced.status_code, 200, replaced.text)
+        self.assertEqual(
+            replaced.headers["x-existing-analysis-policy"], "replace"
+        )
+        copies = self.client.get(
+            f"/api/v1/runs/{self.run['id']}/analysis-copies"
+        ).json()
+        self.assertEqual([copy["id"] for copy in copies], [replaced.json()["id"]])
+        run = self.client.get(f"/api/v1/runs/{self.run['id']}").json()
+        self.assertEqual(run["analyzed_csv_count"], 1)
+        self.assertEqual(run["trainable_json_count"], 1)
+        for download_url in first_artifact_urls:
+            self.assertEqual(self.client.get(download_url).status_code, 404)
+
+        retry = self.client.post(
+            f"/api/v1/runs/{self.run['id']}/analysis/finalize",
+            content=replacement_bundle,
+            headers={
+                **replacement_headers,
+                "If-Match": '"stale"',
+            },
+        )
+        self.assertEqual(retry.status_code, 200, retry.text)
+        self.assertEqual(retry.json()["id"], replaced.json()["id"])
+        self.assertEqual(
+            len(
+                self.client.get(
+                    f"/api/v1/runs/{self.run['id']}/analysis-copies"
+                ).json()
+            ),
+            1,
+        )
+
+        changed_policy = self.client.post(
+            f"/api/v1/runs/{self.run['id']}/analysis/finalize",
+            content=replacement_bundle,
+            headers={
+                **replacement_headers,
+                "If-Match": replaced.headers["etag"],
+                "X-Existing-Analysis-Policy": "keep",
+            },
+        )
+        self.assertEqual(changed_policy.status_code, 409, changed_policy.text)
+
+        invalid_policy = self.client.post(
+            f"/api/v1/runs/{self.run['id']}/analysis/finalize",
+            content=replacement_bundle,
+            headers={
+                "Content-Type": "application/zip",
+                "X-Idempotency-Key": str(uuid.uuid4()),
+                "If-Match": replaced.headers["etag"],
+                "X-Existing-Analysis-Policy": "merge",
+            },
+        )
+        self.assertEqual(invalid_policy.status_code, 400, invalid_policy.text)
+
     def test_draft_retention_never_prunes_finalizations(self):
         saved = self.put_state(self.state())
         bundle = self.bundle_bytes(self.state())
@@ -531,6 +718,27 @@ class AnalysisApiTests(unittest.TestCase):
         self.assertEqual(resolved.json()["missing_sha256"], [hidden_sha])
         self.assertEqual(
             self.client.get(f"/api/v1/runs/{hidden_run_id}").status_code,
+            404,
+        )
+        hidden_revision_id = uuid.uuid4()
+        self.assertEqual(
+            self.client.get(
+                f"/api/v1/runs/{hidden_run_id}/analysis-copies"
+            ).status_code,
+            404,
+        )
+        self.assertEqual(
+            self.client.post(
+                f"/api/v1/runs/{hidden_run_id}/analysis-copies/"
+                f"{hidden_revision_id}/set-editable"
+            ).status_code,
+            404,
+        )
+        self.assertEqual(
+            self.client.delete(
+                f"/api/v1/runs/{hidden_run_id}/analysis-copies/"
+                f"{hidden_revision_id}"
+            ).status_code,
             404,
         )
 

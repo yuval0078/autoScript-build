@@ -107,6 +107,13 @@ def _run_response(run):
         analysis_updated_at=run.analysis_updated_at,
         created_at=run.created_at,
         result_count=len(results),
+        raw_data_count=len(results),
+        analyzed_csv_count=sum(
+            artifact.kind == "analysis_csv" for artifact in artifacts
+        ),
+        trainable_json_count=sum(
+            artifact.kind == "trainable_json" for artifact in artifacts
+        ),
         completed_word_count=completed_word_count,
         expected_word_count=expected_word_count,
         complete=_run_is_complete(run, results),

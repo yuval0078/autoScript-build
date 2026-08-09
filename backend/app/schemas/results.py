@@ -41,6 +41,17 @@ class RunAnalysisRevisionResponse(BaseModel):
     artifacts: list[RunArtifactResponse]
 
 
+class RunAnalysisCopyResponse(BaseModel):
+    id: uuid.UUID
+    run_id: uuid.UUID
+    revision: int
+    created_at: datetime
+    completed: bool
+    is_current_editable: bool
+    analyzed_csv: RunArtifactResponse
+    trainable_json: RunArtifactResponse
+
+
 class RunResultResponse(BaseModel):
     id: uuid.UUID
     run_id: uuid.UUID
@@ -101,6 +112,9 @@ class ExperimentRunResponse(BaseModel):
     analysis_updated_at: datetime | None
     created_at: datetime
     result_count: int
+    raw_data_count: int
+    analyzed_csv_count: int
+    trainable_json_count: int
     completed_word_count: int
     expected_word_count: int
     complete: bool

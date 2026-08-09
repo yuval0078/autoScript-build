@@ -7,7 +7,7 @@ from email.utils import format_datetime
 from pathlib import Path
 from urllib.parse import unquote
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
@@ -26,6 +26,7 @@ from ..models import (
     User,
 )
 from ..schemas import (
+    RunAnalysisCopyResponse,
     RunAnalysisRevisionResponse,
     RunArtifactResponse,
     RunResultResolveRequest,
@@ -143,6 +144,27 @@ def _analysis_response(revision):
     )
 
 
+def _analysis_copy_response(run, revision):
+    artifacts = {artifact.kind: artifact for artifact in revision.artifacts}
+    analyzed_csv = artifacts.get("analysis_csv")
+    trainable_json = artifacts.get("trainable_json")
+    if analyzed_csv is None or trainable_json is None:
+        raise HTTPException(
+            status_code=500,
+            detail="Finalized analysis revision has incomplete export artifacts.",
+        )
+    return RunAnalysisCopyResponse(
+        id=revision.id,
+        run_id=revision.run_id,
+        revision=revision.revision_number,
+        created_at=revision.created_at,
+        completed=bool(revision.completed),
+        is_current_editable=run.current_analysis_revision_id == revision.id,
+        analyzed_csv=_artifact_response(analyzed_csv),
+        trainable_json=_artifact_response(trainable_json),
+    )
+
+
 def _set_analysis_headers(response, revision):
     state_artifact = _state_artifact(revision)
     if state_artifact is None:
@@ -161,6 +183,24 @@ def _parse_request_id(value):
             status_code=400,
             detail="X-Idempotency-Key must be a UUID.",
         ) from exc
+
+
+def _parse_existing_analysis_policy(value):
+    policy = str(value or "keep").strip().lower()
+    if policy not in {"keep", "replace"}:
+        raise HTTPException(
+            status_code=400,
+            detail="X-Existing-Analysis-Policy must be 'keep' or 'replace'.",
+        )
+    return policy
+
+
+def _finalize_operation_sha256(request_sha256, policy):
+    # Preserve the original digest for the default policy so idempotency keys written
+    # by older servers remain retryable after this feature is deployed.
+    if policy == "keep":
+        return request_sha256
+    return hashlib.sha256(f"replace\0{request_sha256}".encode("ascii")).hexdigest()
 
 
 def _safe_filename(value, default, suffix):
@@ -336,6 +376,115 @@ def _cleanup_uncommitted_objects(database, storage, storage_keys):
     drain_object_deletions(database, storage)
 
 
+def _finalized_analysis_copy(run, revision_id):
+    revision = next(
+        (
+            item
+            for item in run.analysis_revisions
+            if item.id == revision_id and item.finalized
+        ),
+        None,
+    )
+    if revision is None:
+        raise HTTPException(status_code=404, detail="Analysis copy was not found.")
+    return revision
+
+
+@router.get(
+    "/runs/{run_id}/analysis-copies",
+    response_model=list[RunAnalysisCopyResponse],
+)
+def list_run_analysis_copies(
+    run_id: uuid.UUID,
+    database: Session = Depends(get_db),
+    actor: User = Depends(get_current_user),
+):
+    run = _owned_analysis_run(database, actor, run_id)
+    revisions = sorted(
+        (revision for revision in run.analysis_revisions if revision.finalized),
+        key=lambda revision: revision.revision_number,
+        reverse=True,
+    )
+    return [_analysis_copy_response(run, revision) for revision in revisions]
+
+
+@router.post(
+    "/runs/{run_id}/analysis-copies/{revision_id}/set-editable",
+    response_model=RunAnalysisRevisionResponse,
+)
+def set_run_analysis_copy_editable(
+    run_id: uuid.UUID,
+    revision_id: uuid.UUID,
+    response: Response,
+    database: Session = Depends(get_db),
+    actor: User = Depends(get_current_user),
+):
+    run = _owned_analysis_run(database, actor, run_id, lock=True)
+    revision = _finalized_analysis_copy(run, revision_id)
+    artifact_kinds = {artifact.kind for artifact in revision.artifacts}
+    if not {"analysis_state", "trainable_json"}.issubset(artifact_kinds):
+        raise HTTPException(
+            status_code=409,
+            detail="This analysis copy cannot restore an editable state.",
+        )
+    run.current_analysis_revision = revision
+    run.analysis_completed = revision.completed
+    run.analysis_updated_at = datetime.now(timezone.utc)
+    database.commit()
+    _set_analysis_headers(response, revision)
+    return _analysis_response(revision)
+
+
+@router.delete(
+    "/runs/{run_id}/analysis-copies/{revision_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+def delete_run_analysis_copy(
+    run_id: uuid.UUID,
+    revision_id: uuid.UUID,
+    database: Session = Depends(get_db),
+    storage=Depends(get_object_storage),
+    actor: User = Depends(get_current_user),
+):
+    run = _owned_analysis_run(database, actor, run_id, lock=True)
+    revision = _finalized_analysis_copy(run, revision_id)
+    storage_keys = [artifact.storage_key for artifact in revision.artifacts]
+
+    if run.current_analysis_revision_id == revision.id:
+        remaining = [
+            candidate
+            for candidate in run.analysis_revisions
+            if candidate.id != revision.id and _state_artifact(candidate) is not None
+        ]
+        fallback = max(
+            remaining,
+            key=lambda candidate: candidate.revision_number,
+            default=None,
+        )
+        run.current_analysis_revision = fallback
+        if fallback is None:
+            run.analysis_completed = (
+                False if _legacy_state_artifact(run) is not None else None
+            )
+        else:
+            run.analysis_completed = fallback.completed if fallback.finalized else False
+        run.analysis_updated_at = datetime.now(timezone.utc)
+        # Persist the pointer change before deleting the referenced revision. This is
+        # required by databases that enforce the FK immediately.
+        database.flush()
+
+    database.execute(
+        RunAnalysisOperation.__table__.update()
+        .where(RunAnalysisOperation.revision_id == revision.id)
+        .values(revision_id=None)
+    )
+    queue_object_deletions(database, storage_keys)
+    database.delete(revision)
+    database.commit()
+    drain_object_deletions(database, storage)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
 @router.get("/runs/{run_id}/analysis-state")
 def get_run_analysis_state(
     run_id: uuid.UUID,
@@ -502,12 +651,19 @@ async def finalize_run_analysis(
     if_match: str | None = Header(default=None, alias="If-Match"),
     if_none_match: str | None = Header(default=None, alias="If-None-Match"),
     x_filename: str | None = Header(default=None, alias="X-Filename"),
+    x_existing_analysis_policy: str = Header(
+        default="keep", alias="X-Existing-Analysis-Policy"
+    ),
     database: Session = Depends(get_db),
     storage=Depends(get_object_storage),
     actor: User = Depends(get_current_user),
 ):
     del x_filename
     request_id = _parse_request_id(x_idempotency_key)
+    existing_analysis_policy = _parse_existing_analysis_policy(
+        x_existing_analysis_policy
+    )
+    response.headers["X-Existing-Analysis-Policy"] = existing_analysis_policy
     if request.headers.get("content-type", "").split(";", 1)[0].strip().lower() != "application/zip":
         raise HTTPException(
             status_code=415,
@@ -515,6 +671,9 @@ async def finalize_run_analysis(
         )
     upload_path, request_sha256, _bundle_size = await _receive_body(
         request, ".zip", "Analysis finalization ZIP"
+    )
+    operation_sha256 = _finalize_operation_sha256(
+        request_sha256, existing_analysis_policy
     )
     storage_keys = []
     committed = False
@@ -533,7 +692,7 @@ async def finalize_run_analysis(
             except AnalysisValidationError as exc:
                 raise HTTPException(status_code=422, detail=str(exc)) from exc
             prior = _idempotent_revision(
-                database, run, request_id, "finalize", request_sha256
+                database, run, request_id, "finalize", operation_sha256
             )
             if prior is not None:
                 _set_analysis_headers(response, prior)
@@ -579,7 +738,7 @@ async def finalize_run_analysis(
                 run_id=run.id,
                 request_id=request_id,
                 operation_kind="finalize",
-                request_sha256=request_sha256,
+                request_sha256=operation_sha256,
                 revision_id=revision.id,
                 revision_number=revision.revision_number,
             )
@@ -589,6 +748,33 @@ async def finalize_run_analysis(
             run.analysis_completed = bundle.completed
             run.analysis_updated_at = now
             database.flush()
+            if existing_analysis_policy == "replace":
+                replaced_revisions = [
+                    candidate
+                    for candidate in run.analysis_revisions
+                    if candidate.finalized and candidate.id != revision.id
+                ]
+                replaced_storage_keys = [
+                    artifact.storage_key
+                    for candidate in replaced_revisions
+                    for artifact in candidate.artifacts
+                ]
+                replaced_revision_ids = [
+                    candidate.id for candidate in replaced_revisions
+                ]
+                if replaced_revision_ids:
+                    database.execute(
+                        RunAnalysisOperation.__table__.update()
+                        .where(
+                            RunAnalysisOperation.revision_id.in_(
+                                replaced_revision_ids
+                            )
+                        )
+                        .values(revision_id=None)
+                    )
+                    for candidate in replaced_revisions:
+                        database.delete(candidate)
+                    queue_object_deletions(database, replaced_storage_keys)
             _prune_analysis_drafts(database, run)
             database.commit()
             committed = True
@@ -602,7 +788,7 @@ async def finalize_run_analysis(
         _cleanup_uncommitted_objects(database, storage, storage_keys)
         run = _owned_analysis_run(database, actor, run_id)
         prior = _idempotent_revision(
-            database, run, request_id, "finalize", request_sha256
+            database, run, request_id, "finalize", operation_sha256
         )
         if prior is None:
             raise HTTPException(status_code=409, detail="Concurrent analysis finalization conflict.") from exc

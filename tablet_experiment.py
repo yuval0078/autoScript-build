@@ -568,6 +568,7 @@ def apply_session_plan(configs, session_plan=None):
     """Attach per-config page-layout metadata from the launcher session plan."""
     plan_by_path = {}
     session_recalibrate_between_pages = bool((session_plan or {}).get('recalibrate_between_pages', False))
+    save_results_locally = bool((session_plan or {}).get('save_results_locally', True))
     if session_plan:
         for entry in session_plan.get('experiments', []):
             config_path = entry.get('config_path')
@@ -588,6 +589,7 @@ def apply_session_plan(configs, session_plan=None):
 
         config['__session_layout__'] = layout
         config['__session_recalibrate_between_pages__'] = session_recalibrate_between_pages
+        config['__save_results_locally__'] = save_results_locally
 
     return configs
 
@@ -2024,18 +2026,6 @@ class ExperimentCanvas(QWidget):
         }
         return self.completed_data
     
-    def _confirm_discard(self, parent, text):
-        """Ask whether unsaved data should be discarded."""
-        discard_msg = QMessageBox(parent)
-        discard_msg.setIcon(QMessageBox.Warning)
-        discard_msg.setWindowTitle("Discard Data?")
-        discard_msg.setText(text)
-        discard_msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
-        discard_msg.setDefaultButton(QMessageBox.No)
-        discard_msg.setWindowModality(Qt.ApplicationModal)
-        discard_msg.setWindowFlag(Qt.WindowStaysOnTopHint, True)
-        return discard_msg.exec_() == QMessageBox.Yes
-    
     def _cleanup_and_quit(self):
         """Release audio resources and close the app."""
         try:
@@ -2164,25 +2154,49 @@ class ExperimentCanvas(QWidget):
             return 0, [f"Cloud connection: {exc}"]
 
     @staticmethod
-    def _cloud_save_status(uploaded, errors, skipped):
+    def _cloud_save_status(uploaded, errors, skipped, locally_saved=True):
         if errors:
             detail = "\n".join(errors[:3])
             if len(errors) > 3:
                 detail += f"\n...and {len(errors) - 3} more"
+            safety_note = (
+                "The local files are safe."
+                if locally_saved
+                else "The upload remains queued for automatic retry."
+            )
             return (
                 f"\n\nCloud: uploaded {uploaded}; {len(errors)} failed. "
-                f"The local files are safe.\n{detail}"
+                f"{safety_note}\n{detail}"
             )
         if uploaded:
             return f"\n\nCloud: uploaded {uploaded} result file(s)."
         if skipped:
-            return "\n\nLocal/legacy run: results were kept locally."
+            if locally_saved:
+                return "\n\nLocal/legacy run: results were kept locally."
+            return "\n\nLocal/legacy run: no cloud experiment was available."
         return ""
+
+    def _should_save_results_locally(self):
+        """Return the launcher's fixed local-save choice for this run."""
+        return bool(self.config.get('__save_results_locally__', True))
+
+    @staticmethod
+    def _available_result_path(path):
+        """Avoid overwriting an existing automatic local result file."""
+        path = Path(path)
+        if not path.exists():
+            return path
+        for duplicate_index in range(2, 10_000):
+            candidate = path.with_name(
+                f"{path.stem}_{duplicate_index}{path.suffix}"
+            )
+            if not candidate.exists():
+                return candidate
+        return path.with_name(f"{path.stem}_{uuid.uuid4().hex}{path.suffix}")
     
     def _save_single_result(self, combined_data, dialog_parent):
-        """Save one experiment result using the existing file-save flow."""
+        """Upload one result and honor the launcher's automatic local-save choice."""
         from pathlib import Path
-        from PyQt5.QtWidgets import QFileDialog
         from app_paths import ensure_dir, user_data_dir
         
         results_dir = ensure_dir(user_data_dir() / 'results')
@@ -2195,30 +2209,25 @@ class ExperimentCanvas(QWidget):
             [combined_data],
             transition='finalize',
         )
-        
-        save_dialog = QFileDialog(
-            dialog_parent,
-            "Save Experiment Data",
-            str(default_path),
-            "JSON Files (*.json);;All Files (*.*)"
-        )
-        save_dialog.setAcceptMode(QFileDialog.AcceptSave)
-        save_dialog.setDefaultSuffix("json")
-        save_dialog.setOption(QFileDialog.DontUseNativeDialog, True)
-        save_dialog.setWindowModality(Qt.ApplicationModal)
-        save_dialog.setWindowFlag(Qt.WindowStaysOnTopHint, True)
-        save_path = save_dialog.selectedFiles()[0] if save_dialog.exec_() == QFileDialog.Accepted else ""
-        
-        if not save_path:
-            if not self._confirm_discard(dialog_parent, "Are you sure you want to exit without saving the experiment data?"):
-                self.finish_experiment()
-            else:
-                print("Local export skipped by user; cloud data was preserved")
-                self._cleanup_and_quit()
+
+        if not self._should_save_results_locally():
+            msg = QMessageBox(dialog_parent)
+            msg.setIcon(QMessageBox.Information)
+            msg.setWindowTitle("Experiment Complete")
+            msg.setText(
+                "Experiment finished. Local saving was disabled in Run settings."
+                + self._cloud_save_status(
+                    uploaded, errors, skipped, locally_saved=False
+                )
+            )
+            msg.setWindowModality(Qt.ApplicationModal)
+            msg.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+            msg.exec_()
+            self._cleanup_and_quit()
             return
         
         try:
-            data_file = Path(save_path)
+            data_file = self._available_result_path(default_path)
             with open(str(data_file), 'w', encoding='utf-8') as f:
                 json.dump(combined_data, f, ensure_ascii=False, indent=2)
             msg = QMessageBox(dialog_parent)
@@ -2239,14 +2248,14 @@ class ExperimentCanvas(QWidget):
             error_msg.setWindowModality(Qt.ApplicationModal)
             error_msg.setWindowFlag(Qt.WindowStaysOnTopHint, True)
             error_msg.exec_()
+            self._cleanup_and_quit()
             return
         
         self._cleanup_and_quit()
     
     def _save_session_results(self, session_results, dialog_parent):
-        """Save every block result in a multi-block experiment separately."""
+        """Upload a session and optionally save every Block result automatically."""
         from pathlib import Path
-        from PyQt5.QtWidgets import QFileDialog
         from app_paths import ensure_dir, user_data_dir
         
         results_dir = ensure_dir(user_data_dir() / 'results')
@@ -2260,21 +2269,24 @@ class ExperimentCanvas(QWidget):
             session_results,
             transition='finalize',
         )
-        parent_dir = QFileDialog.getExistingDirectory(
-            dialog_parent,
-            f"Select Parent Folder for Participant {self.participant_number}",
-            str(results_dir)
-        )
-        
-        if not parent_dir:
-            if not self._confirm_discard(dialog_parent, "Are you sure you want to exit without saving this experiment run?"):
-                self.finish_experiment()
-            else:
-                print("Local session export skipped by user; cloud data was preserved")
-                self._cleanup_and_quit()
+
+        if not self._should_save_results_locally():
+            msg = QMessageBox(dialog_parent)
+            msg.setIcon(QMessageBox.Information)
+            msg.setWindowTitle("Session Complete")
+            msg.setText(
+                "Session finished. Local saving was disabled in Run settings."
+                + self._cloud_save_status(
+                    uploaded, errors, skipped, locally_saved=False
+                )
+            )
+            msg.setWindowModality(Qt.ApplicationModal)
+            msg.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+            msg.exec_()
+            self._cleanup_and_quit()
             return
-        
-        session_dir = Path(parent_dir) / str(self.participant_number)
+
+        session_dir = Path(results_dir) / str(self.participant_number)
         session_dir.mkdir(parents=True, exist_ok=True)
         
         saved_files = []
@@ -2282,9 +2294,7 @@ class ExperimentCanvas(QWidget):
             for index, result in enumerate(session_results, start=1):
                 stem = self._result_file_stem(result.get('config'), result.get('block_name'))
                 filename = f"{stem}_p{self.participant_number}_{result.get('timestamp')}.json"
-                data_file = session_dir / filename
-                if data_file.exists():
-                    data_file = session_dir / f"{stem}_p{self.participant_number}_{result.get('timestamp')}_{index}.json"
+                data_file = self._available_result_path(session_dir / filename)
                 
                 with open(str(data_file), 'w', encoding='utf-8') as f:
                     json.dump(result, f, ensure_ascii=False, indent=2)
@@ -2297,6 +2307,7 @@ class ExperimentCanvas(QWidget):
             error_msg.setWindowModality(Qt.ApplicationModal)
             error_msg.setWindowFlag(Qt.WindowStaysOnTopHint, True)
             error_msg.exec_()
+            self._cleanup_and_quit()
             return
         
         msg = QMessageBox(dialog_parent)

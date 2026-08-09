@@ -99,6 +99,15 @@ class ApiHandler(BaseHTTPRequestHandler):
                 "X-Source-Fingerprint": "b" * 64,
             })
             return
+        if self.path == "/api/v1/runs/run-1/analysis-copies":
+            self.send_json(200, [{
+                "id": "revision-3",
+                "run_id": "run-1",
+                "revision": 3,
+                "created_at": "2026-08-09T12:00:00Z",
+                "is_current_editable": True,
+            }])
+            return
         if self.path == "/api/v1/run-results/result-1/download":
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -157,10 +166,15 @@ class ApiHandler(BaseHTTPRequestHandler):
                 "ANALYSIS_FINALIZE", self.path,
                 self.headers.get("If-Match"),
                 self.headers.get("X-Idempotency-Key"),
+                self.headers.get("X-Existing-Analysis-Policy"),
             ))
             self.send_json(200, {"run_id": "run-1", "completed": True}, {
                 "ETag": '"state-r3"', "X-Analysis-Revision": "3",
             })
+            return
+        if self.path == "/api/v1/runs/run-1/analysis-copies/revision-3/set-editable":
+            type(self).requests.append(("SET_EDITABLE", self.path, None))
+            self.send_json(200, {"id": "revision-3", "run_id": "run-1"})
             return
         if self.path == "/api/v1/experiments":
             payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
@@ -485,10 +499,34 @@ class AutoScriptApiClientTests(unittest.TestCase):
                 "run-1", state_path, base_etag=state["etag"], request_id="request-1"
             )
             finalized = self.api.finalize_run_analysis(
-                "run-1", bundle_path, base_etag=updated["etag"], request_id="request-2"
+                "run-1",
+                bundle_path,
+                base_etag=updated["etag"],
+                request_id="request-2",
+                existing_policy="replace",
             )
         self.assertEqual(updated["revision"], 3)
         self.assertEqual(finalized["etag"], '"state-r3"')
+        finalize_request = next(
+            request for request in ApiHandler.requests
+            if request[0] == "ANALYSIS_FINALIZE"
+        )
+        self.assertEqual(finalize_request[-1], "replace")
+        copies = self.api.list_run_analysis_copies("run-1")
+        self.assertEqual(copies[0]["id"], "revision-3")
+        editable = self.api.set_run_analysis_copy_editable(
+            "run-1", "revision-3"
+        )
+        self.assertEqual(editable["id"], "revision-3")
+        self.api.delete_run_analysis_copy("run-1", "revision-3")
+        self.assertIn(
+            (
+                "DELETE",
+                "/api/v1/runs/run-1/analysis-copies/revision-3",
+                None,
+            ),
+            ApiHandler.requests,
+        )
         resolved = self.api.resolve_run_results_by_sha(["a" * 64, "b" * 64])
         self.assertEqual(resolved["results"][0]["run_id"], "run-1")
         self.assertEqual(resolved["missing_sha256"], ["b" * 64])

@@ -4,7 +4,7 @@ import unittest
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from analyzer_refactored import (
     ParticipantData,
@@ -22,6 +22,48 @@ from tablet_experiment import (
 
 
 class RunnerBlockIdentityTests(unittest.TestCase):
+    def test_single_result_is_saved_automatically_when_launch_setting_is_on(self):
+        canvas = ExperimentCanvas.__new__(ExperimentCanvas)
+        canvas.config = {"__save_results_locally__": True}
+        canvas.participant_number = 17
+        canvas._result_file_stem = lambda: "reading"
+        canvas._upload_results_before_export = lambda *_args, **_kwargs: (1, [], 0)
+        canvas._cleanup_and_quit = MagicMock()
+        result = {"timestamp": "20260809_120000", "block_completed": True}
+
+        with tempfile.TemporaryDirectory() as temp_dir, patch(
+            "app_paths.user_data_dir", return_value=Path(temp_dir)
+        ), patch("tablet_experiment.QMessageBox"):
+            canvas._save_single_result(result, None)
+
+            saved_path = (
+                Path(temp_dir)
+                / "results"
+                / "reading_p17_20260809_120000.json"
+            )
+            self.assertTrue(saved_path.is_file())
+            self.assertEqual(
+                json.loads(saved_path.read_text(encoding="utf-8"))["experiment_completed"],
+                True,
+            )
+        canvas._cleanup_and_quit.assert_called_once_with()
+
+    def test_single_result_skips_local_file_when_launch_setting_is_off(self):
+        canvas = ExperimentCanvas.__new__(ExperimentCanvas)
+        canvas.config = {"__save_results_locally__": False}
+        canvas.participant_number = 17
+        canvas._result_file_stem = lambda: "reading"
+        canvas._upload_results_before_export = lambda *_args, **_kwargs: (1, [], 0)
+        canvas._cleanup_and_quit = MagicMock()
+        result = {"timestamp": "20260809_120000", "block_completed": True}
+
+        with tempfile.TemporaryDirectory() as temp_dir, patch(
+            "app_paths.user_data_dir", return_value=Path(temp_dir)
+        ), patch("tablet_experiment.QMessageBox"):
+            canvas._save_single_result(result, None)
+            self.assertEqual(list(Path(temp_dir).rglob("*.json")), [])
+        canvas._cleanup_and_quit.assert_called_once_with()
+
     def test_uncaught_runner_failure_is_queued_and_reported(self):
         run_id = str(uuid.uuid4())
         calls = []

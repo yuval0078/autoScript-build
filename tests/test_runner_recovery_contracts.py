@@ -24,7 +24,7 @@ def _function_names(source: str) -> set[str]:
 
 
 class RunnerRecoveryContractsTests(unittest.TestCase):
-    def test_block_session_recalibration_only_occurs_at_block_boundaries(self):
+    def test_block_session_recalibration_covers_every_page_change(self):
         from gui_menu import build_block_session_layout
 
         blocks = [
@@ -43,7 +43,7 @@ class RunnerRecoveryContractsTests(unittest.TestCase):
         self.assertTrue(entries[1]["recalibrate_before_start"])
         self.assertTrue(plan["recalibrate_between_pages"])
         self.assertTrue(
-            all(not entry["recalibrate_during_page_refresh"] for entry in entries)
+            all(entry["recalibrate_during_page_refresh"] for entry in entries)
         )
 
     def test_arranged_blocks_can_share_a_page_without_extra_recalibration(self):
@@ -72,8 +72,44 @@ class RunnerRecoveryContractsTests(unittest.TestCase):
         self.assertFalse(entries[1]["recalibrate_before_start"])
         self.assertTrue(entries[2]["recalibrate_before_start"])
         self.assertTrue(
-            all(not entry["recalibrate_during_page_refresh"] for entry in entries)
+            all(entry["recalibrate_during_page_refresh"] for entry in entries)
         )
+
+    def test_run_settings_are_carried_in_the_session_plan(self):
+        from gui_menu import build_block_session_layout
+        from tablet_experiment import apply_session_plan
+
+        config_path = str((ROOT / "block-1.json").resolve())
+        blocks = [
+            {
+                "config_path": config_path,
+                "display_name": "Block 1",
+                "word_count": 1,
+                "rows": 1,
+                "cols": 1,
+            }
+        ]
+        plan = build_block_session_layout(
+            blocks,
+            recalibrate_between_blocks=True,
+            save_results_locally=False,
+        )
+        configs = [{"__file_path__": config_path}]
+
+        apply_session_plan(configs, plan)
+
+        self.assertFalse(plan["save_results_locally"])
+        self.assertFalse(configs[0]["__save_results_locally__"])
+        # A single Block has no boundary at which to re-calibrate.
+        self.assertFalse(plan["recalibrate_between_pages"])
+
+    def test_direct_runner_launch_keeps_legacy_local_save_default(self):
+        from tablet_experiment import apply_session_plan
+
+        configs = [{"__file_path__": str((ROOT / "legacy.json").resolve())}]
+        apply_session_plan(configs, None)
+
+        self.assertTrue(configs[0]["__save_results_locally__"])
 
     def test_runner_supports_session_plan_and_cell_offsets(self):
         source = _source("tablet_experiment.py")
@@ -118,6 +154,24 @@ class RunnerRecoveryContractsTests(unittest.TestCase):
             source,
         )
         self.assertIn('config["block_index"] = final_block_index', source)
+
+        arrange_source = source[
+            source.index("class ArrangeExperimentsDialog"):
+            source.index("class MainMenu")
+        ]
+        self.assertNotIn("recalibrate_toggle", arrange_source)
+        self.assertNotIn('"Re-calibrate Between Blocks",', source)
+
+    def test_runner_local_save_no_longer_uses_an_end_of_run_file_dialog(self):
+        source = _source("tablet_experiment.py")
+        save_flow = source[
+            source.index("    def _save_single_result"):
+            source.index("    def finish_experiment")
+        ]
+
+        self.assertNotIn("QFileDialog", save_flow)
+        self.assertIn("_should_save_results_locally", save_flow)
+        self.assertIn("Local saving was disabled in Run settings", save_flow)
 
     def test_audio_playback_cache_is_present_without_removing_safe_temp_paths(self):
         source = _source("audio_processor.py")

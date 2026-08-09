@@ -60,11 +60,17 @@ class AnalysisSyncQueueTests(unittest.TestCase):
                 self.assertEqual(len(items), 1)
                 item = json.loads(items[0].read_text(encoding="utf-8"))
                 self.assertEqual((root / item["payload"]).read_text(), "second")
-                enqueue_analysis_finalize("run-1", final, base_etag='"r0"')
+                enqueue_analysis_finalize(
+                    "run-1",
+                    final,
+                    base_etag='"r0"',
+                    existing_policy="replace",
+                )
                 item_paths = list(root.glob("*.queue.json"))
                 self.assertEqual(len(item_paths), 1)
                 item = json.loads(item_paths[0].read_text(encoding="utf-8"))
                 self.assertEqual(item["kind"], "finalize")
+                self.assertEqual(item["existing_policy"], "replace")
 
     def test_precondition_conflict_preserves_payload(self):
         class API:
@@ -134,7 +140,11 @@ class AnalysisSyncQueueTests(unittest.TestCase):
                 return {"etag": '"r1"', "revision": 1}
 
             def finalize_run_analysis(self, run_id, path, **kwargs):
-                calls.append(("finalize", kwargs["base_etag"]))
+                calls.append((
+                    "finalize",
+                    kwargs["base_etag"],
+                    kwargs["existing_policy"],
+                ))
                 return {"etag": '"r2"', "revision": 2}
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -148,11 +158,17 @@ class AnalysisSyncQueueTests(unittest.TestCase):
             with patch("analysis_sync_queue.queue_root", return_value=root):
                 enqueue_analysis_state("run-1", state, base_etag=None, request_id="state")
                 drain_analysis_queue(api)
-                enqueue_analysis_finalize("run-1", bundle, base_etag=None, request_id="final")
+                enqueue_analysis_finalize(
+                    "run-1",
+                    bundle,
+                    base_etag=None,
+                    request_id="final",
+                    existing_policy="replace",
+                )
                 self.assertEqual(len(list(root.glob("*.queue.json"))), 2)
                 count, errors, _ = drain_analysis_queue(api)
             self.assertEqual((count, errors), (2, []))
-            self.assertEqual(calls[-1], ("finalize", '"r1"'))
+            self.assertEqual(calls[-1], ("finalize", '"r1"', "replace"))
 
     def test_new_finalize_follows_exact_retry_of_attempted_finalize(self):
         calls = []

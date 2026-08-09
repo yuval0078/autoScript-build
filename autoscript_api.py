@@ -212,11 +212,16 @@ class AutoScriptAPI:
         *,
         base_etag=None,
         request_id=None,
+        existing_policy="keep",
         progress=None,
     ):
+        existing_policy = str(existing_policy or "keep").strip().lower()
+        if existing_policy not in {"keep", "replace"}:
+            raise ValueError("existing_policy must be 'keep' or 'replace'.")
         headers = {
             "X-Idempotency-Key": str(request_id or uuid.uuid4()),
             "X-Filename": quote(Path(bundle_path).name, safe=""),
+            "X-Existing-Analysis-Policy": existing_policy,
         }
         if base_etag:
             headers["If-Match"] = base_etag
@@ -236,6 +241,23 @@ class AutoScriptAPI:
                 "revision", int(response_headers.get("x-analysis-revision") or 0)
             )
         return payload
+
+    def list_run_analysis_copies(self, run_id):
+        return self._json_request(
+            "GET", f"/api/v1/runs/{run_id}/analysis-copies"
+        )
+
+    def delete_run_analysis_copy(self, run_id, revision_id):
+        return self._json_request(
+            "DELETE",
+            f"/api/v1/runs/{run_id}/analysis-copies/{revision_id}",
+        )
+
+    def set_run_analysis_copy_editable(self, run_id, revision_id):
+        return self._json_request(
+            "POST",
+            f"/api/v1/runs/{run_id}/analysis-copies/{revision_id}/set-editable",
+        )
 
     def resolve_run_results_by_sha(self, sha256_values):
         return self._json_request(

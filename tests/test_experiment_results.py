@@ -6,6 +6,8 @@ import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
+from PyQt5.QtWidgets import QApplication, QMessageBox
+
 from autoscript_api import APIError
 from analyzer_refactored import (
     ParticipantData,
@@ -16,37 +18,88 @@ from analyzer_refactored import (
     write_analysis_finalize_bundle,
     write_analysis_csv,
 )
-from experiment_results import format_run_datetime, run_status
+from experiment_results import (
+    ExperimentResultsPage,
+    analysis_copy_count,
+    cloud_file_count,
+    format_run_datetime,
+    run_cloud_file_tags,
+)
 
 
-class ExperimentResultStatusTests(unittest.TestCase):
+class ExperimentResultCardTests(unittest.TestCase):
     def test_run_timestamp_is_rendered_for_the_results_row(self):
         rendered = format_run_datetime("2026-08-09T10:45:00+00:00")
 
         self.assertRegex(rendered, r"^2026-08-09 \d{2}:45:00$")
 
-    def test_incomplete_data_is_red_even_if_analysis_completed(self):
-        status, color, _background, data, analysis = run_status(
-            {"complete": False, "analysis_completed": True}
+    def test_tags_are_driven_by_cloud_file_counts_not_editing_status(self):
+        run = {
+            "complete": False,
+            "analysis_completed": None,
+            "raw_data_count": 2,
+            "analyzed_csv_count": 1,
+            "trainable_json_count": 0,
+        }
+        self.assertEqual(
+            run_cloud_file_tags(run),
+            [("raw_data", "Raw data", 2), ("analysis_csv", "Analyzed CSV", 1)],
         )
-        self.assertEqual(status, "incomplete")
-        self.assertEqual(color, "#c62828")
-        self.assertEqual(data, "Data incomplete")
-        self.assertEqual(analysis, "Analysis completed")
 
-    def test_unstarted_and_partial_analysis_are_orange_and_explicit(self):
-        for value, expected in (
-            (None, "Analysis not started"),
-            (False, "Analysis not completed"),
-        ):
-            with self.subTest(value=value):
-                status, color, _background, data, analysis = run_status(
-                    {"complete": True, "analysis_completed": value}
-                )
-                self.assertEqual(status, "analysis_pending")
-                self.assertEqual(color, "#b26a00")
-                self.assertEqual(data, "Data complete")
-                self.assertEqual(analysis, expected)
+    def test_tag_counts_fall_back_to_legacy_embedded_files(self):
+        run = {
+            "results": [{"id": "raw-1"}],
+            "artifacts": [
+                {"id": "csv-1", "kind": "analysis_csv"},
+                {"id": "json-1", "kind": "trainable_json"},
+            ],
+        }
+        self.assertEqual(cloud_file_count(run, "raw_data"), 1)
+        self.assertEqual(
+            [label for _kind, label, _count in run_cloud_file_tags(run)],
+            ["Raw data", "Analyzed CSV", "Trainable Json"],
+        )
+        self.assertEqual(analysis_copy_count(run), 1)
+
+    def test_versioned_copies_are_newest_first_and_do_not_duplicate_flat_artifacts(self):
+        class API:
+            def list_run_analysis_copies(self, run_id):
+                self.requested_run_id = run_id
+                return [{
+                    "id": "revision-2",
+                    "revision": 2,
+                    "created_at": "2026-08-09T12:00:00Z",
+                    "is_current_editable": True,
+                    "analyzed_csv": {"id": "csv-2", "kind": "analysis_csv"},
+                    "trainable_json": {"id": "json-2", "kind": "trainable_json"},
+                }]
+
+        page = ExperimentResultsPage.__new__(ExperimentResultsPage)
+        page.api = API()
+        copies = page._analysis_copies({
+            "id": "run-1",
+            "analysis_completed": True,
+            "artifacts": [
+                {
+                    "id": "csv-2",
+                    "kind": "analysis_csv",
+                    "created_at": "2026-08-09T12:00:00Z",
+                },
+                {
+                    "id": "legacy-csv",
+                    "kind": "analysis_csv",
+                    "created_at": "2026-08-08T12:00:00Z",
+                },
+            ],
+        }, "analysis_csv")
+
+        self.assertEqual(page.api.requested_run_id, "run-1")
+        self.assertEqual(
+            [copy["artifact"]["id"] for copy in copies],
+            ["csv-2", "legacy-csv"],
+        )
+        self.assertTrue(copies[0]["is_current_editable"])
+        self.assertTrue(copies[1]["legacy"])
 
 
 class AnalyzerArtifactTests(unittest.TestCase):
@@ -284,10 +337,75 @@ class AnalyzerArtifactTests(unittest.TestCase):
             with patch("autoscript_api.AutoScriptAPI", FakeAPI), patch(
                 "analysis_sync_queue.queue_root", return_value=queue_root
             ):
-                player._finalize_cloud_analysis(True)
+                player._finalize_cloud_analysis(
+                    True, existing_policy="replace"
+                )
 
         self.assertEqual(len([call for call in calls if call[0] == "finalize"]), 1)
         self.assertEqual(calls[-1][1:3], ("run-1", ".zip"))
+        self.assertEqual(calls[-1][3]["existing_policy"], "replace")
+
+    def test_close_without_exports_saves_only_editable_state(self):
+        class Event:
+            accepted = False
+            ignored = False
+
+            def accept(self):
+                self.accepted = True
+
+            def ignore(self):
+                self.ignored = True
+
+        player = PenDataPlayer.__new__(PenDataPlayer)
+        player.analysis_context = {"runs": [{"id": "run-1"}]}
+        player.analysis_context_saved = False
+        event = Event()
+        with patch.object(
+            QMessageBox, "question", return_value=QMessageBox.No
+        ), patch.object(
+            player, "_save_cloud_analysis_state", return_value=[]
+        ) as save_state, patch.object(
+            player, "_finalize_cloud_analysis"
+        ) as finalize, patch.object(
+            QApplication, "setOverrideCursor"
+        ), patch.object(
+            QApplication, "restoreOverrideCursor"
+        ):
+            player.closeEvent(event)
+        save_state.assert_called_once_with()
+        finalize.assert_not_called()
+        self.assertTrue(event.accepted)
+
+    def test_close_with_exports_uses_selected_duplicate_policy(self):
+        class Event:
+            accepted = False
+
+            def accept(self):
+                self.accepted = True
+
+            def ignore(self):
+                raise AssertionError("Close should not be cancelled")
+
+        player = PenDataPlayer.__new__(PenDataPlayer)
+        player.analysis_context = {
+            "runs": [{"id": "run-1", "analysis_copy_count": 2}]
+        }
+        player.analysis_context_saved = False
+        event = Event()
+        with patch.object(
+            QMessageBox, "question", return_value=QMessageBox.Yes
+        ), patch.object(
+            player, "_choose_existing_analysis_policy", return_value="keep"
+        ), patch.object(
+            player, "_finalize_cloud_analysis", return_value=(1, [], {})
+        ) as finalize, patch.object(
+            QApplication, "setOverrideCursor"
+        ), patch.object(
+            QApplication, "restoreOverrideCursor"
+        ):
+            player.closeEvent(event)
+        finalize.assert_called_once_with(completed=True, existing_policy="keep")
+        self.assertTrue(event.accepted)
 
     def test_finalize_bundle_contains_only_manifest_and_three_checksummed_files(self):
         with tempfile.TemporaryDirectory() as temp_dir:

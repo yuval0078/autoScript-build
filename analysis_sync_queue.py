@@ -95,7 +95,18 @@ def _entries(root):
     return sorted(values)
 
 
-def _enqueue(kind, run_id, source_path, base_etag, request_id=None):
+def _enqueue(
+    kind,
+    run_id,
+    source_path,
+    base_etag,
+    request_id=None,
+    existing_policy=None,
+):
+    if kind == "finalize":
+        existing_policy = str(existing_policy or "keep").strip().lower()
+        if existing_policy not in {"keep", "replace"}:
+            raise ValueError("existing_policy must be 'keep' or 'replace'.")
     root = queue_root()
     request_id = str(request_id or uuid.uuid4())
     with _queue_lock(root):
@@ -117,18 +128,18 @@ def _enqueue(kind, run_id, source_path, base_etag, request_id=None):
         payload_name = _copy_payload(root, Path(source_path))
         item_id = uuid.uuid4().hex
         item_path = root / f"{item_id}.queue.json"
-        _atomic_json(
-            item_path,
-            {
-                "kind": kind,
-                "created_at": time.time(),
-                "run_id": str(run_id),
-                "request_id": request_id,
-                "base_etag": base_etag,
-                "payload": payload_name,
-                "attempt_count": 0,
-            },
-        )
+        metadata = {
+            "kind": kind,
+            "created_at": time.time(),
+            "run_id": str(run_id),
+            "request_id": request_id,
+            "base_etag": base_etag,
+            "payload": payload_name,
+            "attempt_count": 0,
+        }
+        if kind == "finalize":
+            metadata["existing_policy"] = existing_policy
+        _atomic_json(item_path, metadata)
         # The replacement is durable before the older unsent draft is removed.
         for old_path, old_item in superseded:
             _remove_entry(root, old_path, old_item)
@@ -139,8 +150,21 @@ def enqueue_analysis_state(run_id, state_path, base_etag=None, request_id=None):
     return _enqueue("state_put", run_id, state_path, base_etag, request_id)
 
 
-def enqueue_analysis_finalize(run_id, bundle_path, base_etag=None, request_id=None):
-    return _enqueue("finalize", run_id, bundle_path, base_etag, request_id)
+def enqueue_analysis_finalize(
+    run_id,
+    bundle_path,
+    base_etag=None,
+    request_id=None,
+    existing_policy="keep",
+):
+    return _enqueue(
+        "finalize",
+        run_id,
+        bundle_path,
+        base_etag,
+        request_id,
+        existing_policy,
+    )
 
 
 def _move_entry(root, path, item, folder, reason):
@@ -200,6 +224,7 @@ def drain_analysis_queue(api):
                             payload,
                             base_etag=item.get("base_etag"),
                             request_id=item["request_id"],
+                            existing_policy=item.get("existing_policy", "keep"),
                         )
                     else:
                         raise ValueError(f"Unknown Analyzer queue kind: {item.get('kind')!r}")

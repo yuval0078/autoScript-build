@@ -12,6 +12,7 @@ from .experiments import (
 )
 from .results import (
     ExperimentRunResponse,
+    RunAnalysisCopyResponse,
     RunAnalysisRevisionResponse,
     RunAnalysisUpdate,
     RunArtifactResponse,
@@ -33,6 +34,7 @@ __all__ = [
     "ExperimentVersionResponse",
     "StagedBlockAssetResponse",
     "ExperimentRunResponse",
+    "RunAnalysisCopyResponse",
     "RunAnalysisRevisionResponse",
     "RunAnalysisUpdate",
     "RunArtifactResponse",
