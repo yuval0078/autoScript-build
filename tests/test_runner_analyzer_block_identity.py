@@ -6,7 +6,12 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from analyzer_refactored import ParticipantData, _result_identity
+from analyzer_refactored import (
+    ParticipantData,
+    _result_identity,
+    block_sidebar_label,
+    experiment_sidebar_heading,
+)
 from tablet_experiment import (
     ExperimentCanvas,
     ensure_shared_run_session_id,
@@ -311,6 +316,35 @@ class RunnerBlockIdentityTests(unittest.TestCase):
 
 
 class AnalyzerBlockIdentityTests(unittest.TestCase):
+    def test_sidebar_shows_experiment_once_and_block_items_by_name_only(self):
+        first = SimpleNamespace(
+            experiment_name="Reading study",
+            block_name="Practice",
+        )
+        second = SimpleNamespace(
+            experiment_name="Reading study",
+            block_name="Main task",
+        )
+
+        self.assertEqual(
+            experiment_sidebar_heading([first, second]),
+            "Experiment: Reading study",
+        )
+        self.assertEqual(block_sidebar_label(first), "Practice")
+        self.assertEqual(block_sidebar_label(second), "Main task")
+        self.assertNotIn("Reading study", block_sidebar_label(first))
+
+    def test_sidebar_handles_multiple_experiments_without_repeating_names_in_blocks(self):
+        first = SimpleNamespace(experiment_name="Study A", block_name="Block 1")
+        second = SimpleNamespace(experiment_name="Study B", block_name="Block 2")
+
+        self.assertEqual(
+            experiment_sidebar_heading([first, second]),
+            "Experiments: Study A, Study B",
+        )
+        self.assertEqual(block_sidebar_label(first), "Block 1")
+        self.assertEqual(block_sidebar_label(second), "Block 2")
+
     def _participant_from_payload(self, payload):
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "result.json"

@@ -1325,6 +1325,25 @@ class AnimationCanvas(QWidget):
 # MAIN WINDOW
 # =============================================================================
 
+
+def experiment_sidebar_heading(participants) -> str:
+    """Return the experiment heading shown once above the Block tree."""
+    names = []
+    for participant in participants or []:
+        name = str(getattr(participant, "experiment_name", "") or "").strip()
+        if name and name not in names:
+            names.append(name)
+    if not names:
+        return "Experiment: —"
+    if len(names) == 1:
+        return f"Experiment: {names[0]}"
+    return "Experiments: " + ", ".join(names)
+
+
+def block_sidebar_label(participant) -> str:
+    """Keep each top-level tree item scoped to its Block name only."""
+    return str(getattr(participant, "block_name", "") or "Unnamed Block").strip()
+
 class PenDataPlayer(QMainWindow):
     """Pen data player with animation control"""
     
@@ -1858,9 +1877,18 @@ class PenDataPlayer(QMainWindow):
         tree_title = QLabel("Words By Group")
         tree_title.setObjectName("panelTitle")
         left_layout.addWidget(tree_title)
+
+        self.experiment_name_label = QLabel("Experiment: —")
+        self.experiment_name_label.setWordWrap(True)
+        self.experiment_name_label.setStyleSheet(
+            "color: #1d3047; font-size: 14px; font-weight: 700; "
+            "padding: 7px 9px; background: #eef4fb; "
+            "border: 1px solid #cfdae8; border-radius: 8px;"
+        )
+        left_layout.addWidget(self.experiment_name_label)
         
         self.word_tree = QTreeWidget()
-        self.word_tree.setHeaderLabels(["Words by Group"])
+        self.word_tree.setHeaderLabels(["Blocks and words"])
         self.word_tree.itemClicked.connect(self.word_selected)
         left_layout.addWidget(self.word_tree)
         
@@ -2464,17 +2492,19 @@ class PenDataPlayer(QMainWindow):
     def _populate_tree(self):
         """Populate tree widget"""
         self.word_tree.clear()
+        self.experiment_name_label.setText(
+            experiment_sidebar_heading(self.participants)
+        )
         flat_idx = 0
         
         for participant in self.participants:
             p_item = QTreeWidgetItem(self.word_tree)
-            p_item.setText(
+            p_item.setText(0, block_sidebar_label(participant))
+            p_item.setToolTip(
                 0,
-                f"Participant {participant.participant_number} — "
-                f"Experiment: {participant.experiment_name} — "
-                f"Block: {participant.block_name} "
-                f"({participant.block_index}/{participant.block_count}; "
-                f"{len(participant.words)} words)"
+                f"Participant {participant.participant_number} · "
+                f"Block {participant.block_index}/{participant.block_count} · "
+                f"{len(participant.words)} words",
             )
             p_item.setExpanded(True)
             
