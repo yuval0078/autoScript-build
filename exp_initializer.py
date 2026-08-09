@@ -11,7 +11,10 @@ import uuid
 from pathlib import Path
 from app_paths import ensure_dir, user_data_dir
 from archive_utils import safe_extract_zip
-from project_version import APP_VERSION
+from component_versions import get_component_version
+
+
+BUILDER_VERSION = get_component_version("builder")
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton, 
                              QLabel, QFileDialog, QListWidget, QListWidgetItem, 
                              QTextEdit, QMessageBox, QGroupBox, QSplitter, 
@@ -568,18 +571,28 @@ class NewExperimentWizard(QWidget):
         group = self.groups.get("Group 1", {})
         return bool(group.get("files") or group.get("words"))
 
-    def import_experiment_zip(self, file_path=None):
+    def reset_draft(self):
+        self.media_player.stop()
+        self.groups = {"Group 1": {"files": [], "words": []}}
+        self.loaded_properties = None
+        self.imported_package_dir = None
+        self._active_word_item = None
+        self._active_word_text_input = None
+        self.populate_tree()
+        self.clear_right_panel()
+
+    def import_experiment_zip(self, file_path=None, replace_without_prompt=False):
         if file_path is None:
-            file_path, _ = QFileDialog.getOpenFileName(self, "Upload Experiment Package", "", "ZIP Files (*.zip)")
+            file_path, _ = QFileDialog.getOpenFileName(self, "Upload Block Package", "", "ZIP Files (*.zip)")
 
         if not file_path:
             return False
 
-        if self._has_setup_data():
+        if self._has_setup_data() and not replace_without_prompt:
             reply = QMessageBox.question(
                 self,
                 "Replace Current Draft",
-                "Loading an experiment package will replace the current experiment draft in the editor. Continue?",
+                "Loading a Block package will replace the current Block draft in the editor. Continue?",
                 QMessageBox.Yes | QMessageBox.No,
                 QMessageBox.No,
             )
@@ -587,12 +600,12 @@ class NewExperimentWizard(QWidget):
                 return False
 
         QApplication.setOverrideCursor(Qt.WaitCursor)
-        self.parent.status_msg.setText("Importing experiment package...")  # type: ignore
+        self.parent.status_msg.setText("Importing Block package...")  # type: ignore
 
         try:
             imported_groups, loaded_properties, extract_dir = self._load_experiment_package(file_path)
         except Exception as exc:
-            QMessageBox.critical(self, "Import Failed", f"Could not import experiment package:\n{exc}")
+            QMessageBox.critical(self, "Import Failed", f"Could not import Block package:\n{exc}")
             return False
         finally:
             QApplication.restoreOverrideCursor()
@@ -624,13 +637,13 @@ class NewExperimentWizard(QWidget):
         if not json_files:
             json_files = sorted(extract_dir.rglob("*.json"))
         if not json_files:
-            raise FileNotFoundError("No experiment configuration JSON found inside the ZIP package.")
+            raise FileNotFoundError("No Block configuration JSON found inside the ZIP package.")
 
         return extract_dir, json_files[0]
 
     def _resolve_imported_media_path(self, package_dir, file_lookup, source_ref):
         if not source_ref:
-            raise ValueError("Experiment package contains a word without a source audio reference.")
+            raise ValueError("Block package contains a word without a source audio reference.")
 
         entry = file_lookup.get(source_ref)
         if entry:
@@ -652,7 +665,7 @@ class NewExperimentWizard(QWidget):
                 'owner_group': None,
             }
 
-        raise FileNotFoundError(f"Missing source audio '{source_ref}' in the experiment package.")
+        raise FileNotFoundError(f"Missing source audio '{source_ref}' in the Block package.")
 
     def _load_experiment_package(self, file_path):
         extract_dir, config_path = self._extract_experiment_package(file_path)
@@ -662,7 +675,7 @@ class NewExperimentWizard(QWidget):
 
         config_groups = config.get('groups')
         if not isinstance(config_groups, list):
-            raise ValueError("This experiment package format cannot be edited by the current setup tool.")
+            raise ValueError("This Block package format cannot be edited by the current setup tool.")
 
         groups = {}
         for index, group_cfg in enumerate(config_groups, start=1):
@@ -778,7 +791,7 @@ class NewExperimentWizard(QWidget):
             })
 
         loaded_properties = {
-            'name': config.get('name', Path(file_path).stem),
+            'name': config.get('block_name') or config.get('name', Path(file_path).stem),
             'grid': config.get('grid', {}),
             'order': config.get('order', 'random'),
             'sequence': list(config.get('sequence', []) or []),
@@ -796,10 +809,10 @@ class NewExperimentWizard(QWidget):
         # Header
         header = QHBoxLayout()
         btn_back = QPushButton("← Back")
-        btn_back.clicked.connect(self.parent.show_main_menu)  # type: ignore
+        btn_back.clicked.connect(self.parent.cancel_block_edit)  # type: ignore
         header.addWidget(btn_back)
         header.addStretch()
-        title = QLabel("Experiment Setup")
+        title = QLabel("Block Content")
         title.setStyleSheet("font-size: 20px; font-weight: bold;")
         header.addWidget(title)
         header.addStretch()
@@ -1621,16 +1634,16 @@ class ExperimentPropertiesPage(QWidget):
         header.addWidget(btn_back)
         layout.addLayout(header)
         
-        # Scroll Area for Experiment Properties
+        # Scroll Area for Block Properties
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         content = QWidget()
         form_layout = QVBoxLayout(content)
         
-        # 1. Experiment Name
-        name_box = QGroupBox("Experiment Name")
+        # 1. Block Name
+        name_box = QGroupBox("Block Name")
         name_layout = QVBoxLayout()
-        self.txt_exp_name = QLineEdit("My Experiment")
+        self.txt_exp_name = QLineEdit("Block 1")
         name_layout.addWidget(self.txt_exp_name)
         name_box.setLayout(name_layout)
         form_layout.addWidget(name_box)
@@ -1797,14 +1810,25 @@ class ExperimentPropertiesPage(QWidget):
         
         # Footer
         footer = QHBoxLayout()
-        self.btn_export = QPushButton("Export Experiment Package")
+        self.btn_export = QPushButton("Save Block")
         self.btn_export.setProperty("class", "primary")
         self.btn_export.setFixedSize(250, 50)
-        self.btn_export.clicked.connect(self.export_package)
+        self.btn_export.clicked.connect(self.save_block)
         footer.addStretch()
         footer.addWidget(self.btn_export)
         footer.addStretch()
         layout.addLayout(footer)
+
+    def reset_defaults(self, block_name="Block 1"):
+        self.txt_exp_name.setText(block_name)
+        self.radio_random.setChecked(True)
+        self.radio_key.setChecked(True)
+        self.spin_delay.setValue(2000)
+        self.chk_beep_before.setChecked(False)
+        self.chk_beep_after.setChecked(False)
+        self.spin_beep_before.setValue(100)
+        self.spin_beep_after.setValue(100)
+        self.active_block_sequence = []
 
     def set_data(self, groups, loaded_properties=None):
         self.groups = groups
@@ -2078,15 +2102,18 @@ class ExperimentPropertiesPage(QWidget):
             # Apply reset to enforce new block order
             self.reset_order()
 
-    def export_package(self):
+    def export_package(self, checked=False, save_path=None, notify=True):
         exp_name = self.txt_exp_name.text().strip()
         if not exp_name:
-            QMessageBox.warning(self, "Warning", "Please enter an experiment name")
+            QMessageBox.warning(self, "Warning", "Please enter a Block name")
             return
 
-        save_path, _ = QFileDialog.getSaveFileName(self, "Save Experiment", f"{exp_name}.zip", "ZIP (*.zip)")
-        if not save_path: return
+        if not save_path:
+            save_path, _ = QFileDialog.getSaveFileName(self, "Save Block", f"{exp_name}.zip", "ZIP (*.zip)")
+            if not save_path:
+                return
 
+        temp_dir = None
         try:
             temp_dir = tempfile.mkdtemp()
             # 1. Create centralized Media folder
@@ -2200,8 +2227,11 @@ class ExperimentPropertiesPage(QWidget):
 
             # 4. Final Config Structure
             config = {
-                "app_version": APP_VERSION,
+                "schema_version": "2.0",
+                "package_type": "block",
+                "app_version": BUILDER_VERSION,
                 "name": exp_name,
+                "block_name": exp_name,
                 "grid": {"rows": self.spin_rows.value(), "cols": self.spin_cols.value()},
                 "order": "stiff" if self.radio_stiff.isChecked() else "random",
                 "sequence": sequence_ids, 
@@ -2228,11 +2258,37 @@ class ExperimentPropertiesPage(QWidget):
             with open(Path(temp_dir) / f"{exp_name}.json", 'w') as f:
                 json.dump(config, f, indent=2)
 
-            shutil.make_archive(str(Path(save_path).with_suffix('')), 'zip', temp_dir)
-            
-            shutil.rmtree(temp_dir)
-            QMessageBox.information(self, "Success", "Export Complete!")
+            archive_path = Path(
+                shutil.make_archive(str(Path(save_path).with_suffix('')), 'zip', temp_dir)
+            )
+            if notify:
+                QMessageBox.information(self, "Success", "Block ZIP saved.")
+            return archive_path
             
         except Exception as e:
-            QMessageBox.critical(self, "Error", str(e))
             traceback.print_exc()
+            if notify:
+                QMessageBox.critical(self, "Error", str(e))
+                return None
+            raise
+        finally:
+            if temp_dir:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def save_block(self):
+        block_name = self.txt_exp_name.text().strip()
+        if not block_name:
+            QMessageBox.warning(self, "Warning", "Please enter a Block name")
+            return
+
+        try:
+            with tempfile.TemporaryDirectory(prefix="autoscript-block-") as temp_dir:
+                package_path = self.export_package(
+                    save_path=Path(temp_dir) / f"{block_name}.zip",
+                    notify=False,
+                )
+                if package_path is not None:
+                    self.parent.finish_block_edit(package_path, block_name)  # type: ignore
+        except Exception as exc:
+            traceback.print_exc()
+            QMessageBox.critical(self, "Save Block Failed", str(exc))

@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "algorithm": "ed25519",
+  "threshold": 1,
+  "keys": {
+    "release-2026-08": {
+      "algorithm": "ed25519",
+      "public_key": "Wh4z5Ylh5fcTGFxf9iAXd+uQh3lC390XETrxGfXGsCc="
+    }
+  }
+}

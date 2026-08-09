@@ -1,0 +1,24 @@
+services:
+  postgres:
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+
+  minio:
+    environment:
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?Set MINIO_ROOT_PASSWORD}
+    ports: !reset []
+
+  api:
+    environment:
+      AUTOSCRIPT_ENVIRONMENT: production
+      AUTOSCRIPT_AUTH_MODE: token
+      AUTOSCRIPT_BOOTSTRAP_ADMIN_USERNAME: ${AUTOSCRIPT_BOOTSTRAP_ADMIN_USERNAME:-admin}
+      AUTOSCRIPT_BOOTSTRAP_ADMIN_PASSWORD: ${AUTOSCRIPT_BOOTSTRAP_ADMIN_PASSWORD:?Set AUTOSCRIPT_BOOTSTRAP_ADMIN_PASSWORD}
+      AUTOSCRIPT_ACCESS_TOKEN_TTL_HOURS: ${AUTOSCRIPT_ACCESS_TOKEN_TTL_HOURS:-24}
+    ports: !override
+      - "127.0.0.1:${AUTOSCRIPT_API_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/live')"]
+      interval: 10s
+      timeout: 5s
+      retries: 12

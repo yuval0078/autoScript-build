@@ -24,6 +24,93 @@ def _function_names(source: str) -> set[str]:
 
 
 class RunnerRecoveryContractsTests(unittest.TestCase):
+    def test_block_session_recalibration_covers_every_page_change(self):
+        from gui_menu import build_block_session_layout
+
+        blocks = [
+            {
+                "config_path": f"block-{index}.json",
+                "display_name": f"Block {index}",
+                "word_count": 1,
+                "rows": 1,
+                "cols": 1,
+            }
+            for index in (1, 2)
+        ]
+        plan = build_block_session_layout(blocks, recalibrate_between_blocks=True)
+        entries = plan["experiments"]
+        self.assertFalse(entries[0]["recalibrate_before_start"])
+        self.assertTrue(entries[1]["recalibrate_before_start"])
+        self.assertTrue(plan["recalibrate_between_pages"])
+        self.assertTrue(
+            all(entry["recalibrate_during_page_refresh"] for entry in entries)
+        )
+
+    def test_arranged_blocks_can_share_a_page_without_extra_recalibration(self):
+        from gui_menu import build_block_session_layout
+
+        blocks = [
+            {
+                "config_path": f"block-{index}.json",
+                "display_name": f"Block {index}",
+                "word_count": 1,
+                "rows": 1,
+                "cols": 2,
+            }
+            for index in (1, 2, 3)
+        ]
+
+        plan = build_block_session_layout(
+            blocks,
+            recalibrate_between_blocks=True,
+            joined_boundaries={0},
+        )
+        entries = plan["experiments"]
+
+        self.assertFalse(entries[0]["recalibrate_before_start"])
+        self.assertTrue(entries[1]["same_page_as_previous"])
+        self.assertFalse(entries[1]["recalibrate_before_start"])
+        self.assertTrue(entries[2]["recalibrate_before_start"])
+        self.assertTrue(
+            all(entry["recalibrate_during_page_refresh"] for entry in entries)
+        )
+
+    def test_run_settings_are_carried_in_the_session_plan(self):
+        from gui_menu import build_block_session_layout
+        from tablet_experiment import apply_session_plan
+
+        config_path = str((ROOT / "block-1.json").resolve())
+        blocks = [
+            {
+                "config_path": config_path,
+                "display_name": "Block 1",
+                "word_count": 1,
+                "rows": 1,
+                "cols": 1,
+            }
+        ]
+        plan = build_block_session_layout(
+            blocks,
+            recalibrate_between_blocks=True,
+            save_results_locally=False,
+        )
+        configs = [{"__file_path__": config_path}]
+
+        apply_session_plan(configs, plan)
+
+        self.assertFalse(plan["save_results_locally"])
+        self.assertFalse(configs[0]["__save_results_locally__"])
+        # A single Block has no boundary at which to re-calibrate.
+        self.assertFalse(plan["recalibrate_between_pages"])
+
+    def test_direct_runner_launch_keeps_legacy_local_save_default(self):
+        from tablet_experiment import apply_session_plan
+
+        configs = [{"__file_path__": str((ROOT / "legacy.json").resolve())}]
+        apply_session_plan(configs, None)
+
+        self.assertTrue(configs[0]["__save_results_locally__"])
+
     def test_runner_supports_session_plan_and_cell_offsets(self):
         source = _source("tablet_experiment.py")
         functions = _function_names(source)
@@ -40,11 +127,51 @@ class RunnerRecoveryContractsTests(unittest.TestCase):
     def test_launcher_builds_and_passes_session_layout(self):
         source = _source("gui_menu.py")
         functions = _function_names(source)
+        package_source = _source("experiment_packages.py")
+        package_functions = _function_names(package_source)
 
         self.assertIn("build_session_layout", functions)
-        self.assertIn("safe_extract_zip(zip_ref, extract_dir)", source)
-        self.assertIn('source_script_path("tablet_experiment.py")', source)
-        self.assertIn('command.extend(["--session-plan", str(session_plan_path)])', source)
+        self.assertIn("unpack_experiment_package", package_functions)
+        self.assertIn("unpack_experiment_package(file_path, destination)", source)
+        self.assertIn("safe_extract_zip(block_archive, extracted_dir)", package_source)
+        self.assertIn('source_kind="block"', package_source)
+        self.assertIn('source_kind="experiment"', package_source)
+        self.assertIn('component_launch_command(', source)
+        self.assertIn('"runner",', source)
+        self.assertIn('source_script="tablet_experiment.py"', source)
+        self.assertIn('legacy_executable="ExperimentRunner.exe"', source)
+        self.assertIn('arguments.extend(["--session-plan", str(session_plan_path)])', source)
+
+    def test_local_legacy_runs_use_the_block_arrangement_dialog(self):
+        source = _source("gui_menu.py")
+
+        self.assertIn(
+            "if len(experiments) > 1 and parent_experiment is None:",
+            source,
+        )
+        self.assertIn(
+            "arrange_dialog = ArrangeExperimentsDialog(",
+            source,
+        )
+        self.assertIn('config["block_index"] = final_block_index', source)
+
+        arrange_source = source[
+            source.index("class ArrangeExperimentsDialog"):
+            source.index("class MainMenu")
+        ]
+        self.assertNotIn("recalibrate_toggle", arrange_source)
+        self.assertNotIn('"Re-calibrate Between Blocks",', source)
+
+    def test_runner_local_save_no_longer_uses_an_end_of_run_file_dialog(self):
+        source = _source("tablet_experiment.py")
+        save_flow = source[
+            source.index("    def _save_single_result"):
+            source.index("    def finish_experiment")
+        ]
+
+        self.assertNotIn("QFileDialog", save_flow)
+        self.assertIn("_should_save_results_locally", save_flow)
+        self.assertIn("Local saving was disabled in Run settings", save_flow)
 
     def test_audio_playback_cache_is_present_without_removing_safe_temp_paths(self):
         source = _source("audio_processor.py")

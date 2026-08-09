@@ -1,0 +1,232 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autoscript.local/schemas/data-contracts/trainable-export.schema.json",
+  "title": "Analyzer trainable JSON as currently emitted",
+  "description": "One participant is emitted as an object; multiple participants are emitted as an array.",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/participant"
+    },
+    {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/participant"
+      }
+    }
+  ],
+  "$defs": {
+    "participant": {
+      "type": "object",
+      "required": [
+        "participant_number",
+        "participant_age",
+        "participant_gender",
+        "timestamp",
+        "calibration",
+        "group",
+        "words"
+      ],
+      "properties": {
+        "analyzer_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "run_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source_result_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source_sha256": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[0-9a-fA-F]{64}$"
+        },
+        "experiment_name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "experiment_id": {
+          "type": [
+            "string",
+            "integer",
+            "null"
+          ]
+        },
+        "block_name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "block_id": {
+          "type": [
+            "string",
+            "integer",
+            "null"
+          ]
+        },
+        "block_index": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "block_count": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "participant_number": {
+          "type": [
+            "integer",
+            "string"
+          ]
+        },
+        "participant_age": {
+          "type": [
+            "integer",
+            "number",
+            "string",
+            "null"
+          ]
+        },
+        "participant_gender": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "timestamp": {
+          "type": "string"
+        },
+        "calibration": {
+          "oneOf": [
+            {
+              "$ref": "common.schema.json#/$defs/calibration"
+            },
+            {
+              "type": "null"
+            },
+            {
+              "type": "array",
+              "items": {}
+            }
+          ]
+        },
+        "group": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "words": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/trainableWord"
+          }
+        }
+      },
+      "additionalProperties": true
+    },
+    "trainableWord": {
+      "type": "object",
+      "required": [
+        "written_word",
+        "trainability",
+        "audio_start_time",
+        "audio_end_time",
+        "strokes",
+        "letters"
+      ],
+      "properties": {
+        "written_word": {
+          "type": "string"
+        },
+        "trainability": {
+          "type": "string",
+          "enum": [
+            "trainable",
+            "low-quality",
+            "untrainable"
+          ]
+        },
+        "audio_start_time": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "audio_end_time": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "strokes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/stroke"
+          }
+        },
+        "letters": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/letter"
+          }
+        }
+      },
+      "additionalProperties": true
+    },
+    "stroke": {
+      "type": "object",
+      "required": [
+        "stroke_id",
+        "events"
+      ],
+      "properties": {
+        "stroke_id": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "events": {
+          "type": "array",
+          "items": {
+            "$ref": "common.schema.json#/$defs/penEvent"
+          }
+        }
+      },
+      "additionalProperties": true
+    },
+    "letter": {
+      "type": "object",
+      "required": [
+        "char",
+        "stroke_ids"
+      ],
+      "properties": {
+        "char": {
+          "type": "string"
+        },
+        "stroke_ids": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "additionalProperties": true
+    }
+  }
+}

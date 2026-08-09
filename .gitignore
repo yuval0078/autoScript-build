@@ -12,6 +12,10 @@ __pycache__/
 venv/
 ENV/
 
+# Local secrets and service configuration
+.env
+backend/.env
+
 # Large binary files (over 100MB)
 portable build/TouchpadExperiment/assets/bin/ffmpeg.exe
 portable build/TouchpadExperiment/assets/bin/ffprobe.exe
@@ -25,6 +29,8 @@ assets/bin/ffprobe.exe
 *trainable*.json
 *analysis*.json
 *analysis*.csv
+!schemas/data-contracts/analysis-state.schema.json
+!schemas/data-contracts/analysis-finalize-manifest.schema.json
 1_*/
 
 # OS files

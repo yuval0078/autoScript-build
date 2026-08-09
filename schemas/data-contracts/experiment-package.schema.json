@@ -1,0 +1,255 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autoscript.local/schemas/data-contracts/experiment-package.schema.json",
+  "title": "AutoScript Block JSON (legacy Experiment ZIP compatible)",
+  "type": "object",
+  "required": [
+    "name",
+    "grid",
+    "order",
+    "sequence",
+    "repetitions",
+    "active_block_sequence",
+    "proceed_condition",
+    "beeps",
+    "files",
+    "groups"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Optional for legacy packages; new Block packages should set it."
+    },
+    "package_type": {
+      "const": "block",
+      "description": "Optional discriminator for new Block packages."
+    },
+    "block_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Stable Block identifier; optional for legacy packages."
+    },
+    "app_version": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Builder version that created the Block. Optional for legacy packages."
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1
+    },
+    "grid": {
+      "type": "object",
+      "required": [
+        "rows",
+        "cols"
+      ],
+      "properties": {
+        "rows": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "cols": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "additionalProperties": true
+    },
+    "order": {
+      "type": "string",
+      "enum": [
+        "stiff",
+        "random"
+      ]
+    },
+    "sequence": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "repetitions": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "integer",
+        "minimum": 1
+      }
+    },
+    "active_block_sequence": {
+      "type": "array",
+      "items": {
+        "type": "array",
+        "prefixItems": [
+          {
+            "type": "string",
+            "minLength": 1
+          },
+          {
+            "type": "integer",
+            "minimum": 1
+          }
+        ],
+        "minItems": 2,
+        "maxItems": 2
+      }
+    },
+    "proceed_condition": {
+      "type": "object",
+      "required": [
+        "type",
+        "delay_ms"
+      ],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "key",
+            "time"
+          ]
+        },
+        "delay_ms": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": true
+    },
+    "beeps": {
+      "type": "object",
+      "required": [
+        "before",
+        "after"
+      ],
+      "properties": {
+        "before": {
+          "$ref": "#/$defs/beep"
+        },
+        "after": {
+          "$ref": "#/$defs/beep"
+        }
+      },
+      "additionalProperties": true
+    },
+    "files": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/mediaFile"
+      }
+    },
+    "groups": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/group"
+      }
+    }
+  },
+  "$defs": {
+    "beep": {
+      "type": "object",
+      "required": [
+        "enabled",
+        "delay_ms"
+      ],
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "delay_ms": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": true
+    },
+    "mediaFile": {
+      "type": "object",
+      "required": [
+        "file_name",
+        "path",
+        "original_name"
+      ],
+      "properties": {
+        "file_name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "path": {
+          "type": "string",
+          "pattern": "^media/[^/]+$"
+        },
+        "original_name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "owner_group": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Group that owns this media file. Optional for legacy packages."
+        },
+        "auto_slice_word": {
+          "type": "boolean",
+          "description": "Whether this media file should be sliced automatically. Optional for legacy packages."
+        }
+      },
+      "additionalProperties": true
+    },
+    "group": {
+      "type": "object",
+      "required": [
+        "name",
+        "words"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "words": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/word"
+          }
+        }
+      },
+      "additionalProperties": true
+    },
+    "word": {
+      "type": "object",
+      "required": [
+        "id",
+        "text",
+        "source_file",
+        "start_ms",
+        "end_ms"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "text": {
+          "type": "string"
+        },
+        "source_file": {
+          "type": "string",
+          "minLength": 1
+        },
+        "start_ms": {
+          "type": "number",
+          "minimum": 0
+        },
+        "end_ms": {
+          "type": "number",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}

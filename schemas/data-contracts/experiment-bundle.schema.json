@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autoscript.local/schemas/data-contracts/experiment-bundle.schema.json",
+  "title": "AutoScript multi-Block Experiment bundle manifest",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "package_type",
+    "name",
+    "blocks"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "minLength": 1
+    },
+    "package_type": {
+      "const": "experiment"
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1
+    },
+    "id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "revision_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "revision_number": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "blocks": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/blockEntry"
+      }
+    }
+  },
+  "$defs": {
+    "blockEntry": {
+      "type": "object",
+      "required": [
+        "name",
+        "path",
+        "sha256"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "path": {
+          "type": "string",
+          "pattern": "^blocks/[0-9]{3}_[^/]+\\.zip$"
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "same_page_as_previous": {
+          "type": "boolean",
+          "default": false,
+          "description": "If true, this Block continues on the same physical page as the previous Block. Optional for older bundles."
+        }
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}

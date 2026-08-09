@@ -1,0 +1,266 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autoscript.local/schemas/data-contracts/raw-run.schema.json",
+  "title": "Runner block result JSON",
+  "description": "A result for one executed block. Block identity is present from v1.1, completeness from v1.2, and immutable cloud Run/revision identity from v1.3; v1.0 files remain valid for backwards compatibility.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "app_version",
+    "experiment_name",
+    "experiment_id",
+    "experiment_version",
+    "session_experiment_index",
+    "session_experiment_count",
+    "participant_number",
+    "participant_age",
+    "participant_gender",
+    "session_id",
+    "timestamp",
+    "calibration",
+    "config",
+    "words"
+  ],
+  "properties": {
+    "schema_version": {
+      "enum": [
+        "1.0",
+        "1.1",
+        "1.2",
+        "1.3"
+      ]
+    },
+    "app_version": {
+      "type": "string",
+      "minLength": 1
+    },
+    "experiment_name": {
+      "type": "string",
+      "minLength": 1
+    },
+    "experiment_id": {
+      "type": [
+        "string",
+        "integer",
+        "null"
+      ]
+    },
+    "experiment_version": {
+      "type": [
+        "integer",
+        "string",
+        "null"
+      ]
+    },
+    "experiment_revision_id": {
+      "type": ["string", "null"]
+    },
+    "experiment_revision_number": {
+      "type": ["integer", "null"],
+      "minimum": 1
+    },
+    "server_run_id": {
+      "type": ["string", "null"]
+    },
+    "test_mode": {
+      "type": "boolean"
+    },
+    "block_name": {
+      "type": "string",
+      "minLength": 1
+    },
+    "block_id": {
+      "type": [
+        "string",
+        "integer",
+        "null"
+      ]
+    },
+    "block_index": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "block_count": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "block_completed": {
+      "type": "boolean"
+    },
+    "experiment_completed": {
+      "type": "boolean"
+    },
+    "completed_word_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "expected_word_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "session_experiment_index": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "session_experiment_count": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "participant_number": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "participant_age": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "participant_gender": {
+      "type": "string",
+      "enum": [
+        "Male",
+        "Female",
+        "Other",
+        "Prefer not to say"
+      ]
+    },
+    "session_id": {
+      "type": "string",
+      "pattern": "^[0-9]+_\\d{8}_\\d{6}_[0-9a-f]{6}$"
+    },
+    "timestamp": {
+      "$ref": "common.schema.json#/$defs/localTimestamp"
+    },
+    "recorded_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "calibration": {
+      "$ref": "common.schema.json#/$defs/calibration"
+    },
+    "config": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "words": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/wordRecord"
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "schema_version": {
+            "enum": [
+              "1.1",
+              "1.2",
+              "1.3"
+            ]
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "block_name",
+          "block_id",
+          "block_index",
+          "block_count"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "schema_version": {
+            "enum": [
+              "1.2",
+              "1.3"
+            ]
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "block_completed",
+          "experiment_completed",
+          "completed_word_count",
+          "expected_word_count"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "schema_version": {
+            "const": "1.3"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "experiment_revision_id",
+          "experiment_revision_number",
+          "server_run_id"
+        ]
+      }
+    }
+  ],
+  "$defs": {
+    "wordRecord": {
+      "type": "object",
+      "required": [
+        "word",
+        "cell",
+        "group",
+        "start_time",
+        "end_time",
+        "audio_start_time",
+        "audio_end_time",
+        "pen_events"
+      ],
+      "properties": {
+        "word": {
+          "type": "string"
+        },
+        "cell": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "group": {
+          "type": "string"
+        },
+        "start_time": {
+          "type": "number"
+        },
+        "end_time": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "audio_start_time": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "audio_end_time": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "pen_events": {
+          "type": "array",
+          "items": {
+            "$ref": "common.schema.json#/$defs/penEvent"
+          }
+        }
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}

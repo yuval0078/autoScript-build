@@ -1,0 +1,96 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autoscript.local/schemas/data-contracts/common.schema.json",
+  "title": "AutoScript definitions for currently emitted files",
+  "$defs": {
+    "localTimestamp": {
+      "type": "string",
+      "pattern": "^\\d{8}_\\d{6}$",
+      "description": "Local timestamp emitted with datetime.now().strftime('%Y%m%d_%H%M%S')."
+    },
+    "coordinatePair": {
+      "type": "array",
+      "prefixItems": [
+        {
+          "type": "number"
+        },
+        {
+          "type": "number"
+        }
+      ],
+      "minItems": 2,
+      "maxItems": 2
+    },
+    "calibration": {
+      "type": "object",
+      "required": [
+        "corners"
+      ],
+      "properties": {
+        "corners": {
+          "type": "array",
+          "prefixItems": [
+            {
+              "$ref": "#/$defs/coordinatePair"
+            },
+            {
+              "$ref": "#/$defs/coordinatePair"
+            },
+            {
+              "$ref": "#/$defs/coordinatePair"
+            },
+            {
+              "$ref": "#/$defs/coordinatePair"
+            }
+          ],
+          "minItems": 4,
+          "maxItems": 4
+        }
+      },
+      "additionalProperties": true
+    },
+    "penEvent": {
+      "type": "object",
+      "required": [
+        "type",
+        "x",
+        "y",
+        "pressure",
+        "timestamp",
+        "absolute_time",
+        "speed"
+      ],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "press",
+            "move",
+            "release"
+          ]
+        },
+        "x": {
+          "type": "number"
+        },
+        "y": {
+          "type": "number"
+        },
+        "pressure": {
+          "type": "number",
+          "minimum": 0
+        },
+        "timestamp": {
+          "type": "number"
+        },
+        "absolute_time": {
+          "type": "number"
+        },
+        "speed": {
+          "type": "number",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": true
+    }
+  }
+}

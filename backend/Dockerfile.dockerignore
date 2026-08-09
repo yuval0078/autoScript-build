@@ -1,0 +1,8 @@
+**
+!backend/
+!backend/app/**
+!backend/migrations/**
+!backend/alembic.ini
+!backend/requirements.txt
+!schemas/
+!schemas/data-contracts/**

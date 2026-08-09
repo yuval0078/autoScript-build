@@ -1,0 +1,92 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autoscript.local/schemas/analysis-state.schema.json",
+  "title": "AutoScript Analyzer edit state",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "run_id",
+    "experiment_id",
+    "session_id",
+    "source_fingerprint",
+    "sources"
+  ],
+  "properties": {
+    "schema_version": {"const": "1.1"},
+    "analyzer_version": {"type": "string", "maxLength": 32},
+    "run_id": {"type": "string", "minLength": 1},
+    "experiment_id": {"type": ["string", "null"]},
+    "session_id": {"type": "string", "minLength": 1, "maxLength": 128},
+    "source_fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "sources": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/source"}
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "source": {
+      "type": "object",
+      "required": [
+        "result_id",
+        "raw_sha256",
+        "session_id",
+        "block_id",
+        "block_index",
+        "block_name",
+        "word_count",
+        "words"
+      ],
+      "properties": {
+        "result_id": {"type": "string", "minLength": 1},
+        "raw_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "session_id": {"type": "string", "minLength": 1, "maxLength": 128},
+        "block_id": {"type": ["string", "null"]},
+        "block_index": {"type": "integer", "minimum": 1},
+        "block_name": {"type": "string", "minLength": 1, "maxLength": 200},
+        "word_count": {"type": "integer", "minimum": 0},
+        "words": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/word"}
+        }
+      },
+      "additionalProperties": false
+    },
+    "word": {
+      "type": "object",
+      "required": ["letters", "assigned_letters", "stroke_slices", "trainability"],
+      "properties": {
+        "letters": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["char", "stroke_ids"],
+            "properties": {
+              "char": {"type": "string"},
+              "stroke_ids": {
+                "type": "array",
+                "items": {"type": "integer", "minimum": 0}
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "assigned_letters": {
+          "type": "object",
+          "propertyNames": {"pattern": "^(0|[1-9][0-9]*)$"},
+          "additionalProperties": {"type": "string"}
+        },
+        "stroke_slices": {
+          "type": "array",
+          "items": {"type": "integer", "minimum": 0}
+        },
+        "trainability": {
+          "enum": ["trainable", "low-quality", "untrainable"]
+        },
+        "written_word": {"type": "string"},
+        "correct": {"type": "boolean"}
+      },
+      "additionalProperties": false
+    }
+  }
+}

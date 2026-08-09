@@ -19,7 +19,26 @@ from datetime import datetime
 import time
 import json
 import uuid
-from project_version import APP_VERSION
+from component_versions import get_component_version
+from runner_launch_contract import read_runtime_session_seed
+
+
+RUNNER_VERSION = get_component_version("runner")
+
+
+def _configure_console_output():
+    """Keep diagnostic Unicode from crashing Windows legacy consoles."""
+
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(errors="replace")
+            except (OSError, ValueError):
+                pass
+
+
+_configure_console_output()
 
 # Import AudioProcessor for segment playback
 try:
@@ -93,6 +112,16 @@ def _manifest_to_legacy_config(config_path: str, manifest: dict) -> dict:
         'experiment_version': manifest.get('experiment_version')
     }
 
+    for identity_key in (
+        'experiment_name',
+        'block_name',
+        'block_id',
+        'block_index',
+        'block_count',
+    ):
+        if identity_key in manifest:
+            legacy_config[identity_key] = manifest[identity_key]
+
     return legacy_config
 
 
@@ -118,28 +147,174 @@ def load_experiment_config(config_path: str) -> dict:
     return config
 
 
-_SESSION_SEED_SUFFIX = ".autoscript_session_seed"
+def _first_identity_value(*values):
+    """Return the first identity value that is present and non-empty."""
+    for value in values:
+        if value is not None and value != '':
+            return value
+    return None
 
 
-def _session_seed_path(config_path: str) -> str:
-    """Return the sidecar path used to persist one session seed per extracted config."""
-    return f"{os.path.abspath(config_path)}{_SESSION_SEED_SUFFIX}"
-
-
-def write_runtime_session_seed(config_path: str, session_seed: str):
-    """Persist a session seed so launcher preloading and runner startup use the same order."""
-    with open(_session_seed_path(config_path), 'w', encoding='utf-8') as handle:
-        handle.write(str(session_seed).strip())
-
-
-def read_runtime_session_seed(config_path: str):
-    """Load a previously stored session seed, if one exists."""
+def _positive_identity_int(value, fallback):
+    """Coerce a 1-based index/count, falling back for missing legacy metadata."""
     try:
-        with open(_session_seed_path(config_path), 'r', encoding='utf-8') as handle:
-            session_seed = handle.read().strip()
-            return session_seed or None
-    except OSError:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return fallback
+    return parsed if parsed >= 1 else fallback
+
+
+def get_block_run_identity(config: dict, session_index=0, session_total=1) -> dict:
+    """Resolve parent-experiment and block identity for old and new configs.
+
+    New launchers inject the six public identity keys at the top level. The
+    nested contexts are accepted for early bundles, while a legacy ZIP whose
+    config only has ``name`` is treated as a one-block experiment.
+    """
+    config = config if isinstance(config, dict) else {}
+    experiment_context = config.get('__experiment__')
+    if not isinstance(experiment_context, dict):
+        experiment_context = {}
+    block_context = config.get('__block__')
+    if not isinstance(block_context, dict):
+        block_context = {}
+    properties = config.get('properties')
+    if not isinstance(properties, dict):
+        properties = {}
+
+    legacy_name = _first_identity_value(
+        config.get('name'),
+        properties.get('experiment_name'),
+    )
+    if legacy_name is None and config.get('__file_path__'):
+        legacy_name = Path(str(config['__file_path__'])).stem
+    legacy_name = str(legacy_name or 'experiment')
+
+    block_name = _first_identity_value(
+        config.get('block_name'),
+        config.get('__block_name__'),
+        block_context.get('name'),
+        legacy_name,
+    )
+    experiment_name = _first_identity_value(
+        config.get('experiment_name'),
+        config.get('__experiment_name__'),
+        config.get('parent_experiment_name'),
+        experiment_context.get('name'),
+        block_name,
+    )
+    experiment_id = _first_identity_value(
+        config.get('experiment_id'),
+        config.get('__experiment_id__'),
+        config.get('parent_experiment_id'),
+        experiment_context.get('id'),
+        experiment_name,
+    )
+    block_id = _first_identity_value(
+        config.get('block_id'),
+        config.get('__block_id__'),
+        block_context.get('id'),
+    )
+
+    default_index = max(1, int(session_index or 0) + 1)
+    default_count = max(default_index, int(session_total or 1))
+    block_index = _positive_identity_int(
+        _first_identity_value(
+            config.get('block_index'),
+            config.get('__block_index__'),
+            block_context.get('index'),
+        ),
+        default_index,
+    )
+    block_count = _positive_identity_int(
+        _first_identity_value(
+            config.get('block_count'),
+            config.get('__block_count__'),
+            experiment_context.get('block_count'),
+        ),
+        default_count,
+    )
+    block_count = max(block_count, block_index)
+
+    return {
+        'experiment_name': str(experiment_name),
+        'experiment_id': experiment_id,
+        'block_name': str(block_name),
+        'block_id': block_id,
+        'block_index': block_index,
+        'block_count': block_count,
+    }
+
+
+def ensure_shared_run_session_id(configs, participant_number) -> str:
+    """Assign one run/session id to every block config in an experiment run."""
+    usable_configs = [config for config in (configs or []) if isinstance(config, dict)]
+    existing = next(
+        (
+            config.get('__run_session_id__')
+            for config in usable_configs
+            if config.get('__run_session_id__')
+        ),
+        None,
+    )
+    session_id = existing or (
+        f"{participant_number}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_"
+        f"{uuid.uuid4().hex[:6]}"
+    )
+    for config in usable_configs:
+        config['__run_session_id__'] = session_id
+    return session_id
+
+
+def initialize_cloud_run(configs, participant_number, age, gender, test_mode=False):
+    """Create one server Run before the first Block starts; local files remain a fallback."""
+    if not configs:
         return None
+    existing = next((config.get('__server_run_id__') for config in configs if config.get('__server_run_id__')), None)
+    if existing:
+        return existing
+    revision_id = configs[0].get('experiment_revision_id')
+    experiment_id = configs[0].get('experiment_id')
+    try:
+        uuid.UUID(str(revision_id))
+        uuid.UUID(str(experiment_id))
+    except (ValueError, TypeError, AttributeError):
+        return None
+    session_id = ensure_shared_run_session_id(configs, participant_number)
+    try:
+        from autoscript_api import AutoScriptAPI
+        api = AutoScriptAPI()
+        run = api.create_run(
+            revision_id, session_id, participant_number, age, gender
+        )
+        api.start_run(run['id'])
+        for config in configs:
+            config['__server_run_id__'] = run['id']
+        return run['id']
+    except Exception as exc:
+        print(f"Cloud Run initialization failed; results will use the durable queue: {exc}")
+        return None
+
+
+def queue_cloud_run_failure(configs, api_factory=None):
+    """Best-effort durable failure reporting for an uncaught Runner exception."""
+    run_ids = {
+        str(config.get('__server_run_id__'))
+        for config in (configs or [])
+        if isinstance(config, dict) and config.get('__server_run_id__')
+    }
+    if not run_ids:
+        return 0, []
+    from autoscript_api import AutoScriptAPI
+    from result_upload_queue import drain_upload_queue, enqueue_transition
+
+    for run_id in run_ids:
+        enqueue_transition(run_id, 'fail')
+    try:
+        api = api_factory() if api_factory is not None else AutoScriptAPI()
+        return drain_upload_queue(api)
+    except Exception as exc:
+        return 0, [f"Cloud connection: {exc}"]
 
 
 def _make_word_shuffle_rng(config: dict, session_seed=None):
@@ -393,6 +568,7 @@ def apply_session_plan(configs, session_plan=None):
     """Attach per-config page-layout metadata from the launcher session plan."""
     plan_by_path = {}
     session_recalibrate_between_pages = bool((session_plan or {}).get('recalibrate_between_pages', False))
+    save_results_locally = bool((session_plan or {}).get('save_results_locally', True))
     if session_plan:
         for entry in session_plan.get('experiments', []):
             config_path = entry.get('config_path')
@@ -413,6 +589,7 @@ def apply_session_plan(configs, session_plan=None):
 
         config['__session_layout__'] = layout
         config['__session_recalibrate_between_pages__'] = session_recalibrate_between_pages
+        config['__save_results_locally__'] = save_results_locally
 
     return configs
 
@@ -1124,6 +1301,7 @@ class ExperimentCanvas(QWidget):
         self.participant_number = participant_number
         self.config = config
         self.test_mode = test_mode
+        self._cloud_upload_outcome = None
         self.participant_age = age
         self.participant_gender = gender
         self.session_index = session_index
@@ -1171,6 +1349,13 @@ class ExperimentCanvas(QWidget):
             self.beep_before_delay = beeps.get('before', {}).get('delay_ms', 100)
             self.beep_after = beeps.get('after', {}).get('enabled', False)
             self.beep_after_delay = beeps.get('after', {}).get('delay_ms', 100)
+
+        self.run_identity = get_block_run_identity(
+            self.config,
+            session_index=self.session_index,
+            session_total=self.session_total,
+        )
+        self.exp_name = self.run_identity['block_name']
             
         self.grid_size = self.grid_rows # For compatibility with some methods, though we should use rows/cols
         self.total_cells = self.grid_rows * self.grid_cols
@@ -1285,7 +1470,12 @@ class ExperimentCanvas(QWidget):
         self.grid_size = self.grid_rows # For compatibility with some methods, though we should use rows/cols
         self.total_cells = self.grid_rows * self.grid_cols
         
-        print(f"✓ Loaded {len(self.words)} words for experiment")
+        self.exp_name = get_block_run_identity(
+            self.config,
+            session_index=self.session_index,
+            session_total=self.session_total,
+        )['block_name']
+        print(f"✓ Loaded {len(self.words)} words for block")
     
     
     def _shuffle_with_spacing(self, word_pool):
@@ -1296,7 +1486,7 @@ class ExperimentCanvas(QWidget):
         return _shuffle_words_with_spacing(word_pool)
 
     def _current_experiment_display_name(self):
-        """Return the current experiment file label shown in the session banner."""
+        """Return the current block label shown in the session banner."""
         display_name = self.session_layout.get('display_name') if self.session_layout else None
         if display_name:
             return str(display_name)
@@ -1307,7 +1497,7 @@ class ExperimentCanvas(QWidget):
         return self.exp_name or 'experiment'
 
     def _current_word_progress_text(self):
-        """Return the 1-based word progress for the current experiment."""
+        """Return the 1-based word progress for the current block."""
         total_words = len(self.words)
         if total_words <= 0:
             return '0/0'
@@ -1316,11 +1506,16 @@ class ExperimentCanvas(QWidget):
         return f"{word_number}/{total_words}"
 
     def _current_session_experiment_text(self):
-        """Return the current experiment index within the session."""
-        return f"{self.session_index + 1}/{self.session_total}"
+        """Return the current block index/count (legacy method name)."""
+        identity = get_block_run_identity(
+            self.config,
+            session_index=self.session_index,
+            session_total=self.session_total,
+        )
+        return f"{identity['block_index']}/{identity['block_count']}"
 
     def _current_heading_prefix(self):
-        """Return the shared heading prefix for the current experiment state."""
+        """Return the shared heading prefix for the current block state."""
         return (
             f"{self._current_experiment_display_name()} "
             f"({self._current_session_experiment_text()}) - "
@@ -1778,7 +1973,7 @@ class ExperimentCanvas(QWidget):
         return safe or 'experiment'
     
     def collect_experiment_data(self):
-        """Finalize this experiment and return the JSON-ready result data."""
+        """Finalize this block and return the JSON-ready result data."""
         if self.completed_data is not None:
             return self.completed_data
         
@@ -1787,37 +1982,49 @@ class ExperimentCanvas(QWidget):
         elif self.pen_recorder.current_word_data:
             self.pen_recorder.end_word()
         
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        recorded_at = datetime.now().astimezone()
+        timestamp = recorded_at.strftime('%Y%m%d_%H%M%S')
+        identity = get_block_run_identity(
+            self.config,
+            session_index=self.session_index,
+            session_total=self.session_total,
+        )
         self.completed_data = {
-            'schema_version': '1.0',
-            'app_version': APP_VERSION,
-            'experiment_name': self.exp_name,
-            'experiment_id': self.config.get('experiment_id', self.exp_name),
+            'schema_version': '1.3',
+            'app_version': RUNNER_VERSION,
+            'experiment_name': identity['experiment_name'],
+            'experiment_id': identity['experiment_id'],
             'experiment_version': self.config.get('experiment_version', 1),
-            'session_experiment_index': self.session_index + 1,
-            'session_experiment_count': self.session_total,
+            'experiment_revision_id': self.config.get('experiment_revision_id'),
+            'experiment_revision_number': self.config.get('experiment_revision_number'),
+            'server_run_id': self.config.get('__server_run_id__'),
+            'test_mode': bool(self.test_mode),
+            'block_name': identity['block_name'],
+            'block_id': identity['block_id'],
+            'block_index': identity['block_index'],
+            'block_count': identity['block_count'],
+            'block_completed': len(self.pen_recorder.all_word_data) >= len(self.words),
+            'experiment_completed': (
+                len(self.pen_recorder.all_word_data) >= len(self.words)
+                and identity['block_count'] == 1
+            ),
+            'completed_word_count': len(self.pen_recorder.all_word_data),
+            'expected_word_count': len(self.words),
+            'session_experiment_index': identity['block_index'],
+            'session_experiment_count': identity['block_count'],
             'participant_number': self.participant_number,
             'participant_age': self.participant_age,
             'participant_gender': self.participant_gender,
-            'session_id': f"{self.participant_number}_{timestamp}_{uuid.uuid4().hex[:6]}",
+            'session_id': self.config.get('__run_session_id__') or (
+                f"{self.participant_number}_{timestamp}_{uuid.uuid4().hex[:6]}"
+            ),
             'timestamp': timestamp,
+            'recorded_at': recorded_at.isoformat(timespec='seconds'),
             'calibration': self.calibration_data,
             'config': self.config,
             'words': self.pen_recorder.all_word_data
         }
         return self.completed_data
-    
-    def _confirm_discard(self, parent, text):
-        """Ask whether unsaved data should be discarded."""
-        discard_msg = QMessageBox(parent)
-        discard_msg.setIcon(QMessageBox.Warning)
-        discard_msg.setWindowTitle("Discard Data?")
-        discard_msg.setText(text)
-        discard_msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
-        discard_msg.setDefaultButton(QMessageBox.No)
-        discard_msg.setWindowModality(Qt.ApplicationModal)
-        discard_msg.setWindowFlag(Qt.WindowStaysOnTopHint, True)
-        return discard_msg.exec_() == QMessageBox.Yes
     
     def _cleanup_and_quit(self):
         """Release audio resources and close the app."""
@@ -1830,6 +2037,7 @@ class ExperimentCanvas(QWidget):
             pass
         app = QApplication.instance()
         if app:
+            app.setProperty("autoscript_allow_close", True)
             app.closeAllWindows()
             app.quit()
         else:
@@ -1845,47 +2053,190 @@ class ExperimentCanvas(QWidget):
                 pygame.mixer.music.stop()
         except Exception:
             pass
+
+    def _upload_saved_results(self, saved_results, transition="finalize"):
+        """Durably queue cloud-run results, then make a best-effort upload."""
+        cloud_results = []
+        skipped = 0
+        for data_file, result in saved_results:
+            experiment_id = result.get('experiment_id')
+            try:
+                uuid.UUID(str(experiment_id))
+            except (ValueError, TypeError, AttributeError):
+                skipped += 1
+                continue
+            cloud_results.append((data_file, result, str(experiment_id)))
+
+        if not cloud_results:
+            return 0, [], skipped
+
+        from result_upload_queue import drain_upload_queue, enqueue_result, enqueue_transition
+        run_ids = set()
+        for result_index, (data_file, result, experiment_id) in enumerate(cloud_results):
+            run_id = result.get('server_run_id') or result.get('config', {}).get('__server_run_id__')
+            terminal_after = (
+                transition
+                if transition and not run_id and result_index == len(cloud_results) - 1
+                else None
+            )
+            enqueue_result(
+                data_file,
+                experiment_id,
+                run_id=run_id,
+                terminal_after=terminal_after,
+            )
+            if run_id:
+                run_ids.add(str(run_id))
+        if transition:
+            for run_id in run_ids:
+                enqueue_transition(run_id, transition)
+        from autoscript_api import AutoScriptAPI
+        try:
+            api = AutoScriptAPI()
+        except Exception as exc:
+            return 0, [f"Cloud connection: {exc}"], skipped
+        uploaded, queue_errors = drain_upload_queue(api)
+        return uploaded, list(queue_errors), skipped
+
+    def _upload_results_before_export(self, results, transition="finalize"):
+        """Persist cloud results independently of the optional user export dialog."""
+        cached = getattr(self, '_cloud_upload_outcome', None)
+        if cached is not None:
+            return cached
+
+        from app_paths import ensure_dir, user_data_dir
+
+        staging = ensure_dir(user_data_dir() / 'results' / 'cloud_staging')
+        staged_results = []
+        try:
+            for result in results:
+                target = staging / f"{uuid.uuid4().hex}.json"
+                temporary = target.with_suffix('.tmp')
+                temporary.write_text(
+                    json.dumps(result, ensure_ascii=False, indent=2),
+                    encoding='utf-8',
+                )
+                temporary.replace(target)
+                staged_results.append((target, result))
+            outcome = self._upload_saved_results(
+                staged_results,
+                transition=transition,
+            )
+            self._cloud_upload_outcome = outcome
+            return outcome
+        finally:
+            for staged_path, _result in staged_results:
+                staged_path.unlink(missing_ok=True)
+
+    def _transition_cloud_results(self, results, transition):
+        """Queue a terminal Run transition after its result payloads."""
+        from autoscript_api import AutoScriptAPI
+        from result_upload_queue import drain_upload_queue, enqueue_transition
+
+        run_ids = {
+            str(
+                result.get('server_run_id')
+                or result.get('config', {}).get('__server_run_id__')
+            )
+            for result in results
+            if (
+                result.get('server_run_id')
+                or result.get('config', {}).get('__server_run_id__')
+            )
+        }
+        if not run_ids:
+            return 0, []
+        for run_id in run_ids:
+            enqueue_transition(run_id, transition)
+        try:
+            return drain_upload_queue(AutoScriptAPI())
+        except Exception as exc:
+            return 0, [f"Cloud connection: {exc}"]
+
+    @staticmethod
+    def _cloud_save_status(uploaded, errors, skipped, locally_saved=True):
+        if errors:
+            detail = "\n".join(errors[:3])
+            if len(errors) > 3:
+                detail += f"\n...and {len(errors) - 3} more"
+            safety_note = (
+                "The local files are safe."
+                if locally_saved
+                else "The upload remains queued for automatic retry."
+            )
+            return (
+                f"\n\nCloud: uploaded {uploaded}; {len(errors)} failed. "
+                f"{safety_note}\n{detail}"
+            )
+        if uploaded:
+            return f"\n\nCloud: uploaded {uploaded} result file(s)."
+        if skipped:
+            if locally_saved:
+                return "\n\nLocal/legacy run: results were kept locally."
+            return "\n\nLocal/legacy run: no cloud experiment was available."
+        return ""
+
+    def _should_save_results_locally(self):
+        """Return the launcher's fixed local-save choice for this run."""
+        return bool(self.config.get('__save_results_locally__', True))
+
+    @staticmethod
+    def _available_result_path(path):
+        """Avoid overwriting an existing automatic local result file."""
+        path = Path(path)
+        if not path.exists():
+            return path
+        for duplicate_index in range(2, 10_000):
+            candidate = path.with_name(
+                f"{path.stem}_{duplicate_index}{path.suffix}"
+            )
+            if not candidate.exists():
+                return candidate
+        return path.with_name(f"{path.stem}_{uuid.uuid4().hex}{path.suffix}")
     
     def _save_single_result(self, combined_data, dialog_parent):
-        """Save one experiment result using the existing file-save flow."""
+        """Upload one result and honor the launcher's automatic local-save choice."""
         from pathlib import Path
-        from PyQt5.QtWidgets import QFileDialog
         from app_paths import ensure_dir, user_data_dir
         
         results_dir = ensure_dir(user_data_dir() / 'results')
         default_filename = f"{self._result_file_stem()}_p{self.participant_number}_{combined_data['timestamp']}.json"
         default_path = results_dir / default_filename
-        
-        save_dialog = QFileDialog(
-            dialog_parent,
-            "Save Experiment Data",
-            str(default_path),
-            "JSON Files (*.json);;All Files (*.*)"
+        combined_data['experiment_completed'] = bool(
+            combined_data.get('block_completed', False)
         )
-        save_dialog.setAcceptMode(QFileDialog.AcceptSave)
-        save_dialog.setDefaultSuffix("json")
-        save_dialog.setOption(QFileDialog.DontUseNativeDialog, True)
-        save_dialog.setWindowModality(Qt.ApplicationModal)
-        save_dialog.setWindowFlag(Qt.WindowStaysOnTopHint, True)
-        save_path = save_dialog.selectedFiles()[0] if save_dialog.exec_() == QFileDialog.Accepted else ""
-        
-        if not save_path:
-            if not self._confirm_discard(dialog_parent, "Are you sure you want to exit without saving the experiment data?"):
-                self.finish_experiment()
-            else:
-                print("⚠ Experiment data discarded by user")
-                self._cleanup_and_quit()
-            return
-        
-        try:
-            data_file = Path(save_path)
-            with open(str(data_file), 'w', encoding='utf-8') as f:
-                json.dump(combined_data, f, ensure_ascii=False, indent=2)
-            
+        uploaded, errors, skipped = self._upload_results_before_export(
+            [combined_data],
+            transition='finalize',
+        )
+
+        if not self._should_save_results_locally():
             msg = QMessageBox(dialog_parent)
             msg.setIcon(QMessageBox.Information)
             msg.setWindowTitle("Experiment Complete")
-            msg.setText(f"Experiment finished!\n\nData saved to:\n{str(data_file)}")
+            msg.setText(
+                "Experiment finished. Local saving was disabled in Run settings."
+                + self._cloud_save_status(
+                    uploaded, errors, skipped, locally_saved=False
+                )
+            )
+            msg.setWindowModality(Qt.ApplicationModal)
+            msg.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+            msg.exec_()
+            self._cleanup_and_quit()
+            return
+        
+        try:
+            data_file = self._available_result_path(default_path)
+            with open(str(data_file), 'w', encoding='utf-8') as f:
+                json.dump(combined_data, f, ensure_ascii=False, indent=2)
+            msg = QMessageBox(dialog_parent)
+            msg.setIcon(QMessageBox.Information)
+            msg.setWindowTitle("Experiment Complete")
+            msg.setText(
+                f"Experiment finished!\n\nData saved to:\n{str(data_file)}"
+                + self._cloud_save_status(uploaded, errors, skipped)
+            )
             msg.setWindowModality(Qt.ApplicationModal)
             msg.setWindowFlag(Qt.WindowStaysOnTopHint, True)
             msg.exec_()
@@ -1897,42 +2248,53 @@ class ExperimentCanvas(QWidget):
             error_msg.setWindowModality(Qt.ApplicationModal)
             error_msg.setWindowFlag(Qt.WindowStaysOnTopHint, True)
             error_msg.exec_()
+            self._cleanup_and_quit()
             return
         
         self._cleanup_and_quit()
     
     def _save_session_results(self, session_results, dialog_parent):
-        """Save every experiment in a multi-experiment session as separate files."""
+        """Upload a session and optionally save every Block result automatically."""
         from pathlib import Path
-        from PyQt5.QtWidgets import QFileDialog
         from app_paths import ensure_dir, user_data_dir
         
         results_dir = ensure_dir(user_data_dir() / 'results')
-        parent_dir = QFileDialog.getExistingDirectory(
-            dialog_parent,
-            f"Select Parent Folder for Participant {self.participant_number}",
-            str(results_dir)
+        experiment_completed = (
+            len(session_results) == self.session_total
+            and all(result.get('block_completed', False) for result in session_results)
         )
-        
-        if not parent_dir:
-            if not self._confirm_discard(dialog_parent, "Are you sure you want to exit without saving this experiment session?"):
-                self.finish_experiment()
-            else:
-                print("⚠ Experiment session data discarded by user")
-                self._cleanup_and_quit()
+        for result in session_results:
+            result['experiment_completed'] = experiment_completed
+        uploaded, errors, skipped = self._upload_results_before_export(
+            session_results,
+            transition='finalize',
+        )
+
+        if not self._should_save_results_locally():
+            msg = QMessageBox(dialog_parent)
+            msg.setIcon(QMessageBox.Information)
+            msg.setWindowTitle("Session Complete")
+            msg.setText(
+                "Session finished. Local saving was disabled in Run settings."
+                + self._cloud_save_status(
+                    uploaded, errors, skipped, locally_saved=False
+                )
+            )
+            msg.setWindowModality(Qt.ApplicationModal)
+            msg.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+            msg.exec_()
+            self._cleanup_and_quit()
             return
-        
-        session_dir = Path(parent_dir) / str(self.participant_number)
+
+        session_dir = Path(results_dir) / str(self.participant_number)
         session_dir.mkdir(parents=True, exist_ok=True)
         
         saved_files = []
         try:
             for index, result in enumerate(session_results, start=1):
-                stem = self._result_file_stem(result.get('config'), result.get('experiment_name'))
+                stem = self._result_file_stem(result.get('config'), result.get('block_name'))
                 filename = f"{stem}_p{self.participant_number}_{result.get('timestamp')}.json"
-                data_file = session_dir / filename
-                if data_file.exists():
-                    data_file = session_dir / f"{stem}_p{self.participant_number}_{result.get('timestamp')}_{index}.json"
+                data_file = self._available_result_path(session_dir / filename)
                 
                 with open(str(data_file), 'w', encoding='utf-8') as f:
                     json.dump(result, f, ensure_ascii=False, indent=2)
@@ -1945,19 +2307,23 @@ class ExperimentCanvas(QWidget):
             error_msg.setWindowModality(Qt.ApplicationModal)
             error_msg.setWindowFlag(Qt.WindowStaysOnTopHint, True)
             error_msg.exec_()
+            self._cleanup_and_quit()
             return
         
         msg = QMessageBox(dialog_parent)
         msg.setIcon(QMessageBox.Information)
         msg.setWindowTitle("Session Complete")
-        msg.setText(f"Saved {len(saved_files)} experiment files to:\n{str(session_dir)}")
+        msg.setText(
+            f"Saved {len(saved_files)} block result files to:\n{str(session_dir)}"
+            + self._cloud_save_status(uploaded, errors, skipped)
+        )
         msg.setWindowModality(Qt.ApplicationModal)
         msg.setWindowFlag(Qt.WindowStaysOnTopHint, True)
         msg.exec_()
         self._cleanup_and_quit()
     
     def finish_experiment(self):
-        """Finalize and save this experiment or full multi-experiment session."""
+        """Finalize and save this block or the full multi-block experiment."""
         dialog_parent = self.window()
         current_data = self.collect_experiment_data()
         self._stop_runtime_activity()
@@ -2437,7 +2803,7 @@ class ExperimentCanvas(QWidget):
             if self._audio_is_playing():
                 text = f"{heading_prefix} - Finish writing - waiting for audio to finish"
             elif self.waiting_for_next_experiment_spacebar:
-                text = f"{heading_prefix} - Finish writing - press SPACE for next experiment"
+                text = f"{heading_prefix} - Finish writing - press SPACE for next block"
             else:
                 text = f"{heading_prefix} - Finish writing - press SPACE to save data"
         elif self.current_cell < len(self.words):
@@ -2460,7 +2826,7 @@ class ExperimentCanvas(QWidget):
                     f"Write: '{word}' - Auto-advance enabled"
                 )
         else:
-            text = f"{self._current_heading_prefix()} - Experiment Complete!"
+            text = f"{self._current_heading_prefix()} - Block Complete!"
         
         painter.drawText(self.rect(), Qt.AlignTop | Qt.AlignHCenter, text)
 
@@ -2495,6 +2861,15 @@ class ExperimentWindow(QMainWindow):
         self.session_results = list(session_results) if session_results else []
         self.test_mode = test_mode
         self.next_window = None
+        ensure_shared_run_session_id(self.session_configs, self.participant_number)
+        if self.session_config_index == 0:
+            initialize_cloud_run(
+                self.session_configs,
+                self.participant_number,
+                self.participant_age,
+                self.participant_gender,
+                test_mode=self.test_mode,
+            )
         layout = (self.config or {}).get('__session_layout__', {}) if self.config else {}
         self.start_cell_offset = int(layout.get('start_cell_offset', start_cell_offset) or 0)
         self.initial_page_number = max(1, int(initial_page_number or 1))
@@ -2571,7 +2946,7 @@ class ExperimentWindow(QMainWindow):
         self.recalib_window.show()
     
     def finish_current_and_start_next(self):
-        """Finalize the current experiment and continue to the next session config."""
+        """Finalize the current block and continue to the next block config."""
         next_index = self.session_config_index + 1
         if next_index >= len(self.session_configs):
             self.canvas.finish_experiment()
@@ -2642,6 +3017,28 @@ class ExperimentWindow(QMainWindow):
             self.canvas.keyPressEvent(event)
         event.accept()
 
+    def closeEvent(self, event):
+        """Route a normal window close through the durable result flow."""
+        app = QApplication.instance()
+        if app is not None and app.property("autoscript_allow_close"):
+            event.accept()
+            return
+
+        event.ignore()
+        msg = QMessageBox(self)
+        msg.setIcon(QMessageBox.Question)
+        msg.setWindowTitle('End Experiment')
+        msg.setText(
+            'End this experiment now?\n\n'
+            'All data collected so far will be preserved in the cloud.'
+        )
+        msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        msg.setDefaultButton(QMessageBox.No)
+        msg.setWindowModality(Qt.ApplicationModal)
+        msg.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+        if msg.exec_() == QMessageBox.Yes:
+            QTimer.singleShot(0, self.canvas.finish_experiment)
+
 
 def main():
     """Main entry point"""
@@ -2674,6 +3071,14 @@ def main():
     except Exception as e:
         print(f"⚠ Failed to load session plan: {e}")
         apply_session_plan(configs, None)
+
+    original_excepthook = sys.excepthook
+
+    def report_runner_failure(exc_type, exc_value, traceback):
+        queue_cloud_run_failure(configs)
+        original_excepthook(exc_type, exc_value, traceback)
+
+    sys.excepthook = report_runner_failure
     
     from qt_bootstrap import ensure_qt_platform_plugin_path
     ensure_qt_platform_plugin_path()
