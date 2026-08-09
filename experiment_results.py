@@ -5,6 +5,7 @@ import tempfile
 import time
 import uuid
 import zipfile
+from datetime import datetime
 from pathlib import Path
 
 from PyQt5.QtCore import Qt, QTimer
@@ -59,6 +60,19 @@ def _analysis_label(run):
     if run.get("analysis_completed") is False:
         return "Analysis not completed"
     return "Analysis not started"
+
+
+def format_run_datetime(value):
+    """Render an API timestamp in the machine's local timezone."""
+    if not value:
+        return "Time unavailable"
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is not None:
+            parsed = parsed.astimezone()
+        return parsed.strftime("%Y-%m-%d %H:%M:%S")
+    except (TypeError, ValueError):
+        return str(value)
 
 
 class ExperimentResultsPage(QWidget):
@@ -246,6 +260,7 @@ class ExperimentResultsPage(QWidget):
         participant.setStyleSheet("font-size: 16px; font-weight: 700; color: #172230;")
         details = QLabel(
             f"Age {run['participant_age']} · {run['participant_gender']} · "
+            f"{format_run_datetime(run.get('started_at') or run.get('created_at'))} · "
             f"Session {run['session_id']}"
         )
         details.setStyleSheet("font-size: 12px; color: #617181;")

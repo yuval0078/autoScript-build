@@ -60,6 +60,34 @@ class RunnerBlockIdentityTests(unittest.TestCase):
         self.assertEqual([call[0] for call in calls], ["create", "start"])
         self.assertTrue(all(config["__server_run_id__"] == "run-1" for config in configs))
 
+    def test_test_mode_also_creates_a_cloud_run(self):
+        experiment_id = str(uuid.uuid4())
+        revision_id = str(uuid.uuid4())
+        configs = [
+            {"experiment_id": experiment_id, "experiment_revision_id": revision_id}
+        ]
+        calls = []
+
+        class FakeAPI:
+            def create_run(self, revision, session, number, age, gender):
+                calls.append(("create", revision, session, number, age, gender))
+                return {"id": "test-run-1"}
+
+            def start_run(self, run_id):
+                calls.append(("start", run_id))
+
+        with patch("autoscript_api.AutoScriptAPI", return_value=FakeAPI()):
+            run_id = initialize_cloud_run(
+                configs,
+                12,
+                30,
+                "Other",
+                test_mode=True,
+            )
+
+        self.assertEqual(run_id, "test-run-1")
+        self.assertEqual([call[0] for call in calls], ["create", "start"])
+
     def test_legacy_config_is_one_block_experiment(self):
         identity = get_block_run_identity(
             {"name": "Legacy package"},
@@ -132,6 +160,7 @@ class RunnerBlockIdentityTests(unittest.TestCase):
             participant_number=12,
             participant_age=30,
             participant_gender="Other",
+            test_mode=False,
             calibration_data={"corners": [[0, 0], [1, 0], [0, 1], [1, 1]]},
             words=[],
             pen_recorder=recorder,
@@ -155,6 +184,8 @@ class RunnerBlockIdentityTests(unittest.TestCase):
         self.assertEqual(result["session_experiment_index"], 2)
         self.assertEqual(result["session_experiment_count"], 3)
         self.assertEqual(result["session_id"], "12_20260807_120000_abcdef")
+        self.assertFalse(result["test_mode"])
+        self.assertIn("+", result["recorded_at"])
 
     def test_cloud_result_upload_uses_parent_uuid_and_preserves_local_file(self):
         canvas = ExperimentCanvas.__new__(ExperimentCanvas)
@@ -165,6 +196,10 @@ class RunnerBlockIdentityTests(unittest.TestCase):
         class FakeAPI:
             def upload_result(self, target_experiment_id, result_path):
                 uploaded.append((target_experiment_id, Path(result_path).read_text(encoding="utf-8")))
+                return {"run_id": "run-1"}
+
+            def finalize_run(self, run_id):
+                uploaded.append(("finalize", run_id))
 
         with tempfile.TemporaryDirectory() as temp_dir:
             result_path = Path(temp_dir) / "result.json"
@@ -181,6 +216,7 @@ class RunnerBlockIdentityTests(unittest.TestCase):
             self.assertTrue(result_path.exists())
             self.assertEqual(uploaded[0][0], experiment_id)
             self.assertEqual(uploaded[0][1], "{}")
+            self.assertEqual(uploaded[-1], ("finalize", "run-1"))
             self.assertEqual(list(queue_dir.glob("*.queue.json")), [])
             self.assertEqual((count, errors, skipped), (1, [], 0))
 
@@ -209,7 +245,7 @@ class RunnerBlockIdentityTests(unittest.TestCase):
 
         self.assertEqual(first, (0, ["offline"], 0))
         self.assertEqual(second, first)
-        self.assertEqual(captured, [(result, None)])
+        self.assertEqual(captured, [(result, "finalize")])
 
     def test_offline_api_creation_keeps_durable_queue_item(self):
         canvas = ExperimentCanvas.__new__(ExperimentCanvas)
@@ -237,7 +273,7 @@ class RunnerBlockIdentityTests(unittest.TestCase):
             self.assertEqual(skipped, 0)
             self.assertEqual(len(list(queue_dir.glob("*.queue.json"))), 2)
 
-    def test_local_legacy_and_test_runs_are_not_uploaded(self):
+    def test_local_legacy_is_skipped_but_test_run_is_uploaded(self):
         canvas = ExperimentCanvas.__new__(ExperimentCanvas)
         canvas.test_mode = False
         count, errors, skipped = canvas._upload_saved_results(
@@ -245,11 +281,33 @@ class RunnerBlockIdentityTests(unittest.TestCase):
         )
         self.assertEqual((count, errors, skipped), (0, [], 1))
 
+        calls = []
+
+        class FakeAPI:
+            def upload_result(self, experiment_id, result_path):
+                calls.append(("result", experiment_id))
+                return {"run_id": "test-run-1"}
+
+            def finalize_run(self, run_id):
+                calls.append(("finalize", run_id))
+
         canvas.test_mode = True
-        count, errors, skipped = canvas._upload_saved_results(
-            [(Path("test.json"), {"experiment_id": str(uuid.uuid4())})]
-        )
-        self.assertEqual((count, errors, skipped), (0, [], 1))
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            result_path = root / "test.json"
+            result_path.write_text("{}", encoding="utf-8")
+            queue_dir = root / "queue"
+            queue_dir.mkdir()
+            experiment_id = str(uuid.uuid4())
+            with patch("autoscript_api.AutoScriptAPI", return_value=FakeAPI()), patch(
+                "result_upload_queue.queue_root", return_value=queue_dir
+            ):
+                count, errors, skipped = canvas._upload_saved_results(
+                    [(result_path, {"experiment_id": experiment_id})]
+                )
+
+        self.assertEqual((count, errors, skipped), (1, [], 0))
+        self.assertEqual(calls, [("result", experiment_id), ("finalize", "test-run-1")])
 
 
 class AnalyzerBlockIdentityTests(unittest.TestCase):

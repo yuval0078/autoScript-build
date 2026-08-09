@@ -62,6 +62,9 @@
     "server_run_id": {
       "type": ["string", "null"]
     },
+    "test_mode": {
+      "type": "boolean"
+    },
     "block_name": {
       "type": "string",
       "minLength": 1
@@ -126,6 +129,10 @@
     },
     "timestamp": {
       "$ref": "common.schema.json#/$defs/localTimestamp"
+    },
+    "recorded_at": {
+      "type": "string",
+      "format": "date-time"
     },
     "calibration": {
       "$ref": "common.schema.json#/$defs/calibration"

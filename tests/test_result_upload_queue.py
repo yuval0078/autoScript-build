@@ -104,3 +104,75 @@ class ResultUploadQueueTests(unittest.TestCase):
             self.assertEqual(first_result, [(1, [])])
             self.assertEqual(second[0], 0)
             self.assertTrue(second[1])
+
+    def test_fallback_upload_finalizes_the_run_created_by_the_server(self):
+        calls = []
+
+        class API:
+            def upload_result(self, experiment_id, path):
+                calls.append(("result", experiment_id, Path(path).read_text(encoding="utf-8")))
+                return {"run_id": "created-run-1"}
+
+            def finalize_run(self, run_id):
+                calls.append(("finalize", run_id))
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            result = root / "saved.json"
+            result.write_text('{"ok":true}', encoding="utf-8")
+            with patch("result_upload_queue.queue_root", return_value=root):
+                enqueue_result(
+                    result,
+                    "experiment-1",
+                    terminal_after="finalize",
+                )
+                uploaded, errors = drain_upload_queue(API())
+
+            self.assertEqual((uploaded, errors), (1, []))
+            self.assertEqual(
+                calls,
+                [
+                    ("result", "experiment-1", '{"ok":true}'),
+                    ("finalize", "created-run-1"),
+                ],
+            )
+            self.assertEqual(list(root.glob("*.queue.json")), [])
+
+    def test_fallback_transition_failure_keeps_payload_for_retry(self):
+        calls = []
+
+        class API:
+            fail = True
+
+            def upload_result(self, experiment_id, path):
+                calls.append(("result", experiment_id))
+                return {"run_id": "created-run-1"}
+
+            def finalize_run(self, run_id):
+                calls.append(("finalize", run_id))
+                if self.fail:
+                    raise OSError("offline")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            result = root / "saved.json"
+            result.write_text('{"ok":true}', encoding="utf-8")
+            with patch("result_upload_queue.queue_root", return_value=root):
+                enqueue_result(
+                    result,
+                    "experiment-1",
+                    terminal_after="finalize",
+                )
+                api = API()
+                uploaded, errors = drain_upload_queue(api)
+                self.assertEqual(uploaded, 0)
+                self.assertTrue(errors)
+                self.assertEqual(len(list(root.glob("*.queue.json"))), 1)
+                self.assertEqual(len(list(root.glob("*.payload"))), 1)
+
+                api.fail = False
+                uploaded, errors = drain_upload_queue(api)
+
+            self.assertEqual((uploaded, errors), (1, []))
+            self.assertEqual(calls.count(("result", "experiment-1")), 2)
+            self.assertEqual(calls[-1], ("finalize", "created-run-1"))

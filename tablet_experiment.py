@@ -268,7 +268,7 @@ def ensure_shared_run_session_id(configs, participant_number) -> str:
 
 def initialize_cloud_run(configs, participant_number, age, gender, test_mode=False):
     """Create one server Run before the first Block starts; local files remain a fallback."""
-    if test_mode or not configs:
+    if not configs:
         return None
     existing = next((config.get('__server_run_id__') for config in configs if config.get('__server_run_id__')), None)
     if existing:
@@ -1980,7 +1980,8 @@ class ExperimentCanvas(QWidget):
         elif self.pen_recorder.current_word_data:
             self.pen_recorder.end_word()
         
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        recorded_at = datetime.now().astimezone()
+        timestamp = recorded_at.strftime('%Y%m%d_%H%M%S')
         identity = get_block_run_identity(
             self.config,
             session_index=self.session_index,
@@ -1995,6 +1996,7 @@ class ExperimentCanvas(QWidget):
             'experiment_revision_id': self.config.get('experiment_revision_id'),
             'experiment_revision_number': self.config.get('experiment_revision_number'),
             'server_run_id': self.config.get('__server_run_id__'),
+            'test_mode': bool(self.test_mode),
             'block_name': identity['block_name'],
             'block_id': identity['block_id'],
             'block_index': identity['block_index'],
@@ -2015,6 +2017,7 @@ class ExperimentCanvas(QWidget):
                 f"{self.participant_number}_{timestamp}_{uuid.uuid4().hex[:6]}"
             ),
             'timestamp': timestamp,
+            'recorded_at': recorded_at.isoformat(timespec='seconds'),
             'calibration': self.calibration_data,
             'config': self.config,
             'words': self.pen_recorder.all_word_data
@@ -2044,6 +2047,7 @@ class ExperimentCanvas(QWidget):
             pass
         app = QApplication.instance()
         if app:
+            app.setProperty("autoscript_allow_close", True)
             app.closeAllWindows()
             app.quit()
         else:
@@ -2062,9 +2066,6 @@ class ExperimentCanvas(QWidget):
 
     def _upload_saved_results(self, saved_results, transition="finalize"):
         """Durably queue cloud-run results, then make a best-effort upload."""
-        if self.test_mode:
-            return 0, [], len(saved_results)
-
         cloud_results = []
         skipped = 0
         for data_file, result in saved_results:
@@ -2081,9 +2082,19 @@ class ExperimentCanvas(QWidget):
 
         from result_upload_queue import drain_upload_queue, enqueue_result, enqueue_transition
         run_ids = set()
-        for data_file, result, experiment_id in cloud_results:
+        for result_index, (data_file, result, experiment_id) in enumerate(cloud_results):
             run_id = result.get('server_run_id') or result.get('config', {}).get('__server_run_id__')
-            enqueue_result(data_file, experiment_id, run_id=run_id)
+            terminal_after = (
+                transition
+                if transition and not run_id and result_index == len(cloud_results) - 1
+                else None
+            )
+            enqueue_result(
+                data_file,
+                experiment_id,
+                run_id=run_id,
+                terminal_after=terminal_after,
+            )
             if run_id:
                 run_ids.add(str(run_id))
         if transition:
@@ -2097,7 +2108,7 @@ class ExperimentCanvas(QWidget):
         uploaded, queue_errors = drain_upload_queue(api)
         return uploaded, list(queue_errors), skipped
 
-    def _upload_results_before_export(self, results):
+    def _upload_results_before_export(self, results, transition="finalize"):
         """Persist cloud results independently of the optional user export dialog."""
         cached = getattr(self, '_cloud_upload_outcome', None)
         if cached is not None:
@@ -2117,7 +2128,10 @@ class ExperimentCanvas(QWidget):
                 )
                 temporary.replace(target)
                 staged_results.append((target, result))
-            outcome = self._upload_saved_results(staged_results, transition=None)
+            outcome = self._upload_saved_results(
+                staged_results,
+                transition=transition,
+            )
             self._cloud_upload_outcome = outcome
             return outcome
         finally:
@@ -2126,9 +2140,6 @@ class ExperimentCanvas(QWidget):
 
     def _transition_cloud_results(self, results, transition):
         """Queue a terminal Run transition after its result payloads."""
-        if self.test_mode:
-            return 0, []
-
         from autoscript_api import AutoScriptAPI
         from result_upload_queue import drain_upload_queue, enqueue_transition
 
@@ -2180,7 +2191,10 @@ class ExperimentCanvas(QWidget):
         combined_data['experiment_completed'] = bool(
             combined_data.get('block_completed', False)
         )
-        uploaded, errors, skipped = self._upload_results_before_export([combined_data])
+        uploaded, errors, skipped = self._upload_results_before_export(
+            [combined_data],
+            transition='finalize',
+        )
         
         save_dialog = QFileDialog(
             dialog_parent,
@@ -2199,8 +2213,7 @@ class ExperimentCanvas(QWidget):
             if not self._confirm_discard(dialog_parent, "Are you sure you want to exit without saving the experiment data?"):
                 self.finish_experiment()
             else:
-                self._transition_cloud_results([combined_data], 'cancel')
-                print("⚠ Experiment data discarded by user")
+                print("Local export skipped by user; cloud data was preserved")
                 self._cleanup_and_quit()
             return
         
@@ -2208,15 +2221,6 @@ class ExperimentCanvas(QWidget):
             data_file = Path(save_path)
             with open(str(data_file), 'w', encoding='utf-8') as f:
                 json.dump(combined_data, f, ensure_ascii=False, indent=2)
-            transition_uploaded, transition_errors = self._transition_cloud_results(
-                [combined_data], 'finalize'
-            )
-            uploaded += transition_uploaded
-            if transition_errors:
-                errors.extend(transition_errors)
-            elif transition_uploaded:
-                errors = [error for error in errors if "Quarantined" in error]
-            
             msg = QMessageBox(dialog_parent)
             msg.setIcon(QMessageBox.Information)
             msg.setWindowTitle("Experiment Complete")
@@ -2252,7 +2256,10 @@ class ExperimentCanvas(QWidget):
         )
         for result in session_results:
             result['experiment_completed'] = experiment_completed
-        uploaded, errors, skipped = self._upload_results_before_export(session_results)
+        uploaded, errors, skipped = self._upload_results_before_export(
+            session_results,
+            transition='finalize',
+        )
         parent_dir = QFileDialog.getExistingDirectory(
             dialog_parent,
             f"Select Parent Folder for Participant {self.participant_number}",
@@ -2263,8 +2270,7 @@ class ExperimentCanvas(QWidget):
             if not self._confirm_discard(dialog_parent, "Are you sure you want to exit without saving this experiment run?"):
                 self.finish_experiment()
             else:
-                self._transition_cloud_results(session_results, 'cancel')
-                print("⚠ Experiment session data discarded by user")
+                print("Local session export skipped by user; cloud data was preserved")
                 self._cleanup_and_quit()
             return
         
@@ -2283,14 +2289,6 @@ class ExperimentCanvas(QWidget):
                 with open(str(data_file), 'w', encoding='utf-8') as f:
                     json.dump(result, f, ensure_ascii=False, indent=2)
                 saved_files.append(data_file)
-            transition_uploaded, transition_errors = self._transition_cloud_results(
-                session_results, 'finalize'
-            )
-            uploaded += transition_uploaded
-            if transition_errors:
-                errors.extend(transition_errors)
-            elif transition_uploaded:
-                errors = [error for error in errors if "Quarantined" in error]
         except Exception as e:
             error_msg = QMessageBox(dialog_parent)
             error_msg.setIcon(QMessageBox.Critical)
@@ -3007,6 +3005,28 @@ class ExperimentWindow(QMainWindow):
             # Pass other keys to canvas
             self.canvas.keyPressEvent(event)
         event.accept()
+
+    def closeEvent(self, event):
+        """Route a normal window close through the durable result flow."""
+        app = QApplication.instance()
+        if app is not None and app.property("autoscript_allow_close"):
+            event.accept()
+            return
+
+        event.ignore()
+        msg = QMessageBox(self)
+        msg.setIcon(QMessageBox.Question)
+        msg.setWindowTitle('End Experiment')
+        msg.setText(
+            'End this experiment now?\n\n'
+            'All data collected so far will be preserved in the cloud.'
+        )
+        msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        msg.setDefaultButton(QMessageBox.No)
+        msg.setWindowModality(Qt.ApplicationModal)
+        msg.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+        if msg.exec_() == QMessageBox.Yes:
+            QTimer.singleShot(0, self.canvas.finish_experiment)
 
 
 def main():

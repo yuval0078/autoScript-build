@@ -16,10 +16,15 @@ from analyzer_refactored import (
     write_analysis_finalize_bundle,
     write_analysis_csv,
 )
-from experiment_results import run_status
+from experiment_results import format_run_datetime, run_status
 
 
 class ExperimentResultStatusTests(unittest.TestCase):
+    def test_run_timestamp_is_rendered_for_the_results_row(self):
+        rendered = format_run_datetime("2026-08-09T10:45:00+00:00")
+
+        self.assertRegex(rendered, r"^2026-08-09 \d{2}:45:00$")
+
     def test_incomplete_data_is_red_even_if_analysis_completed(self):
         status, color, _background, data, analysis = run_status(
             {"complete": False, "analysis_completed": True}

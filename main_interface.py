@@ -16,7 +16,7 @@ from PyQt5.QtWidgets import (
     QAction, QApplication, QInputDialog, QLineEdit, QMainWindow, QMessageBox,
     QStackedWidget, QLabel,
 )
-from PyQt5.QtCore import QTimer
+from PyQt5.QtCore import QTimer, pyqtSignal
 from autoscript_api import APIError, AutoScriptAPI, get_session_token
 from component_runtime import component_launch_command, create_update_manager
 from component_updates_dialog import ComponentUpdatesDialog
@@ -53,6 +53,8 @@ def builder_child_environment(environment=None):
 
 class MainInterface(QMainWindow):
     """Main application window that manages different pages"""
+
+    cloud_sync_status = pyqtSignal(str)
     
     def __init__(self):
         super().__init__()
@@ -63,6 +65,8 @@ class MainInterface(QMainWindow):
         # Status Bar
         self.status_msg = QLabel("Ready")
         self.statusBar().addWidget(self.status_msg)
+        self.cloud_sync_status.connect(self.status_msg.setText)
+        self._pending_upload_lock = threading.Lock()
         self.version_label = QLabel(
             f"Interface {get_component_version('interface')}"
         )
@@ -95,6 +99,10 @@ class MainInterface(QMainWindow):
         # Always start on the home screen.
         self.show_main_menu()
         QTimer.singleShot(0, self._retry_pending_uploads)
+        self.pending_upload_timer = QTimer(self)
+        self.pending_upload_timer.setInterval(30_000)
+        self.pending_upload_timer.timeout.connect(self._retry_pending_uploads)
+        self.pending_upload_timer.start()
         QTimer.singleShot(1500, self._start_automatic_update_check)
 
     def _authenticate_if_required(self):
@@ -126,20 +134,32 @@ class MainInterface(QMainWindow):
                     return None
 
     def _retry_pending_uploads(self):
-        try:
-            from analysis_sync_queue import drain_analysis_queue
-            from result_upload_queue import drain_upload_queue
-            api = AutoScriptAPI(timeout=30)
-            uploaded, errors = drain_upload_queue(api)
-            analyzed, analysis_errors, _outcomes = drain_analysis_queue(api)
-            if uploaded or analyzed:
-                self.status_msg.setText(
-                    f"Synchronized {uploaded + analyzed} queued operation(s)"
-                )
-            elif errors or analysis_errors:
-                self.status_msg.setText("Pending cloud uploads remain queued")
-        except Exception:
-            pass
+        if not self._pending_upload_lock.acquire(blocking=False):
+            return
+
+        def synchronize():
+            status_text = None
+            try:
+                from analysis_sync_queue import drain_analysis_queue
+                from result_upload_queue import drain_upload_queue
+
+                api = AutoScriptAPI(timeout=10)
+                uploaded, errors = drain_upload_queue(api)
+                analyzed, analysis_errors, _outcomes = drain_analysis_queue(api)
+                if uploaded or analyzed:
+                    status_text = (
+                        f"Synchronized {uploaded + analyzed} queued operation(s)"
+                    )
+                elif errors or analysis_errors:
+                    status_text = "Pending cloud uploads remain queued"
+            except Exception:
+                status_text = "Pending cloud uploads remain queued"
+            finally:
+                self._pending_upload_lock.release()
+            if status_text:
+                self.cloud_sync_status.emit(status_text)
+
+        threading.Thread(target=synchronize, daemon=True).start()
 
     def _start_automatic_update_check(self):
         if self._automatic_update_result is not None:

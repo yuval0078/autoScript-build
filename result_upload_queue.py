@@ -25,7 +25,9 @@ def _write_item(item):
     return path
 
 
-def enqueue_result(result_path, experiment_id, run_id=None):
+def enqueue_result(result_path, experiment_id, run_id=None, terminal_after=None):
+    if terminal_after not in {None, "finalize", "cancel", "fail"}:
+        raise ValueError(f"Unsupported Run transition: {terminal_after}")
     root = queue_root()
     source = Path(result_path)
     payload_name = f"{uuid.uuid4().hex}.payload"
@@ -37,6 +39,7 @@ def enqueue_result(result_path, experiment_id, run_id=None):
         "kind": "result", "created_at": time.time(),
         "payload": payload_name, "experiment_id": str(experiment_id),
         "run_id": str(run_id) if run_id else None,
+        "terminal_after": terminal_after,
     })
 
 
@@ -153,9 +156,27 @@ def _drain_locked(api, root):
                 if not payload_path.is_file():
                     raise ValueError(f"Queued result payload is missing: {payload_name}")
                 if item.get("run_id"):
-                    api.upload_run_result(item["run_id"], payload_path)
+                    uploaded_result = api.upload_run_result(item["run_id"], payload_path)
                 else:
-                    api.upload_result(item["experiment_id"], payload_path)
+                    uploaded_result = api.upload_result(item["experiment_id"], payload_path)
+                terminal_after = item.get("terminal_after")
+                if terminal_after:
+                    target_run_id = item.get("run_id") or (
+                        uploaded_result.get("run_id")
+                        if isinstance(uploaded_result, dict)
+                        else None
+                    )
+                    if not target_run_id:
+                        raise ValueError(
+                            "Uploaded result did not return the Run ID required "
+                            "for its terminal transition."
+                        )
+                    if terminal_after == "finalize":
+                        api.finalize_run(target_run_id)
+                    elif terminal_after == "cancel":
+                        api.cancel_run(target_run_id)
+                    else:
+                        api.fail_run(target_run_id)
                 payload_path.unlink(missing_ok=True)
                 uploaded += 1
             elif item.get("kind") == "finalize":
