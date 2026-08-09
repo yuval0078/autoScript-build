@@ -9,9 +9,18 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import quote, unquote
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    status,
+)
 from fastapi.responses import FileResponse, StreamingResponse
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 from starlette.background import BackgroundTask
@@ -50,9 +59,11 @@ from ..services.experiment_packages import (
 )
 from ..services.object_cleanup import drain_object_deletions, queue_object_deletions
 from ..services.storage import get_object_storage
+from .pagination import decode_cursor, encode_cursor, escaped_contains_pattern
 
 
 router = APIRouter(prefix="/api/v1", tags=["experiments"])
+_CURRENT_REVISION_UNSET = object()
 
 
 def _version_response(version):
@@ -94,28 +105,37 @@ def _experiment_response(
     experiment,
     participant_count=None,
     analyzed_participant_count=None,
+    current_revision_override=_CURRENT_REVISION_UNSET,
+    include_versions=True,
 ):
-    versions = sorted(
-        experiment.versions,
-        key=lambda version: version.version_number,
-        reverse=True,
+    versions = (
+        sorted(
+            experiment.versions,
+            key=lambda version: version.version_number,
+            reverse=True,
+        )
+        if include_versions
+        else []
     )
     blocks = sorted(experiment.blocks, key=lambda block: block.position)
-    current_revision = next(
-        (
-            item
-            for item in experiment.revisions
-            if item.id == experiment.current_revision_id
-        ),
-        None,
-    )
-    if current_revision is None and experiment.current_revision_id is None:
-        # Compatibility for legacy rows created before the explicit pointer.
-        current_revision = max(
-            experiment.revisions,
-            key=lambda item: item.revision_number,
-            default=None,
+    if current_revision_override is _CURRENT_REVISION_UNSET:
+        current_revision = next(
+            (
+                item
+                for item in experiment.revisions
+                if item.id == experiment.current_revision_id
+            ),
+            None,
         )
+        if current_revision is None and experiment.current_revision_id is None:
+            # Compatibility for legacy rows created before the explicit pointer.
+            current_revision = max(
+                experiment.revisions,
+                key=lambda item: item.revision_number,
+                default=None,
+            )
+    else:
+        current_revision = current_revision_override
     if participant_count is None:
         participant_count = len(
             {run.participant_number for run in experiment.runs}
@@ -145,6 +165,58 @@ def _experiment_response(
         analyzed_participant_count=analyzed_participant_count,
         download_url=f"/api/v1/experiments/{experiment.id}/download",
     )
+
+
+def _current_revisions_for_page(database, experiments):
+    """Load at most one current Revision per paged Experiment."""
+    revisions_by_experiment = {}
+    current_revision_ids = [
+        experiment.current_revision_id
+        for experiment in experiments
+        if experiment.current_revision_id is not None
+    ]
+    if current_revision_ids:
+        current_revisions = database.scalars(
+            select(ExperimentRevision)
+            .where(ExperimentRevision.id.in_(current_revision_ids))
+            .options(selectinload(ExperimentRevision.blocks))
+        ).all()
+        revisions_by_experiment.update(
+            {revision.experiment_id: revision for revision in current_revisions}
+        )
+
+    legacy_experiment_ids = [
+        experiment.id
+        for experiment in experiments
+        if experiment.current_revision_id is None
+    ]
+    if legacy_experiment_ids:
+        latest_revision_numbers = (
+            select(
+                ExperimentRevision.experiment_id.label("experiment_id"),
+                func.max(ExperimentRevision.revision_number).label("revision_number"),
+            )
+            .where(ExperimentRevision.experiment_id.in_(legacy_experiment_ids))
+            .group_by(ExperimentRevision.experiment_id)
+            .subquery()
+        )
+        legacy_revisions = database.scalars(
+            select(ExperimentRevision)
+            .join(
+                latest_revision_numbers,
+                and_(
+                    ExperimentRevision.experiment_id
+                    == latest_revision_numbers.c.experiment_id,
+                    ExperimentRevision.revision_number
+                    == latest_revision_numbers.c.revision_number,
+                ),
+            )
+            .options(selectinload(ExperimentRevision.blocks))
+        ).all()
+        revisions_by_experiment.update(
+            {revision.experiment_id: revision for revision in legacy_revisions}
+        )
+    return revisions_by_experiment
 
 
 def _revision_response(revision):
@@ -821,24 +893,141 @@ def create_experiment(
     return _experiment_response(experiment)
 
 
-@router.get("/experiments", response_model=list[ExperimentResponse])
+@router.get(
+    "/experiments",
+    response_model=list[ExperimentResponse],
+    responses={
+        200: {
+            "description": (
+                "Experiments as a JSON array. Pagination headers are emitted "
+                "when limit is supplied."
+            ),
+            "headers": {
+                "X-Total-Count": {
+                    "description": "Total owner-scoped Experiments matching search.",
+                    "schema": {"type": "integer", "minimum": 0},
+                },
+                "X-Next-Cursor": {
+                    "description": (
+                        "Opaque cursor for the next page; absent on the final page."
+                    ),
+                    "schema": {"type": "string"},
+                },
+            },
+        }
+    },
+)
 def list_experiments(
+    response: Response,
+    search: str | None = Query(
+        default=None,
+        max_length=200,
+        description=(
+            "Case-insensitive literal substring match against the Experiment name "
+            "or description. Percent and underscore characters are not wildcards."
+        ),
+    ),
+    include_versions: bool = Query(
+        default=True,
+        description=(
+            "Include legacy immutable version metadata. Set false for a compact "
+            "list response; the versions array will be empty and version history "
+            "will not be loaded."
+        ),
+    ),
+    limit: int | None = Query(
+        default=None,
+        ge=1,
+        le=200,
+        description=(
+            "Maximum number of Experiments to return. Omit for the legacy "
+            "unpaginated array response."
+        ),
+    ),
+    cursor: str | None = Query(
+        default=None,
+        min_length=1,
+        max_length=1000,
+        description=(
+            "Opaque X-Next-Cursor value from the previous page. Requires limit."
+        ),
+    ),
     database: Session = Depends(get_db),
     actor: User = Depends(get_current_user),
 ):
-    experiments = database.scalars(
+    if cursor is not None and limit is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="cursor requires limit.",
+        )
+
+    filters = [
+        Experiment.owner_id == actor.id,
+        Experiment.archived_at.is_(None),
+    ]
+    normalized_search = (search or "").strip()
+    if normalized_search:
+        pattern = escaped_contains_pattern(normalized_search)
+        filters.append(
+            or_(
+                Experiment.name.ilike(pattern, escape="\\"),
+                Experiment.description.ilike(pattern, escape="\\"),
+            )
+        )
+
+    cursor_position = decode_cursor(cursor) if cursor is not None else None
+    if limit is not None:
+        total_count = database.scalar(
+            select(func.count()).select_from(Experiment).where(*filters)
+        )
+        response.headers["X-Total-Count"] = str(total_count or 0)
+
+    page_filters = list(filters)
+    if cursor_position is not None:
+        cursor_created_at, cursor_id = cursor_position
+        page_filters.append(
+            or_(
+                Experiment.created_at < cursor_created_at,
+                and_(
+                    Experiment.created_at == cursor_created_at,
+                    Experiment.id < cursor_id,
+                ),
+            )
+        )
+
+    loader_options = [
+        selectinload(Experiment.blocks),
+    ]
+    if include_versions:
+        loader_options.append(selectinload(Experiment.versions))
+    if limit is None:
+        # Preserve the legacy unpaginated loading behavior. Paged requests load
+        # only the one Revision represented by current_revision below.
+        loader_options.append(
+            selectinload(Experiment.revisions).selectinload(ExperimentRevision.blocks)
+        )
+    statement = (
         select(Experiment)
-        .where(
-            Experiment.owner_id == actor.id,
-            Experiment.archived_at.is_(None),
+        .where(*page_filters)
+        .options(*loader_options)
+        .order_by(Experiment.created_at.desc(), Experiment.id.desc())
+    )
+    if limit is not None:
+        statement = statement.limit(limit + 1)
+    experiments = list(database.scalars(statement).all())
+    has_next_page = limit is not None and len(experiments) > limit
+    if has_next_page:
+        experiments = experiments[:limit]
+        last_experiment = experiments[-1]
+        response.headers["X-Next-Cursor"] = encode_cursor(
+            last_experiment.created_at,
+            last_experiment.id,
         )
-        .options(
-            selectinload(Experiment.blocks),
-            selectinload(Experiment.versions),
-            selectinload(Experiment.revisions).selectinload(ExperimentRevision.blocks),
-        )
-        .order_by(Experiment.created_at.desc())
-    ).all()
+    current_revisions = (
+        _current_revisions_for_page(database, experiments)
+        if limit is not None
+        else None
+    )
     participant_counts = {}
     analyzed_participant_counts = {}
     if experiments:
@@ -877,6 +1066,12 @@ def list_experiments(
             analyzed_participant_count=int(
                 analyzed_participant_counts.get(experiment.id, 0)
             ),
+            current_revision_override=(
+                current_revisions.get(experiment.id)
+                if current_revisions is not None
+                else _CURRENT_REVISION_UNSET
+            ),
+            include_versions=include_versions,
         )
         for experiment in experiments
     ]
@@ -1175,10 +1370,15 @@ async def upload_block(
         upload_path.unlink(missing_ok=True)
 
 
-@router.api_route(
+@router.patch(
     "/experiments/{experiment_id}/blocks/order",
-    methods=["PUT", "PATCH"],
     response_model=ExperimentResponse,
+    operation_id="patch_experiment_block_order",
+)
+@router.put(
+    "/experiments/{experiment_id}/blocks/order",
+    response_model=ExperimentResponse,
+    operation_id="replace_experiment_block_order",
 )
 def reorder_blocks(
     experiment_id: uuid.UUID,

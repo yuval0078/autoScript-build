@@ -42,14 +42,32 @@ class RunAnalysisRevisionResponse(BaseModel):
 
 
 class RunAnalysisCopyResponse(BaseModel):
-    id: uuid.UUID
-    run_id: uuid.UUID
-    revision: int
-    created_at: datetime
-    completed: bool
-    is_current_editable: bool
-    analyzed_csv: RunArtifactResponse
-    trainable_json: RunArtifactResponse
+    id: uuid.UUID = Field(
+        description="Immutable analysis-revision identifier used by copy-management endpoints."
+    )
+    run_id: uuid.UUID = Field(description="Participant Run that owns this copy.")
+    revision: int = Field(
+        gt=0,
+        description="Monotonically increasing analysis revision number within the Run.",
+    )
+    created_at: datetime = Field(
+        description="UTC timestamp at which this analyzed copy was created."
+    )
+    completed: bool = Field(
+        description="Whether the Analyzer marked this exported revision complete."
+    )
+    is_current_editable: bool = Field(
+        description=(
+            "True when this copy's matching analysis-state snapshot is the state "
+            "that the Analyzer will restore next."
+        )
+    )
+    analyzed_csv: RunArtifactResponse = Field(
+        description="Immutable analyzed CSV artifact belonging to this revision."
+    )
+    trainable_json: RunArtifactResponse = Field(
+        description="Immutable trainable JSON artifact belonging to this revision."
+    )
 
 
 class RunResultResponse(BaseModel):

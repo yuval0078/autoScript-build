@@ -5,8 +5,9 @@ import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
-from autoscript_api import AutoScriptAPI
+from autoscript_api import APICancelled, APIError, AutoScriptAPI, PaginatedList
 
 
 class ApiHandler(BaseHTTPRequestHandler):
@@ -16,6 +17,9 @@ class ApiHandler(BaseHTTPRequestHandler):
     uploaded_block_name = ""
     result = b'{"result":"fixture"}'
     artifact = b"Participant,Word\n7,test\n"
+    bulk_archive = b"PK\x03\x04server-built-results-archive"
+    bulk_started_event = None
+    bulk_release_event = None
     requests = []
     last_authorization = None
 
@@ -34,6 +38,36 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         type(self).last_authorization = self.headers.get("Authorization")
+        if self.path in {"/api/v1/invalid-json", "/api/v1/invalid-utf8"}:
+            body = b"{" if self.path.endswith("invalid-json") else b"\xff"
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        parsed = urlsplit(self.path)
+        if parsed.path == "/api/v1/experiments" and parsed.query:
+            query = parse_qs(parsed.query)
+            type(self).requests.append(("GET_PAGE", parsed.path, query))
+            self.send_json(
+                200,
+                [{"id": "experiment-1", "name": "fixture", "versions": []}],
+                {"X-Total-Count": "3", "X-Next-Cursor": "next-experiment"},
+            )
+            return
+        if (
+            parsed.path == "/api/v1/experiments/experiment-1/runs"
+            and parsed.query
+        ):
+            query = parse_qs(parsed.query)
+            type(self).requests.append(("GET_RUN_PAGE", parsed.path, query))
+            self.send_json(
+                200,
+                [{"id": "run-1", "results": [], "artifacts": []}],
+                {"X-Total-Count": "2", "X-Next-Cursor": "next-run"},
+            )
+            return
         if self.path == "/api/v1/experiments":
             self.send_json(200, [{"id": "experiment-1", "name": "fixture", "versions": []}])
             return
@@ -132,6 +166,27 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         type(self).last_authorization = self.headers.get("Authorization")
+        if self.path == "/api/v1/experiments/experiment-1/bulk-export":
+            payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            type(self).requests.append(("BULK_EXPORT", self.path, payload))
+            if type(self).bulk_started_event is not None:
+                type(self).bulk_started_event.set()
+            if type(self).bulk_release_event is not None:
+                type(self).bulk_release_event.wait(timeout=5)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/zip")
+            self.send_header("Content-Length", str(len(self.bulk_archive)))
+            self.send_header(
+                "X-Checksum-SHA256",
+                hashlib.sha256(self.bulk_archive).hexdigest(),
+            )
+            self.send_header(
+                "Content-Disposition",
+                "attachment; filename=fixture-results.zip",
+            )
+            self.end_headers()
+            self.wfile.write(self.bulk_archive)
+            return
         if self.path == "/api/v1/auth/login":
             self.rfile.read(int(self.headers["Content-Length"]))
             self.send_json(200, {"access_token": "session-token", "user": {"username": "tester"}})
@@ -339,6 +394,154 @@ class AutoScriptApiClientTests(unittest.TestCase):
         self.assertTrue(ApiHandler.uploaded_filename.isascii())
         self.assertEqual(version["version_number"], 1)
         self.assertEqual(progress[-1], (len(ApiHandler.uploaded), len(ApiHandler.uploaded)))
+
+    def test_invalid_success_json_is_reported_as_stable_api_error(self):
+        for path in ("/api/v1/invalid-json", "/api/v1/invalid-utf8"):
+            with self.subTest(path=path), self.assertRaisesRegex(
+                APIError, "invalid JSON response"
+            ):
+                self.api._json_request("GET", path)
+
+    def test_paginated_lists_retain_headers_and_encode_server_filters(self):
+        experiments = self.api.list_experiments(
+            search="alpha beta",
+            include_versions=False,
+            limit=25,
+            cursor="opaque cursor",
+        )
+        self.assertIsInstance(experiments, PaginatedList)
+        self.assertEqual(experiments.total_count, 3)
+        self.assertEqual(experiments.next_cursor, "next-experiment")
+        experiment_request = next(
+            request for request in reversed(ApiHandler.requests)
+            if request[0] == "GET_PAGE"
+        )
+        self.assertEqual(experiment_request[2], {
+            "search": ["alpha beta"],
+            "include_versions": ["false"],
+            "limit": ["25"],
+            "cursor": ["opaque cursor"],
+        })
+
+        runs = self.api.list_experiment_runs(
+            "experiment-1",
+            participant_number=7,
+            session_search="session abc",
+            status="incomplete",
+            complete=False,
+            has_raw_data=True,
+            has_analyzed_csv=False,
+            has_trainable_json=True,
+            include_files=False,
+            limit=50,
+            cursor="next page",
+        )
+        self.assertEqual(runs.total_count, 2)
+        self.assertEqual(runs.next_cursor, "next-run")
+        run_request = next(
+            request for request in reversed(ApiHandler.requests)
+            if request[0] == "GET_RUN_PAGE"
+        )
+        self.assertEqual(run_request[2], {
+            "participant_number": ["7"],
+            "session_search": ["session abc"],
+            "status": ["incomplete"],
+            "complete": ["false"],
+            "has_raw_data": ["true"],
+            "has_analyzed_csv": ["false"],
+            "has_trainable_json": ["true"],
+            "include_files": ["false"],
+            "limit": ["50"],
+            "cursor": ["next page"],
+        })
+
+    def test_bulk_results_export_is_one_streamed_server_request(self):
+        progress = []
+        with tempfile.TemporaryDirectory() as temp_dir:
+            destination = Path(temp_dir) / "results.zip"
+            downloaded = self.api.download_experiment_bulk_export(
+                "experiment-1",
+                ["run-1", "run-2"],
+                ["raw_data", "analysis_csv"],
+                destination,
+                analysis_policy="all",
+                progress=lambda received, total: progress.append((received, total)),
+            )
+            self.assertEqual(downloaded.read_bytes(), ApiHandler.bulk_archive)
+            self.assertFalse(destination.with_name("results.zip.part").exists())
+        request = next(
+            request for request in reversed(ApiHandler.requests)
+            if request[0] == "BULK_EXPORT"
+        )
+        self.assertEqual(request[2], {
+            "run_ids": ["run-1", "run-2"],
+            "include": ["raw_data", "analysis_csv"],
+            "analysis_policy": "all",
+        })
+        self.assertEqual(progress[-1], (
+            len(ApiHandler.bulk_archive), len(ApiHandler.bulk_archive)
+        ))
+
+    def test_cancelled_bulk_export_removes_partial_file(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            destination = Path(temp_dir) / "cancelled.zip"
+            destination.write_bytes(b"previous export")
+
+            def cancel(_received, _total):
+                raise APICancelled("cancelled")
+
+            with self.assertRaises(APICancelled):
+                self.api.download_experiment_bulk_export(
+                    "experiment-1",
+                    ["run-1"],
+                    ["raw_data"],
+                    destination,
+                    progress=cancel,
+                )
+            self.assertEqual(destination.read_bytes(), b"previous export")
+            self.assertFalse(destination.with_name("cancelled.zip.part").exists())
+
+    def test_cancel_event_during_server_preparation_never_replaces_destination(self):
+        started = threading.Event()
+        release = threading.Event()
+        cancelled = threading.Event()
+        errors = []
+        ApiHandler.bulk_started_event = started
+        ApiHandler.bulk_release_event = release
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                destination = Path(temp_dir) / "prepared.zip"
+                destination.write_bytes(b"previous export")
+
+                def download():
+                    try:
+                        self.api.download_experiment_bulk_export(
+                            "experiment-1",
+                            ["run-1"],
+                            ["raw_data"],
+                            destination,
+                            cancel_event=cancelled,
+                        )
+                    except Exception as exc:
+                        errors.append(exc)
+
+                worker = threading.Thread(target=download)
+                worker.start()
+                self.assertTrue(started.wait(timeout=2))
+                cancelled.set()
+                release.set()
+                worker.join(timeout=3)
+                self.assertFalse(worker.is_alive())
+                self.assertEqual(len(errors), 1)
+                self.assertIsInstance(errors[0], APICancelled)
+                self.assertEqual(destination.read_bytes(), b"previous export")
+                self.assertFalse(
+                    destination.with_name("prepared.zip.part").exists()
+                )
+        finally:
+            release.set()
+            ApiHandler.bulk_started_event = None
+            ApiHandler.bulk_release_event = None
 
     def test_download_verifies_checksum_and_replaces_destination(self):
         version = {

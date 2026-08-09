@@ -20,6 +20,12 @@ JSON bytes.
   the explicit `current_revision_id` and immutable current revision.
 - `POST /api/v1/experiments` creates an empty experiment.
 - `GET /api/v1/experiments` lists experiments with their ordered `blocks`.
+  Existing clients may omit paging parameters and continue receiving the full
+  JSON array. New clients send `limit` (1–200), an optional opaque `cursor`
+  copied from `X-Next-Cursor`, and an optional literal `search` substring.
+  A `cursor` is valid only together with `limit`. Paged responses also include
+  `X-Total-Count`. `include_versions=false` omits the unbounded legacy version
+  history from list responses without loading it; the `versions` array is empty.
 - `PATCH /api/v1/experiments/{id}` renames or updates the description.
 - `DELETE /api/v1/experiments/{id}` deletes metadata and unreferenced objects.
 - `POST /api/v1/experiments/{id}/duplicate` copies an experiment and its block
@@ -89,8 +95,13 @@ retain the previous compatibility calculation.
 - `POST /api/v1/experiments/{id}/results` streams one raw Runner JSON file.
   `X-Filename` is optional. The body is validated against
   `schemas/data-contracts/raw-run.schema.json` and stored byte-for-byte.
-- `GET /api/v1/experiments/{id}/runs` lists participant sessions and their
-  ordered Block results. `complete` is true once all expected Blocks exist.
+- `GET /api/v1/experiments/{id}/runs` lists participant sessions. It supports
+  the same opt-in `limit`/`cursor` contract plus filters for participant number,
+  session text, lifecycle status, completeness, and the presence or absence of
+  Raw data, analyzed CSV, and trainable JSON. `include_files=false` returns
+  summary counts with empty `results`/`artifacts` arrays so list screens do not
+  download every file descriptor. `complete` is true once all expected Blocks
+  exist.
 - `GET /api/v1/runs/{run_id}` returns one session.
 - `GET /api/v1/run-results/{result_id}/download` returns the exact JSON bytes
   with `X-Checksum-SHA256`.
@@ -105,7 +116,24 @@ retain the previous compatibility calculation.
 - `POST /api/v1/runs/{run_id}/analysis/finalize` atomically validates and stores
   a ZIP containing only `manifest.json`, `analysis_state.json`, `analysis.csv`,
   and `trainable.json`. The state, CSV, training JSON, and analysis status
-  become visible in one database commit. Finalized revisions are never pruned.
+  become visible in one database commit. `X-Existing-Analysis-Policy: keep`
+  appends an immutable copy; `replace` creates the new copy before atomically
+  removing older finalized copies. Finalized revisions are never pruned unless
+  explicitly replaced or deleted.
+- `GET /api/v1/runs/{run_id}/analysis-copies` returns finalized copies newest
+  first, grouping the CSV and trainable JSON created together and identifying
+  the copy that currently restores Analyzer editing state.
+- `POST /api/v1/runs/{run_id}/analysis-copies/{revision_id}/set-editable`
+  restores the matching immutable analysis-state snapshot for future editing.
+- `DELETE /api/v1/runs/{run_id}/analysis-copies/{revision_id}` deletes that CSV,
+  trainable JSON, and matching state snapshot but never deletes Raw Runner data.
+- `POST /api/v1/experiments/{id}/bulk-export` accepts 1–500 unique `run_ids`,
+  one or more of `raw_data`, `analysis_csv`, and `trainable_json`, and
+  `analysis_policy: latest|all`. The server streams one bounded ZIP containing
+  `manifest.json`, all selected immutable objects, their checksums, creation
+  times, and analysis revision numbers. Raw data always includes every selected
+  Run's Block results; the policy applies to both finalized and legacy analyzed
+  copies. The response includes `X-Checksum-SHA256` for the complete ZIP.
 - `PATCH /api/v1/runs/{run_id}/analysis` records whether analysis is completed.
 - `POST /api/v1/runs/{run_id}/artifacts/{analysis_csv|trainable_json|analysis_state}` stores
   immutable Analyzer exports; exact retries are idempotent.
@@ -199,6 +227,11 @@ console, and binds the API to loopback for a TLS reverse proxy. Put Caddy,
 nginx, or the hosting platform's HTTPS proxy in front of port 8000. Do not
 expose PostgreSQL or MinIO publicly. Desktop clients set
 `AUTOSCRIPT_API_URL=https://your-api-host` and authenticate in the app.
+
+The development OpenAPI document describes Bearer authentication, pagination
+parameters and response headers, the binary Bulk-export response, analysis-copy
+lifecycle operations, and the `keep`/`replace` finalization header. The same
+schema is available as JSON at <http://127.0.0.1:8000/openapi.json>.
 
 Migration `20260808_0013` adds durable security audit and shared login-rate-limit
 tables. It depends on Analyzer migration `20260808_0012`.

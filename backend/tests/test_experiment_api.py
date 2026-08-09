@@ -10,13 +10,20 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.database import get_db
 from app.main import create_app
-from app.models import Base, Experiment, ExperimentRun, StagedBlockAsset, User
+from app.models import (
+    Base,
+    Experiment,
+    ExperimentRevision,
+    ExperimentRun,
+    StagedBlockAsset,
+    User,
+)
 from app.services.storage import get_object_storage
 
 
@@ -260,6 +267,281 @@ class ExperimentApiTests(unittest.TestCase):
         listed = next(item for item in response.json() if item["id"] == experiment["id"])
         self.assertEqual(listed["participant_count"], 2)
         self.assertEqual(listed["analyzed_participant_count"], 1)
+
+    def test_experiment_list_cursor_search_and_owner_scope(self):
+        owned = [
+            self.client.post(
+                "/api/v1/experiments",
+                json={
+                    "name": name,
+                    "description": description,
+                },
+            ).json()
+            for name, description in (
+                ("Literal %_ Study", "needle in a description"),
+                ("Literal XX Study", None),
+                ("Alpha Study", None),
+                ("Beta Study", None),
+                ("Gamma Study", None),
+            )
+        ]
+        shared_timestamp = datetime(2026, 8, 10, 9, 0, tzinfo=timezone.utc)
+        with self.session_factory() as session:
+            for experiment in session.scalars(
+                select(Experiment).where(
+                    Experiment.id.in_([uuid.UUID(item["id"]) for item in owned])
+                )
+            ):
+                experiment.created_at = shared_timestamp
+            other_user = User(
+                username="other-owner",
+                password_hash="!test!",
+                role="user",
+                is_active=True,
+            )
+            session.add(other_user)
+            session.flush()
+            session.add(
+                Experiment(
+                    name="Private needle Study",
+                    description="needle",
+                    owner_id=other_user.id,
+                    created_at=shared_timestamp,
+                )
+            )
+            session.commit()
+
+        legacy = self.client.get("/api/v1/experiments")
+        self.assertEqual(legacy.status_code, 200, legacy.text)
+        self.assertNotIn("x-total-count", legacy.headers)
+        expected_ids = [item["id"] for item in legacy.json()]
+        self.assertEqual(set(expected_ids), {item["id"] for item in owned})
+
+        collected_ids = []
+        cursor = None
+        while True:
+            params = {"limit": 2}
+            if cursor is not None:
+                params["cursor"] = cursor
+            page = self.client.get("/api/v1/experiments", params=params)
+            self.assertEqual(page.status_code, 200, page.text)
+            self.assertEqual(page.headers["x-total-count"], "5")
+            collected_ids.extend(item["id"] for item in page.json())
+            cursor = page.headers.get("x-next-cursor")
+            if cursor is None:
+                break
+        self.assertEqual(collected_ids, expected_ids)
+        self.assertEqual(len(collected_ids), len(set(collected_ids)))
+
+        literal_search = self.client.get(
+            "/api/v1/experiments",
+            params={"search": "%_", "limit": 10},
+        )
+        self.assertEqual(literal_search.status_code, 200, literal_search.text)
+        self.assertEqual(
+            [item["name"] for item in literal_search.json()],
+            ["Literal %_ Study"],
+        )
+        description_search = self.client.get(
+            "/api/v1/experiments",
+            params={"search": "NEEDLE", "limit": 10},
+        )
+        self.assertEqual(
+            [item["name"] for item in description_search.json()],
+            ["Literal %_ Study"],
+        )
+        self.assertEqual(description_search.headers["x-total-count"], "1")
+
+        self.assertEqual(
+            self.client.get(
+                "/api/v1/experiments", params={"cursor": "opaque"}
+            ).status_code,
+            422,
+        )
+        invalid_cursor_statements = []
+
+        def record_invalid_cursor_sql(
+            _connection,
+            _cursor,
+            statement,
+            _parameters,
+            _context,
+            _executemany,
+        ):
+            invalid_cursor_statements.append(statement)
+
+        event.listen(
+            self.engine,
+            "before_cursor_execute",
+            record_invalid_cursor_sql,
+        )
+        try:
+            invalid_cursor = self.client.get(
+                "/api/v1/experiments",
+                params={"limit": 2, "cursor": "not-a-valid-cursor"},
+            )
+        finally:
+            event.remove(
+                self.engine,
+                "before_cursor_execute",
+                record_invalid_cursor_sql,
+            )
+        self.assertEqual(invalid_cursor.status_code, 422)
+        self.assertEqual(
+            invalid_cursor.json()["detail"],
+            "Invalid pagination cursor.",
+        )
+        self.assertFalse(
+            any("count(" in statement.casefold() for statement in invalid_cursor_statements)
+        )
+
+    def test_openapi_operation_ids_are_unique(self):
+        schema = self.client.get("/openapi.json").json()
+        operation_ids = [
+            operation["operationId"]
+            for path in schema["paths"].values()
+            for method, operation in path.items()
+            if method
+            in {"get", "put", "post", "delete", "options", "head", "patch", "trace"}
+        ]
+        self.assertEqual(len(operation_ids), len(set(operation_ids)))
+        experiment_list = schema["paths"]["/api/v1/experiments"]["get"]
+        experiment_parameters = {
+            parameter["name"] for parameter in experiment_list["parameters"]
+        }
+        self.assertTrue(
+            {"search", "include_versions", "limit", "cursor"}
+            <= experiment_parameters
+        )
+        cursor_parameter = next(
+            parameter
+            for parameter in experiment_list["parameters"]
+            if parameter["name"] == "cursor"
+        )
+        self.assertIn("Requires limit", cursor_parameter["description"])
+        experiment_headers = experiment_list["responses"]["200"]["headers"]
+        self.assertIn("X-Total-Count", experiment_headers)
+        self.assertIn("X-Next-Cursor", experiment_headers)
+
+        run_list = schema["paths"][
+            "/api/v1/experiments/{experiment_id}/runs"
+        ]["get"]
+        run_parameters = {parameter["name"] for parameter in run_list["parameters"]}
+        self.assertTrue(
+            {
+                "participant_number",
+                "session_search",
+                "status",
+                "complete",
+                "has_raw_data",
+                "has_analyzed_csv",
+                "has_trainable_json",
+                "include_files",
+                "limit",
+                "cursor",
+            }
+            <= run_parameters
+        )
+        run_headers = run_list["responses"]["200"]["headers"]
+        self.assertIn("X-Total-Count", run_headers)
+        self.assertIn("X-Next-Cursor", run_headers)
+        run_cursor_parameter = next(
+            parameter
+            for parameter in run_list["parameters"]
+            if parameter["name"] == "cursor"
+        )
+        self.assertIn("Requires limit", run_cursor_parameter["description"])
+
+    def test_compact_experiment_list_omits_version_history_without_loading_it(self):
+        experiment = self.create_experiment("Compact Version Study")
+        published = self.legacy_publish(
+            experiment["id"],
+            block_package("versioned-block"),
+        )
+        self.assertEqual(published.status_code, 201, published.text)
+
+        full = self.client.get(
+            "/api/v1/experiments",
+            params={"search": "Compact Version", "limit": 1},
+        )
+        self.assertEqual(full.status_code, 200, full.text)
+        self.assertEqual(len(full.json()[0]["versions"]), 1)
+
+        compact_statements = []
+
+        def record_compact_sql(
+            _connection,
+            _cursor,
+            statement,
+            _parameters,
+            _context,
+            _executemany,
+        ):
+            compact_statements.append(" ".join(statement.casefold().split()))
+
+        event.listen(self.engine, "before_cursor_execute", record_compact_sql)
+        try:
+            compact = self.client.get(
+                "/api/v1/experiments",
+                params={
+                    "search": "Compact Version",
+                    "include_versions": "false",
+                    "limit": 1,
+                },
+            )
+        finally:
+            event.remove(self.engine, "before_cursor_execute", record_compact_sql)
+
+        self.assertEqual(compact.status_code, 200, compact.text)
+        self.assertEqual(compact.json()[0]["versions"], [])
+        self.assertFalse(
+            any(" from experiment_versions " in statement for statement in compact_statements),
+            compact_statements,
+        )
+
+    def test_paged_experiment_list_loads_only_the_selected_current_revision(self):
+        experiment = self.create_experiment("Revision Paging Study")
+        with self.session_factory() as session:
+            actor = session.query(User).filter_by(username="local-admin").one()
+            first_revision = ExperimentRevision(
+                experiment_id=uuid.UUID(experiment["id"]),
+                revision_number=1,
+                name="First Revision",
+                created_by=actor.id,
+            )
+            second_revision = ExperimentRevision(
+                experiment_id=uuid.UUID(experiment["id"]),
+                revision_number=2,
+                name="Second Revision",
+                created_by=actor.id,
+            )
+            session.add_all([first_revision, second_revision])
+            session.commit()
+            first_revision_id = first_revision.id
+
+        legacy_pointer = self.client.get(
+            "/api/v1/experiments",
+            params={"search": "Revision Paging", "limit": 1},
+        )
+        self.assertEqual(legacy_pointer.status_code, 200, legacy_pointer.text)
+        self.assertEqual(
+            legacy_pointer.json()[0]["current_revision"]["name"],
+            "Second Revision",
+        )
+
+        with self.session_factory() as session:
+            stored = session.get(Experiment, uuid.UUID(experiment["id"]))
+            stored.current_revision_id = first_revision_id
+            session.commit()
+        explicit_pointer = self.client.get(
+            "/api/v1/experiments",
+            params={"search": "Revision Paging", "limit": 1},
+        )
+        self.assertEqual(explicit_pointer.status_code, 200, explicit_pointer.text)
+        self.assertEqual(
+            explicit_pointer.json()[0]["current_revision"]["name"],
+            "First Revision",
+        )
 
     def test_upload_insert_reorder_download_and_delete_blocks(self):
         experiment = self.create_experiment()

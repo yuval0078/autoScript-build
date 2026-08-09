@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 
-from fastapi import Depends, Header, HTTPException, status
+from fastapi import Depends, Header, HTTPException, Security, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -10,10 +11,24 @@ from .models import AccessToken, User
 from .services.auth import hash_token
 
 
+bearer_auth = HTTPBearer(
+    auto_error=False,
+    bearerFormat="opaque access token",
+    description=(
+        "AutoScript access token returned by POST /api/v1/auth/login. "
+        "Local development mode may use its configured local actor without a token."
+    ),
+)
+
+
 def get_current_user(
-    authorization: str | None = Header(default=None),
+    authorization: str | None = Header(default=None, include_in_schema=False),
+    _documented_bearer: HTTPAuthorizationCredentials | None = Security(bearer_auth),
     database: Session = Depends(get_db),
 ):
+    # Keep explicit parsing so malformed Authorization headers behave identically
+    # in local and token modes. The Security dependency documents Bearer auth.
+    del _documented_bearer
     settings = get_settings()
     if authorization:
         scheme, _, raw_token = authorization.partition(" ")

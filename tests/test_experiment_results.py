@@ -1,14 +1,17 @@
 import csv
 import json
 import tempfile
+import threading
+import time
 import unittest
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
-from PyQt5.QtWidgets import QApplication, QMessageBox
+from PyQt5.QtWidgets import QApplication, QFileDialog, QMessageBox
 
-from autoscript_api import APIError
+from autoscript_api import APICancelled, APIError, PaginatedList
 from analyzer_refactored import (
     ParticipantData,
     PenDataPlayer,
@@ -28,6 +31,44 @@ from experiment_results import (
 
 
 class ExperimentResultCardTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    @staticmethod
+    def wait_for(predicate, timeout=3):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            QApplication.processEvents()
+            if predicate():
+                return True
+            time.sleep(0.01)
+        QApplication.processEvents()
+        return bool(predicate())
+
+    @staticmethod
+    def run_summary(run_id="run-1", participant_number=7):
+        return {
+            "id": run_id,
+            "participant_number": participant_number,
+            "participant_age": 25,
+            "participant_gender": "Other",
+            "session_id": f"session-{run_id}",
+            "status": "completed",
+            "created_at": "2026-08-09T10:45:00Z",
+            "started_at": "2026-08-09T10:45:00Z",
+            "complete": True,
+            "result_count": 1,
+            "block_count": 1,
+            "completed_word_count": 5,
+            "expected_word_count": 5,
+            "raw_data_count": 1,
+            "analyzed_csv_count": 1,
+            "trainable_json_count": 1,
+            "results": [],
+            "artifacts": [],
+        }
+
     def test_run_timestamp_is_rendered_for_the_results_row(self):
         rendered = format_run_datetime("2026-08-09T10:45:00+00:00")
 
@@ -100,6 +141,226 @@ class ExperimentResultCardTests(unittest.TestCase):
         )
         self.assertTrue(copies[0]["is_current_editable"])
         self.assertTrue(copies[1]["legacy"])
+
+    def test_results_page_sends_filters_uses_compact_pages_and_loads_more(self):
+        first_run = self.run_summary("run-1", 7)
+        second_run = self.run_summary("run-2", 8)
+
+        class API:
+            def __init__(self):
+                self.calls = []
+
+            def list_experiment_runs(self, experiment_id, **parameters):
+                self.calls.append((experiment_id, parameters))
+                if parameters.get("cursor") is None:
+                    return PaginatedList(
+                        [first_run],
+                        headers={
+                            "x-total-count": "2",
+                            "x-next-cursor": "run-page-2",
+                        },
+                    )
+                return PaginatedList(
+                    [second_run], headers={"x-total-count": "3"}
+                )
+
+        page = ExperimentResultsPage(SimpleNamespace())
+        page.api = API()
+        page.experiment = {"id": "experiment-1", "name": "Study"}
+        self.assertEqual(page.session_filter.maxLength(), 128)
+        page.participant_filter.setText("7")
+        page.session_filter.setText("session")
+        page.status_filter.setCurrentIndex(3)
+        page.complete_filter.setCurrentIndex(1)
+        page.raw_filter.setCurrentIndex(1)
+        page.csv_filter.setCurrentIndex(2)
+        page.trainable_filter.setCurrentIndex(1)
+        page.filter_timer.stop()
+
+        page.refresh_runs()
+        first_parameters = page.api.calls[0][1]
+        self.assertEqual(first_parameters["participant_number"], 7)
+        self.assertEqual(first_parameters["session_search"], "session")
+        self.assertEqual(first_parameters["status"], "completed")
+        self.assertTrue(first_parameters["complete"])
+        self.assertTrue(first_parameters["has_raw_data"])
+        self.assertFalse(first_parameters["has_analyzed_csv"])
+        self.assertTrue(first_parameters["has_trainable_json"])
+        self.assertFalse(first_parameters["include_files"])
+        self.assertEqual(first_parameters["limit"], 50)
+        self.assertEqual([run["id"] for run in page.runs], ["run-1"])
+        self.assertFalse(page.load_more_button.isHidden())
+
+        page.load_more_runs()
+        self.assertEqual(page.api.calls[1][1]["cursor"], "run-page-2")
+        self.assertEqual([run["id"] for run in page.runs], ["run-1", "run-2"])
+        self.assertEqual(page._run_total_count, 2)
+        self.assertEqual(page.status_label.text(), "2 participant runs")
+        self.assertTrue(page.load_more_button.isHidden())
+        page.process_timer.stop()
+        page.deleteLater()
+
+    def test_reset_failure_clears_selection_header_and_actions(self):
+        run = self.run_summary()
+
+        class API:
+            def list_experiment_runs(self, _experiment_id, **_parameters):
+                raise APIError("offline")
+
+        page = ExperimentResultsPage(SimpleNamespace())
+        page.api = API()
+        page.experiment = {"id": "experiment-1", "name": "Study"}
+        page.runs = [run]
+        page.selected_ids = {run["id"]}
+        page.select_all.setChecked(True)
+        page._update_actions()
+        self.assertTrue(page.raw_button.isEnabled())
+
+        page.refresh_runs()
+
+        self.assertEqual(page.runs, [])
+        self.assertEqual(page.selected_ids, set())
+        self.assertFalse(page.select_all.isChecked())
+        for button in (
+            page.raw_button,
+            page.csv_button,
+            page.training_button,
+            page.analyze_button,
+            page.delete_button,
+        ):
+            self.assertFalse(button.isEnabled())
+        self.assertFalse(page._run_loading)
+        self.assertTrue(page.load_more_button.isEnabled())
+        page.process_timer.stop()
+        page.deleteLater()
+
+    def test_run_loading_flag_is_released_after_unexpected_failure(self):
+        class API:
+            def list_experiment_runs(self, _experiment_id, **_parameters):
+                raise RuntimeError("unexpected renderer/API failure")
+
+        page = ExperimentResultsPage(SimpleNamespace())
+        page.api = API()
+        page.experiment = {"id": "experiment-1", "name": "Study"}
+        with self.assertRaises(RuntimeError):
+            page.refresh_runs()
+        self.assertFalse(page._run_loading)
+        self.assertTrue(page.load_more_button.isEnabled())
+        page.process_timer.stop()
+        page.deleteLater()
+
+    def test_selected_artifact_download_uses_one_server_bulk_export(self):
+        run = self.run_summary()
+
+        class API:
+            def __init__(self):
+                self.calls = []
+
+            def download_experiment_bulk_export(
+                self,
+                experiment_id,
+                run_ids,
+                include,
+                destination,
+                **options,
+            ):
+                self.calls.append(
+                    (experiment_id, run_ids, include, Path(destination), options)
+                )
+                Path(destination).write_bytes(b"server zip")
+                options["progress"](10, 10)
+                return Path(destination)
+
+            def list_run_analysis_copies(self, _run_id):
+                raise AssertionError("Bulk download must not make per-run requests")
+
+        page = ExperimentResultsPage(SimpleNamespace())
+        page.api = API()
+        page.experiment = {"id": "experiment-1", "name": "Study"}
+        page.runs = [run]
+        page.selected_ids = {run["id"]}
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(
+            page, "_choose_bulk_duplicate_download", return_value="latest"
+        ), patch.object(
+            QFileDialog,
+            "getSaveFileName",
+            return_value=(str(Path(temp_dir) / "export.zip"), "ZIP Files (*.zip)"),
+        ), patch.object(QMessageBox, "information"):
+            page.download_artifacts("analysis_csv")
+            self.assertTrue(self.wait_for(lambda: not page._bulk_export_jobs))
+
+        self.assertEqual(len(page.api.calls), 1)
+        experiment_id, run_ids, include, _destination, options = page.api.calls[0]
+        self.assertEqual(experiment_id, "experiment-1")
+        self.assertEqual(run_ids, ["run-1"])
+        self.assertEqual(include, ["analysis_csv"])
+        self.assertEqual(options["analysis_policy"], "latest")
+        self.assertIn("cancel_event", options)
+        page.process_timer.stop()
+        page.deleteLater()
+
+    def test_analysis_bulk_filename_distinguishes_latest_and_all(self):
+        run = self.run_summary()
+        page = ExperimentResultsPage(SimpleNamespace())
+        page.experiment = {"id": "experiment-1", "name": "Study"}
+        with patch.object(
+            QFileDialog,
+            "getSaveFileName",
+            side_effect=[("", ""), ("", "")],
+        ) as save_dialog:
+            page._download_bulk_export(
+                [run], ["analysis_csv"], analysis_policy="latest"
+            )
+            page._download_bulk_export(
+                [run], ["analysis_csv"], analysis_policy="all"
+            )
+        defaults = [call.args[2] for call in save_dialog.call_args_list]
+        self.assertTrue(defaults[0].endswith("_analyzed_csv_latest.zip"))
+        self.assertTrue(defaults[1].endswith("_analyzed_csv_all.zip"))
+        page.process_timer.stop()
+        page.deleteLater()
+
+    def test_bulk_worker_keeps_ui_responsive_and_honors_cancel_event(self):
+        run = self.run_summary()
+        started = threading.Event()
+
+        class API:
+            def __init__(self):
+                self.cancel_event = None
+
+            def download_experiment_bulk_export(self, *args, **options):
+                del args
+                self.cancel_event = options["cancel_event"]
+                started.set()
+                self.cancel_event.wait(timeout=3)
+                raise APICancelled("cancelled while server was preparing")
+
+        page = ExperimentResultsPage(SimpleNamespace())
+        page.api = API()
+        page.experiment = {"id": "experiment-1", "name": "Study"}
+        page.runs = [run]
+        page.selected_ids = {run["id"]}
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(
+            QFileDialog,
+            "getSaveFileName",
+            return_value=(str(Path(temp_dir) / "export.zip"), "ZIP Files (*.zip)"),
+        ):
+            page.download_raw()
+            self.assertEqual(len(page._bulk_export_jobs), 1)
+            self.assertTrue(self.wait_for(started.is_set))
+            job = page._bulk_export_jobs[0]
+            job["dialog"].canceled.emit()
+            QApplication.processEvents()
+            self.assertTrue(job["cancel_event"].is_set())
+            self.assertIn(
+                page.status_label.text(),
+                {"Cancelling download...", "Download cancelled."},
+            )
+            self.assertTrue(self.wait_for(lambda: not page._bulk_export_jobs))
+
+        self.assertEqual(page.status_label.text(), "Download cancelled.")
+        page.process_timer.stop()
+        page.deleteLater()
 
 
 class AnalyzerArtifactTests(unittest.TestCase):

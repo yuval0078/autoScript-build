@@ -17,8 +17,9 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from jsonschema import Draft202012Validator
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-from PyQt5.QtWidgets import QMessageBox
+from PyQt5.QtWidgets import QApplication, QMessageBox
 
+from autoscript_api import PaginatedList
 from gui_menu import MainMenu, experiment_card_metadata
 from runner_launch_contract import (
     read_runtime_session_seed,
@@ -33,6 +34,10 @@ SPEC_ROOT = ROOT / "packaging" / "pyinstaller"
 
 
 class RunnerLaunchContractTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
     def test_main_menu_exposes_persistent_run_settings(self):
         source = (ROOT / "gui_menu.py").read_text(encoding="utf-8")
 
@@ -75,6 +80,91 @@ class RunnerLaunchContractTests(unittest.TestCase):
                 Path(session_seed_path(str(config))),
                 Path(f"{config.resolve()}.autoscript_session_seed"),
             )
+
+    def test_main_experiment_search_is_server_paged_and_loads_more(self):
+        first = {
+            "id": "experiment-1",
+            "name": "Alpha study",
+            "blocks": [],
+            "participant_count": 0,
+            "analyzed_participant_count": 0,
+        }
+        second = {
+            "id": "experiment-2",
+            "name": "Alpha follow-up",
+            "blocks": [],
+            "participant_count": 0,
+            "analyzed_participant_count": 0,
+        }
+
+        class API:
+            def __init__(self, timeout=0):
+                self.calls = []
+
+            def list_experiments(self, **parameters):
+                self.calls.append(parameters)
+                if parameters.get("cursor"):
+                    return PaginatedList(
+                        [second], headers={"x-total-count": "3"}
+                    )
+                return PaginatedList(
+                    [first],
+                    headers={
+                        "x-total-count": "2",
+                        "x-next-cursor": "experiment-page-2",
+                    },
+                )
+
+        parent = SimpleNamespace(open_new_experiment=MagicMock())
+        with patch("gui_menu.AutoScriptAPI", API):
+            menu = MainMenu(parent)
+        self.assertEqual(menu.search.maxLength(), 200)
+        menu.search.setText("Alpha")
+        menu.search_timer.stop()
+        menu.refresh_experiments()
+        self.assertEqual(menu.api.calls[-1], {
+            "search": "Alpha",
+            "include_versions": False,
+            "limit": 50,
+            "cursor": None,
+        })
+        self.assertEqual(
+            [item["id"] for item in menu.experiments], ["experiment-1"]
+        )
+        self.assertFalse(menu.load_more_button.isHidden())
+
+        menu.load_more_experiments()
+        self.assertEqual(menu.api.calls[-1]["cursor"], "experiment-page-2")
+        self.assertEqual(
+            [item["id"] for item in menu.experiments],
+            ["experiment-1", "experiment-2"],
+        )
+        self.assertEqual(menu._experiment_total_count, 2)
+        self.assertEqual(menu.status_label.text(), "2 experiments")
+        self.assertTrue(menu.load_more_button.isHidden())
+        menu.deleteLater()
+
+    def test_main_loading_flag_is_released_after_unexpected_failure(self):
+        class InitialAPI:
+            def __init__(self, timeout=0):
+                del timeout
+
+            def list_experiments(self, **_parameters):
+                return PaginatedList([], headers={"x-total-count": "0"})
+
+        class ExplodingAPI:
+            def list_experiments(self, **_parameters):
+                raise RuntimeError("unexpected rendering/API failure")
+
+        parent = SimpleNamespace(open_new_experiment=MagicMock())
+        with patch("gui_menu.AutoScriptAPI", InitialAPI):
+            menu = MainMenu(parent)
+        menu.api = ExplodingAPI()
+        with self.assertRaises(RuntimeError):
+            menu.refresh_experiments()
+        self.assertFalse(menu._experiment_loading)
+        self.assertTrue(menu.load_more_button.isEnabled())
+        menu.deleteLater()
 
     def test_interface_launcher_does_not_import_runner_application(self):
         gui_source = (ROOT / "gui_menu.py").read_text(encoding="utf-8")

@@ -19,7 +19,7 @@ from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
                              QDialog, QToolButton, QMenu, QGridLayout,
                              QCheckBox, QInputDialog, QFrame, QScrollArea,
                              QLineEdit, QSizePolicy)
-from PyQt5.QtCore import Qt, QSize, QSettings
+from PyQt5.QtCore import Qt, QSize, QSettings, QTimer
 from PyQt5.QtGui import QFont, QIcon, QPixmap, QPainter, QColor
 
 
@@ -488,7 +488,15 @@ class MainMenu(QWidget):
         self.api = AutoScriptAPI(timeout=10)
         self.experiments = []
         self.experiment_cards = []
+        self._experiment_cursor = None
+        self._experiment_total_count = 0
+        self._experiment_page_limit = 50
+        self._experiment_loading = False
         self.run_settings = QSettings("AutoScript", "Interface")
+        self.search_timer = QTimer(self)
+        self.search_timer.setSingleShot(True)
+        self.search_timer.setInterval(300)
+        self.search_timer.timeout.connect(self.refresh_experiments)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(38, 28, 38, 28)
@@ -595,6 +603,7 @@ class MainMenu(QWidget):
         self.search = QLineEdit()
         self.search.setPlaceholderText("Search experiments…")
         self.search.setClearButtonEnabled(True)
+        self.search.setMaxLength(200)
         self.search.setMinimumHeight(40)
         self.search.setStyleSheet(
             "QLineEdit { border: 1px solid #cfd8e2; border-radius: 8px; padding: 8px 12px; "
@@ -617,6 +626,16 @@ class MainMenu(QWidget):
         self.list_layout.addStretch()
         scroll.setWidget(self.list_container)
         layout.addWidget(scroll, 1)
+
+        self.load_more_button = QPushButton("Load more experiments")
+        self.load_more_button.setStyleSheet(
+            "QPushButton { background: white; color: #356b9b; border: 1px solid #ccd7e2; "
+            "border-radius: 8px; padding: 9px 13px; font-weight: 650; } "
+            "QPushButton:hover { background: #eef5fb; }"
+        )
+        self.load_more_button.clicked.connect(self.load_more_experiments)
+        self.load_more_button.hide()
+        layout.addWidget(self.load_more_button)
 
         self.refresh_experiments()
 
@@ -672,16 +691,63 @@ class MainMenu(QWidget):
         self.experiment_cards = []
 
     def refresh_experiments(self):
+        self._load_experiment_page(reset=True)
+
+    def load_more_experiments(self):
+        if self._experiment_cursor:
+            self._load_experiment_page(reset=False)
+
+    def _load_experiment_page(self, *, reset):
+        if self._experiment_loading:
+            return
+        self._experiment_loading = True
+        try:
+            self._load_experiment_page_once(reset=reset)
+        finally:
+            self._experiment_loading = False
+            self.load_more_button.setEnabled(True)
+
+    def _load_experiment_page_once(self, *, reset):
+        if reset:
+            self._experiment_cursor = None
+            self.load_more_button.hide()
         self.status_label.setText("Refreshing cloud experiments…")
+        if not reset:
+            self.status_label.setText("Loading more cloud experiments…")
+        self.load_more_button.setEnabled(False)
         QApplication.processEvents()
         try:
-            self.experiments = self.api.list_experiments()
+            page = self.api.list_experiments(
+                search=self.search.text().strip() or None,
+                include_versions=False,
+                limit=self._experiment_page_limit,
+                cursor=None if reset else self._experiment_cursor,
+            )
         except APIError as exc:
-            self.experiments = []
-            self._clear_cards()
+            if reset:
+                self.experiments = []
+                self._clear_cards()
             self.status_label.setText(f"Cloud API unavailable: {exc}")
             return
 
+        if reset:
+            self.experiments = []
+        known_ids = {experiment["id"] for experiment in self.experiments}
+        self.experiments.extend(
+            experiment
+            for experiment in page
+            if experiment["id"] not in known_ids
+        )
+        self._experiment_cursor = getattr(page, "next_cursor", None)
+        if reset:
+            self._experiment_total_count = getattr(
+                page, "total_count", len(self.experiments)
+            )
+        elif (
+            not self._experiment_cursor
+            and len(self.experiments) != self._experiment_total_count
+        ):
+            self._experiment_total_count = len(self.experiments)
         self._clear_cards()
         for experiment in self.experiments:
             card = self._build_experiment_card(experiment)
@@ -691,9 +757,13 @@ class MainMenu(QWidget):
         self.status_label.setText(
             "No experiments in the cloud yet."
             if count == 0
-            else ("1 experiment" if count == 1 else f"{count} experiments")
+            else (
+                f"Loaded {count} of {self._experiment_total_count} experiments"
+                if self._experiment_total_count > count
+                else ("1 experiment" if count == 1 else f"{count} experiments")
+            )
         )
-        self._filter_experiments(self.search.text())
+        self.load_more_button.setVisible(bool(self._experiment_cursor))
 
     def _build_experiment_card(self, experiment):
         card = QFrame()
@@ -736,14 +806,10 @@ class MainMenu(QWidget):
         return card
 
     def _filter_experiments(self, query):
-        normalized = query.strip().casefold()
-        visible = 0
-        for experiment, card in self.experiment_cards:
-            matches = normalized in experiment["name"].casefold()
-            card.setVisible(matches)
-            visible += int(matches)
-        if normalized:
-            self.status_label.setText(f"{visible} matching experiments")
+        del query
+        self._experiment_cursor = None
+        self.load_more_button.hide()
+        self.search_timer.start()
 
     def _download_cloud_experiment(self, experiment):
         save_path, _ = QFileDialog.getSaveFileName(

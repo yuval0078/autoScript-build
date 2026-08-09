@@ -2,14 +2,25 @@ import hashlib
 import os
 import tempfile
 import uuid
+from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Literal
 from urllib.parse import quote, unquote
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    status,
+)
 from fastapi.responses import StreamingResponse
-from sqlalchemy import select
-from sqlalchemy.orm import Session, selectinload
+from sqlalchemy import and_, case, exists, func, or_, select
+from sqlalchemy.orm import Session, aliased, selectinload
 
 from ..config import get_settings
 from ..database import get_db
@@ -19,6 +30,7 @@ from ..models import (
     ExperimentBlock,
     ExperimentRun,
     ExperimentRevision,
+    ExperimentRevisionBlock,
     RunArtifact,
     RunResult,
     User,
@@ -33,6 +45,7 @@ from ..schemas import (
 from ..services.raw_results import RawResultValidationError, validate_raw_result
 from ..services.object_cleanup import drain_object_deletions, queue_object_deletions
 from ..services.storage import get_object_storage
+from .pagination import decode_cursor, encode_cursor, escaped_contains_pattern
 
 
 router = APIRouter(prefix="/api/v1", tags=["results"])
@@ -79,16 +92,40 @@ def _result_response(result):
     )
 
 
-def _run_response(run):
-    results = sorted(run.results, key=lambda result: result.block_index)
-    artifacts = sorted(run.artifacts, key=lambda item: item.created_at, reverse=True)
-    completed_word_count = sum(result.completed_word_count for result in results)
-    revision_blocks = _authoritative_revision_blocks(run)
-    expected_word_count = (
-        sum(block.expected_word_count for block in revision_blocks)
-        if revision_blocks is not None
-        else sum(result.expected_word_count for result in results)
-    )
+def _run_response(run, *, include_files=True, summary=None):
+    if include_files:
+        results = sorted(run.results, key=lambda result: result.block_index)
+        artifacts = sorted(run.artifacts, key=lambda item: item.created_at, reverse=True)
+        completed_word_count = sum(result.completed_word_count for result in results)
+        revision_blocks = _authoritative_revision_blocks(run)
+        expected_word_count = (
+            sum(block.expected_word_count for block in revision_blocks)
+            if revision_blocks is not None
+            else sum(result.expected_word_count for result in results)
+        )
+        result_count = len(results)
+        raw_data_count = len(results)
+        analyzed_csv_count = sum(
+            artifact.kind == "analysis_csv" for artifact in artifacts
+        )
+        trainable_json_count = sum(
+            artifact.kind == "trainable_json" for artifact in artifacts
+        )
+        complete = _run_is_complete(run, results)
+        response_results = [_result_response(result) for result in results]
+        response_artifacts = [_artifact_response(artifact) for artifact in artifacts]
+    else:
+        if summary is None:
+            raise ValueError("A summary is required when file details are omitted.")
+        result_count = summary["result_count"]
+        raw_data_count = summary["raw_data_count"]
+        analyzed_csv_count = summary["analyzed_csv_count"]
+        trainable_json_count = summary["trainable_json_count"]
+        completed_word_count = summary["completed_word_count"]
+        expected_word_count = summary["expected_word_count"]
+        complete = summary["complete"]
+        response_results = []
+        response_artifacts = []
     return ExperimentRunResponse(
         id=run.id,
         experiment_id=run.experiment_id,
@@ -106,19 +143,15 @@ def _run_response(run):
         analysis_completed=run.analysis_completed,
         analysis_updated_at=run.analysis_updated_at,
         created_at=run.created_at,
-        result_count=len(results),
-        raw_data_count=len(results),
-        analyzed_csv_count=sum(
-            artifact.kind == "analysis_csv" for artifact in artifacts
-        ),
-        trainable_json_count=sum(
-            artifact.kind == "trainable_json" for artifact in artifacts
-        ),
+        result_count=result_count,
+        raw_data_count=raw_data_count,
+        analyzed_csv_count=analyzed_csv_count,
+        trainable_json_count=trainable_json_count,
         completed_word_count=completed_word_count,
         expected_word_count=expected_word_count,
-        complete=_run_is_complete(run, results),
-        results=[_result_response(result) for result in results],
-        artifacts=[_artifact_response(artifact) for artifact in artifacts],
+        complete=complete,
+        results=response_results,
+        artifacts=response_artifacts,
     )
 
 
@@ -161,7 +194,183 @@ def _run_is_complete(run, results=None):
     )
 
 
-def _owned_experiment(database, actor, experiment_id, *, lock=False):
+def _run_complete_sql_expression():
+    """Build the SQL equivalent of ``_run_is_complete`` for list filtering."""
+    revision_block = aliased(ExperimentRevisionBlock)
+    matching_result = aliased(RunResult)
+
+    revision_block_count = (
+        select(func.count(revision_block.id))
+        .where(revision_block.revision_id == ExperimentRun.revision_id)
+        .correlate(ExperimentRun)
+        .scalar_subquery()
+    )
+    revision_null_expected_count = (
+        select(func.count(revision_block.id))
+        .where(
+            revision_block.revision_id == ExperimentRun.revision_id,
+            revision_block.expected_word_count.is_(None),
+        )
+        .correlate(ExperimentRun)
+        .scalar_subquery()
+    )
+    result_count = (
+        select(func.count(RunResult.id))
+        .where(RunResult.run_id == ExperimentRun.id)
+        .correlate(ExperimentRun)
+        .scalar_subquery()
+    )
+    missing_or_mismatched_revision_result = (
+        exists(
+            select(1)
+            .select_from(revision_block)
+            .where(
+                revision_block.revision_id == ExperimentRun.revision_id,
+                ~exists(
+                    select(1)
+                    .select_from(matching_result)
+                    .where(
+                        matching_result.run_id == ExperimentRun.id,
+                        matching_result.block_index == revision_block.position + 1,
+                        matching_result.completed_word_count
+                        == revision_block.expected_word_count,
+                    )
+                    .correlate(ExperimentRun, revision_block)
+                ),
+            )
+        )
+        .correlate(ExperimentRun)
+    )
+    authoritative_revision_available = and_(
+        ExperimentRun.revision_id.is_not(None),
+        revision_block_count == ExperimentRun.block_count,
+        revision_null_expected_count == 0,
+    )
+    authoritative_complete = and_(
+        result_count == ExperimentRun.block_count,
+        ~missing_or_mismatched_revision_result,
+    )
+
+    incomplete_legacy_result_exists = (
+        exists(
+            select(1)
+            .select_from(RunResult)
+            .where(
+                RunResult.run_id == ExperimentRun.id,
+                or_(
+                    RunResult.block_completed.is_(False),
+                    RunResult.experiment_completed.is_(False),
+                ),
+            )
+        )
+        .correlate(ExperimentRun)
+    )
+    completed_word_count = (
+        select(func.coalesce(func.sum(RunResult.completed_word_count), 0))
+        .where(RunResult.run_id == ExperimentRun.id)
+        .correlate(ExperimentRun)
+        .scalar_subquery()
+    )
+    expected_word_count = (
+        select(func.coalesce(func.sum(RunResult.expected_word_count), 0))
+        .where(RunResult.run_id == ExperimentRun.id)
+        .correlate(ExperimentRun)
+        .scalar_subquery()
+    )
+    legacy_complete = and_(
+        result_count == ExperimentRun.block_count,
+        ~incomplete_legacy_result_exists,
+        completed_word_count == expected_word_count,
+    )
+    return case(
+        (authoritative_revision_available, authoritative_complete),
+        else_=legacy_complete,
+    )
+
+
+def _run_presence_expressions():
+    has_raw_data = (
+        exists(select(1).where(RunResult.run_id == ExperimentRun.id))
+        .correlate(ExperimentRun)
+    )
+
+    def has_artifact(kind):
+        return (
+            exists(
+                select(1).where(
+                    RunArtifact.run_id == ExperimentRun.id,
+                    RunArtifact.kind == kind,
+                )
+            )
+            .correlate(ExperimentRun)
+        )
+
+    return (
+        has_raw_data,
+        has_artifact("analysis_csv"),
+        has_artifact("trainable_json"),
+    )
+
+
+def _run_summaries(database, runs):
+    """Fetch only the columns needed for compact list responses, in fixed queries."""
+    if not runs:
+        return {}
+    run_ids = [run.id for run in runs]
+    result_rows = database.execute(
+        select(
+            RunResult.run_id,
+            RunResult.block_index,
+            RunResult.block_completed,
+            RunResult.experiment_completed,
+            RunResult.completed_word_count,
+            RunResult.expected_word_count,
+        )
+        .where(RunResult.run_id.in_(run_ids))
+        .order_by(RunResult.run_id, RunResult.block_index)
+    ).all()
+    results_by_run = defaultdict(list)
+    for result in result_rows:
+        results_by_run[result.run_id].append(result)
+
+    artifact_counts = defaultdict(lambda: defaultdict(int))
+    for run_id, kind, count in database.execute(
+        select(RunArtifact.run_id, RunArtifact.kind, func.count(RunArtifact.id))
+        .where(RunArtifact.run_id.in_(run_ids))
+        .group_by(RunArtifact.run_id, RunArtifact.kind)
+    ).all():
+        artifact_counts[run_id][kind] = int(count)
+
+    summaries = {}
+    for run in runs:
+        results = results_by_run[run.id]
+        revision_blocks = _authoritative_revision_blocks(run)
+        summaries[run.id] = {
+            "result_count": len(results),
+            "raw_data_count": len(results),
+            "analyzed_csv_count": artifact_counts[run.id]["analysis_csv"],
+            "trainable_json_count": artifact_counts[run.id]["trainable_json"],
+            "completed_word_count": sum(
+                result.completed_word_count for result in results
+            ),
+            "expected_word_count": (
+                sum(block.expected_word_count for block in revision_blocks)
+                if revision_blocks is not None
+                else sum(result.expected_word_count for result in results)
+            ),
+            "complete": _run_is_complete(run, results),
+        }
+    return summaries
+
+
+def _owned_experiment(
+    database,
+    actor,
+    experiment_id,
+    *,
+    lock=False,
+    load_blocks=True,
+):
     statement = (
         select(Experiment)
         .where(
@@ -169,8 +378,9 @@ def _owned_experiment(database, actor, experiment_id, *, lock=False):
             Experiment.owner_id == actor.id,
             Experiment.archived_at.is_(None),
         )
-        .options(selectinload(Experiment.blocks))
     )
+    if load_blocks:
+        statement = statement.options(selectinload(Experiment.blocks))
     if lock:
         statement = statement.with_for_update()
     experiment = database.scalar(statement)
@@ -666,24 +876,191 @@ async def upload_result(
 @router.get(
     "/experiments/{experiment_id}/runs",
     response_model=list[ExperimentRunResponse],
+    responses={
+        200: {
+            "description": (
+                "Experiment runs as a JSON array. Pagination headers are emitted "
+                "when limit is supplied."
+            ),
+            "headers": {
+                "X-Total-Count": {
+                    "description": "Total owner-scoped runs matching all filters.",
+                    "schema": {"type": "integer", "minimum": 0},
+                },
+                "X-Next-Cursor": {
+                    "description": (
+                        "Opaque cursor for the next page; absent on the final page."
+                    ),
+                    "schema": {"type": "string"},
+                },
+            },
+        }
+    },
 )
 def list_experiment_runs(
     experiment_id: uuid.UUID,
+    response: Response,
+    participant_number: int | None = Query(
+        default=None,
+        ge=1,
+        description="Return only runs for this participant number.",
+    ),
+    session_search: str | None = Query(
+        default=None,
+        max_length=128,
+        description=(
+            "Case-insensitive literal substring match against session_id. "
+            "Percent and underscore characters are not wildcards."
+        ),
+    ),
+    run_status: Literal[
+        "created",
+        "running",
+        "completed",
+        "incomplete",
+        "failed",
+        "cancelled",
+    ]
+    | None = Query(
+        default=None,
+        alias="status",
+        description="Return only runs in this lifecycle status.",
+    ),
+    complete: bool | None = Query(
+        default=None,
+        description="Filter by computed raw-result completeness.",
+    ),
+    has_raw_data: bool | None = Query(
+        default=None,
+        description="Filter by whether at least one raw Block result exists.",
+    ),
+    has_analyzed_csv: bool | None = Query(
+        default=None,
+        description="Filter by whether an analyzed CSV artifact exists.",
+    ),
+    has_trainable_json: bool | None = Query(
+        default=None,
+        description="Filter by whether a trainable JSON artifact exists.",
+    ),
+    include_files: bool = Query(
+        default=True,
+        description=(
+            "Include nested raw-result and artifact metadata. Set false for a "
+            "compact list that retains accurate counts and completion totals."
+        ),
+    ),
+    limit: int | None = Query(
+        default=None,
+        ge=1,
+        le=200,
+        description=(
+            "Maximum number of runs to return. Omit for the legacy "
+            "unpaginated array response."
+        ),
+    ),
+    cursor: str | None = Query(
+        default=None,
+        min_length=1,
+        max_length=1000,
+        description=(
+            "Opaque X-Next-Cursor value from the previous page. Requires limit."
+        ),
+    ),
     database: Session = Depends(get_db),
     actor: User = Depends(get_current_user),
 ):
-    experiment = _owned_experiment(database, actor, experiment_id)
-    runs = database.scalars(
+    if cursor is not None and limit is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="cursor requires limit.",
+        )
+    experiment = _owned_experiment(
+        database,
+        actor,
+        experiment_id,
+        load_blocks=False,
+    )
+    filters = [ExperimentRun.experiment_id == experiment.id]
+    if participant_number is not None:
+        filters.append(ExperimentRun.participant_number == participant_number)
+    normalized_session_search = (session_search or "").strip()
+    if normalized_session_search:
+        filters.append(
+            ExperimentRun.session_id.ilike(
+                escaped_contains_pattern(normalized_session_search),
+                escape="\\",
+            )
+        )
+    if run_status is not None:
+        filters.append(ExperimentRun.status == run_status)
+
+    has_raw_expression, has_csv_expression, has_json_expression = (
+        _run_presence_expressions()
+    )
+    if complete is not None:
+        filters.append(_run_complete_sql_expression().is_(complete))
+    for requested, expression in (
+        (has_raw_data, has_raw_expression),
+        (has_analyzed_csv, has_csv_expression),
+        (has_trainable_json, has_json_expression),
+    ):
+        if requested is not None:
+            filters.append(expression if requested else ~expression)
+
+    cursor_position = decode_cursor(cursor) if cursor is not None else None
+    if limit is not None:
+        total_count = database.scalar(
+            select(func.count()).select_from(ExperimentRun).where(*filters)
+        )
+        response.headers["X-Total-Count"] = str(total_count or 0)
+
+    page_filters = list(filters)
+    if cursor_position is not None:
+        cursor_created_at, cursor_id = cursor_position
+        page_filters.append(
+            or_(
+                ExperimentRun.created_at < cursor_created_at,
+                and_(
+                    ExperimentRun.created_at == cursor_created_at,
+                    ExperimentRun.id < cursor_id,
+                ),
+            )
+        )
+
+    statement = (
         select(ExperimentRun)
-        .where(ExperimentRun.experiment_id == experiment.id)
+        .where(*page_filters)
         .options(
-            selectinload(ExperimentRun.results),
-            selectinload(ExperimentRun.artifacts),
             selectinload(ExperimentRun.revision).selectinload(ExperimentRevision.blocks),
         )
-        .order_by(ExperimentRun.created_at.desc())
-    ).all()
-    return [_run_response(run) for run in runs]
+        .order_by(ExperimentRun.created_at.desc(), ExperimentRun.id.desc())
+    )
+    if include_files:
+        statement = statement.options(
+            selectinload(ExperimentRun.results),
+            selectinload(ExperimentRun.artifacts),
+        )
+    if limit is not None:
+        statement = statement.limit(limit + 1)
+    runs = list(database.scalars(statement).all())
+    has_next_page = limit is not None and len(runs) > limit
+    if has_next_page:
+        runs = runs[:limit]
+        last_run = runs[-1]
+        response.headers["X-Next-Cursor"] = encode_cursor(
+            last_run.created_at,
+            last_run.id,
+        )
+
+    summaries = {} if include_files else _run_summaries(database, runs)
+    return [
+        _run_response(
+            run,
+            include_files=include_files,
+            summary=summaries.get(run.id),
+        )
+        for run in runs
+    ]
 
 
 @router.get("/runs/{run_id}", response_model=ExperimentRunResponse)

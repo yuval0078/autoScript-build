@@ -2,15 +2,23 @@ import json
 import unittest
 import uuid
 from copy import deepcopy
+from datetime import datetime, timezone
 
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.database import get_db
 from app.main import create_app
-from app.models import Base, ExperimentRevision, ExperimentRevisionBlock, User
+from app.models import (
+    Base,
+    Experiment,
+    ExperimentRevision,
+    ExperimentRevisionBlock,
+    ExperimentRun,
+    User,
+)
 from app.services.storage import get_object_storage
 
 
@@ -170,6 +178,299 @@ class ResultApiTests(unittest.TestCase):
         )
         self.assertEqual(deleted.status_code, 204, deleted.text)
         self.assertEqual(self.storage.objects, {})
+
+    def test_run_list_pagination_filters_compact_mode_and_owner_scope(self):
+        first_payload = raw_result(self.experiment["id"], block_count=1)
+        first_payload.update(
+            {
+                "participant_number": 7,
+                "completed_word_count": 1,
+                "expected_word_count": 1,
+                "words": [word_record()],
+            }
+        )
+        first_result, _ = self.upload(first_payload, "first-participant.json")
+        self.assertEqual(first_result.status_code, 201, first_result.text)
+        first_run_id = first_result.json()["run_id"]
+        for kind, content in (
+            ("analysis_csv", b"Participant,Word\n7,test\n"),
+            ("trainable_json", b'{"words":[]}'),
+        ):
+            uploaded = self.client.post(
+                f"/api/v1/runs/{first_run_id}/artifacts/{kind}",
+                content=content,
+                headers={"X-Filename": f"first.{kind.rsplit('_', 1)[-1]}"},
+            )
+            self.assertIn(uploaded.status_code, {200, 201}, uploaded.text)
+
+        incomplete_payload = raw_result(self.experiment["id"], block_count=1)
+        incomplete_payload.update(
+            {
+                "participant_number": 9,
+                "session_id": "9_20260807_120001_abcdee",
+                "block_completed": False,
+                "experiment_completed": False,
+                "completed_word_count": 1,
+                "expected_word_count": 2,
+                "words": [word_record()],
+            }
+        )
+        incomplete_result, _ = self.upload(
+            incomplete_payload,
+            "incomplete-participant.json",
+        )
+        self.assertEqual(incomplete_result.status_code, 201, incomplete_result.text)
+
+        shared_timestamp = datetime(2026, 8, 10, 11, 0, tzinfo=timezone.utc)
+        with self.session_factory() as session:
+            actor = session.query(User).filter_by(username="local-admin").one()
+            experiment_id = uuid.UUID(self.experiment["id"])
+            for session_id, participant_number, run_status in (
+                ("literal%_session", 8, "failed"),
+                ("literalXXsession", 7, "running"),
+            ):
+                session.add(
+                    ExperimentRun(
+                        experiment_id=experiment_id,
+                        revision_id=None,
+                        session_id=session_id,
+                        participant_number=participant_number,
+                        participant_age=30,
+                        participant_gender="Other",
+                        block_count=1,
+                        source_experiment_name=self.experiment["name"],
+                        source_experiment_id=self.experiment["id"],
+                        status=run_status,
+                        created_at=shared_timestamp,
+                        created_by=actor.id,
+                    )
+                )
+            for run in session.query(ExperimentRun).filter_by(
+                experiment_id=experiment_id
+            ):
+                run.created_at = shared_timestamp
+
+            other_user = User(
+                username="other-results-owner",
+                password_hash="!test!",
+                role="user",
+                is_active=True,
+            )
+            session.add(other_user)
+            session.flush()
+            private_experiment = Experiment(
+                name="Private Results Study",
+                owner_id=other_user.id,
+            )
+            session.add(private_experiment)
+            session.flush()
+            session.add(
+                ExperimentRun(
+                    experiment_id=private_experiment.id,
+                    revision_id=None,
+                    session_id="private-session",
+                    participant_number=7,
+                    participant_age=30,
+                    participant_gender="Other",
+                    block_count=1,
+                    source_experiment_name=private_experiment.name,
+                    source_experiment_id=str(private_experiment.id),
+                    status="running",
+                    created_by=other_user.id,
+                )
+            )
+            session.commit()
+            private_experiment_id = private_experiment.id
+
+        runs_url = f"/api/v1/experiments/{self.experiment['id']}/runs"
+        legacy = self.client.get(runs_url)
+        self.assertEqual(legacy.status_code, 200, legacy.text)
+        self.assertNotIn("x-total-count", legacy.headers)
+        expected_ids = [run["id"] for run in legacy.json()]
+        self.assertEqual(len(expected_ids), 4)
+
+        collected_ids = []
+        cursor = None
+        while True:
+            params = {"limit": 2, "include_files": "false"}
+            if cursor is not None:
+                params["cursor"] = cursor
+            page = self.client.get(runs_url, params=params)
+            self.assertEqual(page.status_code, 200, page.text)
+            self.assertEqual(page.headers["x-total-count"], "4")
+            self.assertTrue(
+                all(not run["results"] and not run["artifacts"] for run in page.json())
+            )
+            collected_ids.extend(run["id"] for run in page.json())
+            cursor = page.headers.get("x-next-cursor")
+            if cursor is None:
+                break
+        self.assertEqual(collected_ids, expected_ids)
+        self.assertEqual(len(collected_ids), len(set(collected_ids)))
+
+        compact = self.client.get(
+            runs_url,
+            params={
+                "limit": 10,
+                "has_analyzed_csv": "true",
+                "has_trainable_json": "true",
+                "include_files": "false",
+            },
+        )
+        self.assertEqual(compact.status_code, 200, compact.text)
+        self.assertEqual(compact.headers["x-total-count"], "1")
+        compact_run = compact.json()[0]
+        self.assertEqual(compact_run["id"], first_run_id)
+        self.assertEqual(compact_run["raw_data_count"], 1)
+        self.assertEqual(compact_run["analyzed_csv_count"], 1)
+        self.assertEqual(compact_run["trainable_json_count"], 1)
+        self.assertEqual(compact_run["completed_word_count"], 1)
+        self.assertEqual(compact_run["expected_word_count"], 1)
+        self.assertTrue(compact_run["complete"])
+        self.assertEqual(compact_run["results"], [])
+        self.assertEqual(compact_run["artifacts"], [])
+
+        combined = self.client.get(
+            runs_url,
+            params={
+                "participant_number": 8,
+                "status": "failed",
+                "has_raw_data": "false",
+                "limit": 10,
+            },
+        )
+        self.assertEqual(combined.status_code, 200, combined.text)
+        self.assertEqual(
+            [run["session_id"] for run in combined.json()],
+            ["literal%_session"],
+        )
+        self.assertEqual(combined.headers["x-total-count"], "1")
+
+        literal_session = self.client.get(
+            runs_url,
+            params={"session_search": "%_", "limit": 10},
+        )
+        self.assertEqual(
+            [run["session_id"] for run in literal_session.json()],
+            ["literal%_session"],
+        )
+        complete = self.client.get(
+            runs_url,
+            params={"complete": "true", "limit": 10},
+        )
+        incomplete = self.client.get(
+            runs_url,
+            params={"complete": "false", "limit": 10},
+        )
+        expected_complete_ids = {
+            run["id"] for run in legacy.json() if run["complete"]
+        }
+        expected_incomplete_ids = set(expected_ids) - expected_complete_ids
+        self.assertEqual(
+            {run["id"] for run in complete.json()},
+            expected_complete_ids,
+        )
+        self.assertEqual(
+            {run["id"] for run in incomplete.json()},
+            expected_incomplete_ids,
+        )
+        no_raw = self.client.get(
+            runs_url,
+            params={"has_raw_data": "false", "limit": 10},
+        )
+        self.assertEqual(
+            {run["session_id"] for run in no_raw.json()},
+            {"literal%_session", "literalXXsession"},
+        )
+
+        self.assertEqual(
+            self.client.get(runs_url, params={"cursor": "opaque"}).status_code,
+            422,
+        )
+        self.assertEqual(
+            self.client.get(
+                runs_url,
+                params={"limit": 2, "cursor": "not-a-valid-cursor"},
+            ).status_code,
+            422,
+        )
+        self.assertEqual(
+            self.client.get(runs_url, params={"status": "unknown"}).status_code,
+            422,
+        )
+        self.assertEqual(
+            self.client.get(runs_url, params={"participant_number": 0}).status_code,
+            422,
+        )
+        self.assertEqual(
+            self.client.get(
+                f"/api/v1/experiments/{private_experiment_id}/runs",
+                params={"participant_number": 7, "limit": 10},
+            ).status_code,
+            404,
+        )
+
+    def test_compact_run_list_uses_lightweight_owner_lookup_and_validates_cursor_first(self):
+        runs_url = f"/api/v1/experiments/{self.experiment['id']}/runs"
+        compact_statements = []
+
+        def record_compact_sql(
+            _connection,
+            _cursor,
+            statement,
+            _parameters,
+            _context,
+            _executemany,
+        ):
+            compact_statements.append(" ".join(statement.casefold().split()))
+
+        event.listen(self.engine, "before_cursor_execute", record_compact_sql)
+        try:
+            compact = self.client.get(
+                runs_url,
+                params={"include_files": "false", "limit": 1},
+            )
+        finally:
+            event.remove(self.engine, "before_cursor_execute", record_compact_sql)
+        self.assertEqual(compact.status_code, 200, compact.text)
+        self.assertFalse(
+            any(" from experiment_blocks " in statement for statement in compact_statements),
+            compact_statements,
+        )
+
+        invalid_cursor_statements = []
+
+        def record_invalid_cursor_sql(
+            _connection,
+            _cursor,
+            statement,
+            _parameters,
+            _context,
+            _executemany,
+        ):
+            invalid_cursor_statements.append(statement.casefold())
+
+        event.listen(
+            self.engine,
+            "before_cursor_execute",
+            record_invalid_cursor_sql,
+        )
+        try:
+            invalid = self.client.get(
+                runs_url,
+                params={"limit": 1, "cursor": "not-a-valid-cursor"},
+            )
+        finally:
+            event.remove(
+                self.engine,
+                "before_cursor_execute",
+                record_invalid_cursor_sql,
+            )
+        self.assertEqual(invalid.status_code, 422, invalid.text)
+        self.assertFalse(
+            any("count(" in statement for statement in invalid_cursor_statements),
+            invalid_cursor_statements,
+        )
 
     def test_run_metadata_conflict_is_rejected(self):
         first_payload = raw_result(self.experiment["id"], block_index=1)

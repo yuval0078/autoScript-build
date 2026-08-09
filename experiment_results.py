@@ -1,23 +1,27 @@
 """Experiment participant/run management screen."""
 
 import json
-import tempfile
+import threading
 import time
 import uuid
-import zipfile
 from datetime import datetime
 from pathlib import Path
 
-from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtCore import QObject, QThread, Qt, QTimer, pyqtSignal, pyqtSlot
+from PyQt5.QtGui import QIntValidator
 from PyQt5.QtWidgets import (
     QApplication,
     QCheckBox,
+    QComboBox,
     QDialog,
     QFileDialog,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMessageBox,
+    QProgressDialog,
     QPushButton,
     QScrollArea,
     QVBoxLayout,
@@ -25,7 +29,7 @@ from PyQt5.QtWidgets import (
 )
 
 from app_paths import ensure_dir, user_data_dir
-from autoscript_api import APIError, AutoScriptAPI
+from autoscript_api import APICancelled, APIError, AutoScriptAPI
 
 
 ARTIFACT_TAGS = (
@@ -84,6 +88,62 @@ def format_run_datetime(value):
         return str(value)
 
 
+class _BulkExportWorker(QObject):
+    """Run one blocking bulk-export request away from the Qt UI thread."""
+
+    progress = pyqtSignal(object, int, int)
+    succeeded = pyqtSignal(object, str)
+    failed = pyqtSignal(object, str)
+    cancelled = pyqtSignal(object)
+    done = pyqtSignal()
+
+    def __init__(
+        self,
+        api,
+        experiment_id,
+        run_ids,
+        include,
+        destination,
+        analysis_policy,
+        cancel_event,
+    ):
+        super().__init__()
+        self.api = api
+        self.experiment_id = experiment_id
+        self.run_ids = list(run_ids)
+        self.include = list(include)
+        self.destination = Path(destination)
+        self.analysis_policy = analysis_policy
+        self.cancel_event = cancel_event
+
+    @pyqtSlot()
+    def run(self):
+        try:
+            destination = self.api.download_experiment_bulk_export(
+                self.experiment_id,
+                self.run_ids,
+                self.include,
+                self.destination,
+                analysis_policy=self.analysis_policy,
+                progress=(
+                    lambda received, total:
+                    self.progress.emit(self, received, total)
+                ),
+                cancel_event=self.cancel_event,
+            )
+        except APICancelled:
+            self.cancelled.emit(self)
+        except Exception as exc:
+            if self.cancel_event.is_set():
+                self.cancelled.emit(self)
+            else:
+                self.failed.emit(self, str(exc))
+        else:
+            self.succeeded.emit(self, str(destination))
+        finally:
+            self.done.emit()
+
+
 class ExperimentResultsPage(QWidget):
     def __init__(self, parent):
         super().__init__()
@@ -93,8 +153,19 @@ class ExperimentResultsPage(QWidget):
         self.runs = []
         self.selected_ids = set()
         self.row_checkboxes = []
+        self.run_details = {}
         self.analysis_processes = []
+        self._bulk_export_jobs = []
+        self._run_cursor = None
+        self._run_total_count = 0
+        self._run_page_limit = 50
+        self._run_loading = False
         self._build_ui()
+
+        self.filter_timer = QTimer(self)
+        self.filter_timer.setSingleShot(True)
+        self.filter_timer.setInterval(300)
+        self.filter_timer.timeout.connect(self.refresh_runs)
 
         self.process_timer = QTimer(self)
         self.process_timer.setInterval(1200)
@@ -126,6 +197,78 @@ class ExperimentResultsPage(QWidget):
         refresh.setStyleSheet(self._button_style("#356b9b"))
         header.addWidget(refresh)
         layout.addLayout(header)
+
+        filters = QFrame()
+        filters.setObjectName("runFilters")
+        filters.setStyleSheet(
+            "QFrame#runFilters { background: #f7fafc; border: 1px solid #d7e1ea; "
+            "border-radius: 9px; } QLabel { color: #516273; }"
+        )
+        filter_layout = QGridLayout(filters)
+        filter_layout.setContentsMargins(12, 10, 12, 10)
+        filter_layout.setHorizontalSpacing(10)
+        filter_layout.setVerticalSpacing(7)
+
+        self.participant_filter = QLineEdit()
+        self.participant_filter.setPlaceholderText("Any participant")
+        self.participant_filter.setClearButtonEnabled(True)
+        self.participant_filter.setValidator(QIntValidator(1, 2147483647, self))
+        self.session_filter = QLineEdit()
+        self.session_filter.setPlaceholderText("Search session ID...")
+        self.session_filter.setClearButtonEnabled(True)
+        self.session_filter.setMaxLength(128)
+        self.status_filter = QComboBox()
+        for label, value in (
+            ("Any status", None),
+            ("Created", "created"),
+            ("Running", "running"),
+            ("Completed", "completed"),
+            ("Incomplete", "incomplete"),
+            ("Failed", "failed"),
+            ("Cancelled", "cancelled"),
+        ):
+            self.status_filter.addItem(label, value)
+        self.complete_filter = self._boolean_filter_combo(
+            "Any completeness", "Complete data", "Incomplete data"
+        )
+        self.raw_filter = self._boolean_filter_combo(
+            "Any raw data", "Has raw data", "No raw data"
+        )
+        self.csv_filter = self._boolean_filter_combo(
+            "Any analyzed CSV", "Has analyzed CSV", "No analyzed CSV"
+        )
+        self.trainable_filter = self._boolean_filter_combo(
+            "Any trainable JSON", "Has trainable JSON", "No trainable JSON"
+        )
+        clear_filters = QPushButton("Clear filters")
+        clear_filters.setStyleSheet(self._button_style("#536578"))
+        clear_filters.clicked.connect(self._clear_filters)
+
+        filter_layout.addWidget(QLabel("Participant"), 0, 0)
+        filter_layout.addWidget(self.participant_filter, 0, 1)
+        filter_layout.addWidget(QLabel("Session"), 0, 2)
+        filter_layout.addWidget(self.session_filter, 0, 3)
+        filter_layout.addWidget(QLabel("Status"), 0, 4)
+        filter_layout.addWidget(self.status_filter, 0, 5)
+        filter_layout.addWidget(self.complete_filter, 1, 0, 1, 2)
+        filter_layout.addWidget(self.raw_filter, 1, 2)
+        filter_layout.addWidget(self.csv_filter, 1, 3)
+        filter_layout.addWidget(self.trainable_filter, 1, 4)
+        filter_layout.addWidget(clear_filters, 1, 5)
+        filter_layout.setColumnStretch(1, 1)
+        filter_layout.setColumnStretch(3, 1)
+        layout.addWidget(filters)
+
+        self.participant_filter.textChanged.connect(self._queue_filter_refresh)
+        self.session_filter.textChanged.connect(self._queue_filter_refresh)
+        for control in (
+            self.status_filter,
+            self.complete_filter,
+            self.raw_filter,
+            self.csv_filter,
+            self.trainable_filter,
+        ):
+            control.currentIndexChanged.connect(self._queue_filter_refresh)
 
         toolbar = QHBoxLayout()
         toolbar.setSpacing(8)
@@ -161,7 +304,7 @@ class ExperimentResultsPage(QWidget):
         )
         column_layout = QHBoxLayout(column_header)
         column_layout.setContentsMargins(14, 8, 14, 8)
-        self.select_all = QCheckBox("Select all")
+        self.select_all = QCheckBox("Select all loaded")
         self.select_all.stateChanged.connect(self._toggle_all)
         column_layout.addWidget(self.select_all)
         column_layout.addSpacing(18)
@@ -183,7 +326,21 @@ class ExperimentResultsPage(QWidget):
         self.list_layout.addStretch()
         scroll.setWidget(self.list_container)
         layout.addWidget(scroll, 1)
+
+        self.load_more_button = QPushButton("Load more participant runs")
+        self.load_more_button.setStyleSheet(self._button_style("#356b9b"))
+        self.load_more_button.clicked.connect(self.load_more_runs)
+        self.load_more_button.hide()
+        layout.addWidget(self.load_more_button)
         self._update_actions()
+
+    @staticmethod
+    def _boolean_filter_combo(any_label, yes_label, no_label):
+        combo = QComboBox()
+        combo.addItem(any_label, None)
+        combo.addItem(yes_label, True)
+        combo.addItem(no_label, False)
+        return combo
 
     @staticmethod
     def _button_style(color):
@@ -207,6 +364,39 @@ class ExperimentResultsPage(QWidget):
         self.selected_ids.clear()
         self.refresh_runs()
 
+    def _queue_filter_refresh(self, *_args):
+        if hasattr(self, "filter_timer"):
+            self._run_cursor = None
+            self.load_more_button.hide()
+            self.filter_timer.start()
+
+    def _clear_filters(self):
+        self.participant_filter.clear()
+        self.session_filter.clear()
+        for combo in (
+            self.status_filter,
+            self.complete_filter,
+            self.raw_filter,
+            self.csv_filter,
+            self.trainable_filter,
+        ):
+            combo.setCurrentIndex(0)
+        self._queue_filter_refresh()
+
+    def _run_filter_parameters(self):
+        participant_text = self.participant_filter.text().strip()
+        return {
+            "participant_number": (
+                int(participant_text) if participant_text else None
+            ),
+            "session_search": self.session_filter.text().strip() or None,
+            "status": self.status_filter.currentData(),
+            "complete": self.complete_filter.currentData(),
+            "has_raw_data": self.raw_filter.currentData(),
+            "has_analyzed_csv": self.csv_filter.currentData(),
+            "has_trainable_json": self.trainable_filter.currentData(),
+        }
+
     def _clear_rows(self):
         while self.list_layout.count() > 1:
             item = self.list_layout.takeAt(0)
@@ -215,32 +405,85 @@ class ExperimentResultsPage(QWidget):
         self.row_checkboxes = []
 
     def refresh_runs(self):
+        self._load_run_page(reset=True)
+
+    def load_more_runs(self):
+        if self._run_cursor:
+            self._load_run_page(reset=False)
+
+    def _load_run_page(self, *, reset):
         if not self.experiment:
             return
-        self.status_label.setText("Refreshing participant runs…")
+        if self._run_loading:
+            return
+        self._run_loading = True
+        try:
+            self._load_run_page_once(reset=reset)
+        finally:
+            self._run_loading = False
+            self.load_more_button.setEnabled(True)
+
+    def _load_run_page_once(self, *, reset):
+        if reset:
+            self._run_cursor = None
+            self.load_more_button.hide()
+        self.status_label.setText(
+            "Refreshing participant runs…"
+            if reset else "Loading more participant runs…"
+        )
+        self.load_more_button.setEnabled(False)
         QApplication.processEvents()
         try:
-            self.runs = self.api.list_experiment_runs(self.experiment["id"])
+            page = self.api.list_experiment_runs(
+                self.experiment["id"],
+                **self._run_filter_parameters(),
+                include_files=False,
+                limit=self._run_page_limit,
+                cursor=None if reset else self._run_cursor,
+            )
         except APIError as exc:
-            self.runs = []
-            self._clear_rows()
+            if reset:
+                self.runs = []
+                self.selected_ids.clear()
+                self._clear_rows()
+                self._sync_select_all()
+                self._update_actions()
             self.status_label.setText(f"Cloud API unavailable: {exc}")
             return
 
-        available_ids = {run["id"] for run in self.runs}
-        self.selected_ids.intersection_update(available_ids)
+        if reset:
+            self.runs = []
+            self.run_details.clear()
+            self.selected_ids.clear()
+        known_ids = {run["id"] for run in self.runs}
+        for run in page:
+            if run["id"] in known_ids:
+                continue
+            summary = dict(run)
+            summary["_files_included"] = False
+            self.runs.append(summary)
+        self._run_cursor = getattr(page, "next_cursor", None)
+        if reset:
+            self._run_total_count = getattr(page, "total_count", len(self.runs))
+        elif not self._run_cursor and len(self.runs) != self._run_total_count:
+            self._run_total_count = len(self.runs)
         self._clear_rows()
         for run in self.runs:
             self.list_layout.insertWidget(
                 self.list_layout.count() - 1,
                 self._build_run_row(run),
             )
-        count = len(self.runs)
+        loaded_count = len(self.runs)
         self.status_label.setText(
             "No participant runs for this experiment yet."
-            if not count
-            else f"{count} participant run{'s' if count != 1 else ''}"
+            if not loaded_count
+            else (
+                f"Loaded {loaded_count} of {self._run_total_count} participant runs"
+                if self._run_total_count > loaded_count
+                else f"{loaded_count} participant run{'s' if loaded_count != 1 else ''}"
+            )
         )
+        self.load_more_button.setVisible(bool(self._run_cursor))
         self._sync_select_all()
         self._update_actions()
 
@@ -384,50 +627,181 @@ class ExperimentResultsPage(QWidget):
     def download_raw(self):
         runs = self._selected_runs()
         if not runs:
+            QMessageBox.information(
+                self, "Nothing Selected", "Select at least one participant run."
+            )
             return
         self._download_raw_runs(runs)
 
     def _download_raw_runs(self, runs):
-        default_name = f"{self._safe_name(self.experiment['name'])}_raw_results.zip"
+        self._download_bulk_export(runs, ["raw_data"])
+
+    def _download_bulk_export(self, runs, include, *, analysis_policy="latest"):
+        if not runs:
+            QMessageBox.information(
+                self, "Nothing Selected", "Select at least one participant run."
+            )
+            return
+        if len(runs) > 500:
+            QMessageBox.warning(
+                self,
+                "Selection Too Large",
+                "A single server export can contain up to 500 participant runs. "
+                "Reduce the selection and try again.",
+            )
+            return
+        names = {
+            "raw_data": "raw_data",
+            "analysis_csv": "analyzed_csv",
+            "trainable_json": "trainable_json",
+        }
+        export_name = "_and_".join(names[kind] for kind in include)
+        if any(kind in {"analysis_csv", "trainable_json"} for kind in include):
+            export_name += f"_{analysis_policy}"
+        default_name = (
+            f"{self._safe_name(self.experiment['name'])}_{export_name}.zip"
+        )
         if len(runs) == 1:
             run = runs[0]
             default_name = (
                 f"participant_{run['participant_number']}_"
-                f"{self._safe_name(run['session_id'])}_raw_data.zip"
+                f"{self._safe_name(run['session_id'])}_{export_name}.zip"
             )
         save_path, _ = QFileDialog.getSaveFileName(
-            self, "Download Raw Results", default_name, "ZIP Files (*.zip)"
+            self, "Download Results", default_name, "ZIP Files (*.zip)"
         )
         if not save_path:
             return
         output_path = Path(save_path).with_suffix(".zip")
-        try:
-            with tempfile.TemporaryDirectory(prefix="autoscript-raw-export-") as temp_dir:
-                temp_root = Path(temp_dir)
-                with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as archive:
-                    for run in runs:
-                        run_folder = (
-                            f"participant_{run['participant_number']}_"
-                            f"{self._safe_name(run['session_id'])}"
-                        )
-                        for result in sorted(
-                            run.get("results", []),
-                            key=lambda item: item.get("block_index", 0),
-                        ):
-                            filename = (
-                                f"{result.get('block_index', 0):03d}_"
-                                f"{self._safe_name(result.get('block_name', 'block'))}.json"
-                            )
-                            local_path = temp_root / f"{uuid.uuid4().hex}.json"
-                            self.api.download_run_result(result, local_path)
-                            archive.write(local_path, f"{run_folder}/{filename}")
-            QMessageBox.information(self, "Download Complete", f"Saved to:\n{output_path}")
-        except (APIError, OSError, ValueError) as exc:
-            output_path.unlink(missing_ok=True)
-            QMessageBox.critical(self, "Download Failed", str(exc))
+        progress_dialog = QProgressDialog(
+            "Preparing server export...", "Cancel", 0, 100, self
+        )
+        progress_dialog.setWindowTitle("Downloading Results")
+        progress_dialog.setWindowModality(Qt.WindowModal)
+        progress_dialog.setMinimumDuration(0)
+        progress_dialog.setValue(0)
+        cancel_event = threading.Event()
+        thread = QThread()
+        worker = _BulkExportWorker(
+            self.api,
+            self.experiment["id"],
+            [run["id"] for run in runs],
+            include,
+            output_path,
+            analysis_policy,
+            cancel_event,
+        )
+        worker.moveToThread(thread)
+        job = {
+            "thread": thread,
+            "worker": worker,
+            "dialog": progress_dialog,
+            "cancel_event": cancel_event,
+            "outcome_received": False,
+            "thread_finished": False,
+        }
+        self._bulk_export_jobs.append(job)
+        progress_dialog.canceled.connect(
+            lambda current=job: self._cancel_bulk_export(current)
+        )
+        thread.started.connect(worker.run)
+        # Bound QWidget slots guarantee queued delivery on the GUI thread. Bare
+        # lambdas do not provide an explicit QObject receiver across Qt versions.
+        worker.progress.connect(self._update_bulk_export_progress)
+        worker.succeeded.connect(self._bulk_export_succeeded)
+        worker.failed.connect(self._bulk_export_failed)
+        worker.cancelled.connect(self._bulk_export_cancelled)
+        worker.done.connect(thread.quit)
+        worker.done.connect(worker.deleteLater)
+        thread.finished.connect(self._release_bulk_export_job)
+        thread.finished.connect(thread.deleteLater)
+        thread.start()
+
+    def _bulk_export_job_for_source(self, source):
+        return next(
+            (
+                job
+                for job in self._bulk_export_jobs
+                if source is job["worker"] or source is job["thread"]
+            ),
+            None,
+        )
+
+    @pyqtSlot(object, int, int)
+    def _update_bulk_export_progress(self, worker, received, total):
+        job = self._bulk_export_job_for_source(worker)
+        if job is None:
+            return
+        if job["cancel_event"].is_set():
+            return
+        dialog = job["dialog"]
+        if total:
+            dialog.setValue(min(99, int(received * 100 / total)))
+        else:
+            dialog.setLabelText(f"Downloaded {received // 1024:,} KB...")
+
+    def _cancel_bulk_export(self, job):
+        if job["cancel_event"].is_set():
+            return
+        job["cancel_event"].set()
+        self.status_label.setText("Cancelling download...")
+        dialog = job["dialog"]
+        dialog.setLabelText("Cancelling server export...")
+        dialog.setCancelButton(None)
+
+    @pyqtSlot(object, str)
+    def _bulk_export_succeeded(self, worker, destination):
+        job = self._bulk_export_job_for_source(worker)
+        if job is None:
+            return
+        job["outcome_received"] = True
+        job["dialog"].setValue(100)
+        job["dialog"].close()
+        QMessageBox.information(
+            self, "Download Complete", f"Saved to:\n{destination}"
+        )
+        self._discard_bulk_export_job_if_finished(job)
+
+    @pyqtSlot(object, str)
+    def _bulk_export_failed(self, worker, message):
+        job = self._bulk_export_job_for_source(worker)
+        if job is None:
+            return
+        job["outcome_received"] = True
+        job["dialog"].close()
+        QMessageBox.critical(self, "Download Failed", message)
+        self._discard_bulk_export_job_if_finished(job)
+
+    @pyqtSlot(object)
+    def _bulk_export_cancelled(self, worker):
+        job = self._bulk_export_job_for_source(worker)
+        if job is None:
+            return
+        job["outcome_received"] = True
+        job["dialog"].close()
+        self.status_label.setText("Download cancelled.")
+        self._discard_bulk_export_job_if_finished(job)
+
+    @pyqtSlot()
+    def _release_bulk_export_job(self):
+        job = self._bulk_export_job_for_source(self.sender())
+        if job is None:
+            return
+        job["thread_finished"] = True
+        self._discard_bulk_export_job_if_finished(job)
+
+    def _discard_bulk_export_job_if_finished(self, job):
+        # Worker outcome signals and QThread.finished are queued from different
+        # QObject senders, so Qt does not guarantee their cross-sender order.
+        if not (job["outcome_received"] and job["thread_finished"]):
+            return
+        job["dialog"].close()
+        if job in self._bulk_export_jobs:
+            self._bulk_export_jobs.remove(job)
 
     def _analysis_copies(self, run, kind):
         """Load versioned exports, with a flat-artifact fallback for older servers."""
+        run = self._get_run_detail(run)
         try:
             revisions = self.api.list_run_analysis_copies(run["id"])
         except APIError as exc:
@@ -460,6 +834,19 @@ class ExperimentResultsPage(QWidget):
         copies.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
         return copies
 
+    def _get_run_detail(self, run):
+        """Fetch nested files lazily for actions that actually require them."""
+        if run.get("_files_included") is not False and (
+            "results" in run or "artifacts" in run
+        ):
+            return run
+        run_id = run["id"]
+        if not hasattr(self, "run_details"):
+            self.run_details = {}
+        if run_id not in self.run_details:
+            self.run_details[run_id] = self.api.get_experiment_run(run_id)
+        return self.run_details[run_id]
+
     @staticmethod
     def _artifact_details(kind):
         if kind == "analysis_csv":
@@ -481,39 +868,23 @@ class ExperimentResultsPage(QWidget):
         return filename + suffix
 
     def _download_artifact_entries(self, entries, kind, *, include_versions=False):
-        label, suffix, stem = self._artifact_details(kind)
-        if len(entries) == 1 and not include_versions:
-            run, copy = entries[0]
-            save_path, _ = QFileDialog.getSaveFileName(
-                self,
-                f"Download {label}",
-                self._copy_filename(run, copy, kind),
-                f"{label} (*{suffix})",
+        label, suffix, _stem = self._artifact_details(kind)
+        del include_versions
+        if len(entries) != 1:
+            raise ValueError(
+                "Multiple analyzed files must be downloaded through the server export."
             )
-            if not save_path:
-                return
-            output_path = Path(save_path).with_suffix(suffix)
-            self.api.download_run_artifact(copy["artifact"], output_path)
-        else:
-            default_name = f"{self._safe_name(self.experiment['name'])}_{stem}.zip"
-            save_path, _ = QFileDialog.getSaveFileName(
-                self, f"Download {label}", default_name, "ZIP Files (*.zip)"
-            )
-            if not save_path:
-                return
-            output_path = Path(save_path).with_suffix(".zip")
-            with tempfile.TemporaryDirectory(prefix="autoscript-artifact-export-") as temp_dir:
-                temp_root = Path(temp_dir)
-                with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as archive:
-                    for run, copy in entries:
-                        local_path = temp_root / f"{uuid.uuid4().hex}{suffix}"
-                        self.api.download_run_artifact(copy["artifact"], local_path)
-                        archive.write(
-                            local_path,
-                            self._copy_filename(
-                                run, copy, kind, include_version=include_versions
-                            ),
-                        )
+        run, copy = entries[0]
+        save_path, _ = QFileDialog.getSaveFileName(
+            self,
+            f"Download {label}",
+            self._copy_filename(run, copy, kind),
+            f"{label} (*{suffix})",
+        )
+        if not save_path:
+            return
+        output_path = Path(save_path).with_suffix(suffix)
+        self.api.download_run_artifact(copy["artifact"], output_path)
         QMessageBox.information(self, "Download Complete", f"Saved to:\n{output_path}")
 
     def _download_artifact_entries_safely(
@@ -541,10 +912,12 @@ class ExperimentResultsPage(QWidget):
     def download_artifacts(self, kind):
         runs = self._selected_runs()
         if not runs:
+            QMessageBox.information(
+                self, "Nothing Selected", "Select at least one participant run."
+            )
             return
         try:
-            copies_by_run = [(run, self._analysis_copies(run, kind)) for run in runs]
-            missing = [run for run, copies in copies_by_run if not copies]
+            missing = [run for run in runs if cloud_file_count(run, kind) < 1]
             if missing:
                 names = ", ".join(str(run["participant_number"]) for run in missing)
                 QMessageBox.warning(
@@ -555,26 +928,23 @@ class ExperimentResultsPage(QWidget):
                 )
                 return
 
-            if len(copies_by_run) == 1 and len(copies_by_run[0][1]) > 1:
-                run, copies = copies_by_run[0]
-                self._show_analysis_copies(run, kind, copies)
-                return
-
             policy = "latest"
-            if any(len(copies) > 1 for _run, copies in copies_by_run):
-                policy = self._choose_duplicate_download(copies_by_run, kind)
+            duplicates = [
+                (run, cloud_file_count(run, kind))
+                for run in runs
+                if cloud_file_count(run, kind) > 1
+            ]
+            if duplicates:
+                policy = self._choose_bulk_duplicate_download(duplicates, kind)
                 if not policy:
                     return
-            entries = []
-            for run, copies in copies_by_run:
-                entries.extend((run, copy) for copy in (copies if policy == "all" else copies[:1]))
-            self._download_artifact_entries(
-                entries, kind, include_versions=policy == "all"
+            self._download_bulk_export(
+                runs, [kind], analysis_policy=policy
             )
         except (APIError, OSError, ValueError) as exc:
             QMessageBox.critical(self, "Download Failed", str(exc))
 
-    def _choose_duplicate_download(self, copies_by_run, kind):
+    def _choose_bulk_duplicate_download(self, duplicates, kind):
         label, _suffix, _stem = self._artifact_details(kind)
         dialog = QDialog(self)
         dialog.setWindowTitle("How to manage duplicates?")
@@ -583,16 +953,16 @@ class ExperimentResultsPage(QWidget):
         heading = QLabel(f"Multiple {label} copies are stored in the cloud.")
         heading.setStyleSheet("font-size: 15px; font-weight: 700;")
         layout.addWidget(heading)
-        layout.addWidget(QLabel("Choose whether this download should include the latest copy or every copy."))
-        for run, copies in copies_by_run:
-            if len(copies) < 2:
-                continue
-            dates = ", ".join(format_run_datetime(copy.get("created_at")) for copy in copies)
+        layout.addWidget(QLabel(
+            "Choose whether the server should include the latest copy or every copy."
+        ))
+        for run, count in duplicates:
             item = QLabel(
-                f"Participant {run['participant_number']} — {len(copies)} copies\n{dates}"
+                f"Participant {run['participant_number']} — {count} copies"
             )
-            item.setWordWrap(True)
-            item.setStyleSheet("background: #f2f6f9; padding: 8px; border-radius: 6px;")
+            item.setStyleSheet(
+                "background: #f2f6f9; padding: 8px; border-radius: 6px;"
+            )
             layout.addWidget(item)
         buttons = QHBoxLayout()
         buttons.addStretch()
@@ -603,8 +973,12 @@ class ExperimentResultsPage(QWidget):
             buttons.addWidget(button)
         layout.addLayout(buttons)
         dialog.choice = None
-        latest.clicked.connect(lambda: (setattr(dialog, "choice", "latest"), dialog.accept()))
-        all_copies.clicked.connect(lambda: (setattr(dialog, "choice", "all"), dialog.accept()))
+        latest.clicked.connect(
+            lambda: (setattr(dialog, "choice", "latest"), dialog.accept())
+        )
+        all_copies.clicked.connect(
+            lambda: (setattr(dialog, "choice", "all"), dialog.accept())
+        )
         cancel.clicked.connect(dialog.reject)
         dialog.exec_()
         return dialog.choice
@@ -665,8 +1039,8 @@ class ExperimentResultsPage(QWidget):
         )
         all_copies = QPushButton("Download all")
         all_copies.clicked.connect(
-            lambda: self._download_artifact_entries_safely(
-                [(run, copy) for copy in copies], kind, include_versions=True
+            lambda: self._download_bulk_export(
+                [run], [kind], analysis_policy="all"
             )
         )
         close = QPushButton("Close")
@@ -727,7 +1101,8 @@ class ExperimentResultsPage(QWidget):
             output_dir = ensure_dir(workspace / "exports")
             downloaded = []
             context_runs = []
-            for run in runs:
+            for run_summary in runs:
+                run = self._get_run_detail(run_summary)
                 context_run = {
                     "id": run["id"],
                     "session_id": run["session_id"],

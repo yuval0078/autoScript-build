@@ -393,6 +393,18 @@ def _finalized_analysis_copy(run, revision_id):
 @router.get(
     "/runs/{run_id}/analysis-copies",
     response_model=list[RunAnalysisCopyResponse],
+    summary="List saved analyzed copies",
+    response_description="Newest-first immutable analyzed copies for the participant Run.",
+    description=(
+        "Returns every finalized analysis revision owned by the authenticated user. "
+        "Each item groups the analyzed CSV and trainable JSON that were produced "
+        "together, reports its creation time, and identifies the revision currently "
+        "used to restore Analyzer editing state."
+    ),
+    responses={
+        401: {"description": "Authentication is required or the token is invalid."},
+        404: {"description": "The Run is not visible to the authenticated user."},
+    },
 )
 def list_run_analysis_copies(
     run_id: uuid.UUID,
@@ -411,6 +423,18 @@ def list_run_analysis_copies(
 @router.post(
     "/runs/{run_id}/analysis-copies/{revision_id}/set-editable",
     response_model=RunAnalysisRevisionResponse,
+    summary="Use an analyzed copy as the editable state",
+    response_description="The selected revision and its new concurrency ETag.",
+    description=(
+        "Makes the analysis-state snapshot stored alongside the selected trainable "
+        "JSON the current editable state. The next Analyzer launch restores that "
+        "snapshot. No CSV, JSON, or raw result bytes are modified."
+    ),
+    responses={
+        401: {"description": "Authentication is required or the token is invalid."},
+        404: {"description": "The Run or finalized analysis copy was not found."},
+        409: {"description": "The copy has no restorable state snapshot."},
+    },
 )
 def set_run_analysis_copy_editable(
     run_id: uuid.UUID,
@@ -438,6 +462,17 @@ def set_run_analysis_copy_editable(
 @router.delete(
     "/runs/{run_id}/analysis-copies/{revision_id}",
     status_code=status.HTTP_204_NO_CONTENT,
+    summary="Delete one analyzed copy",
+    response_description="The analyzed copy was deleted.",
+    description=(
+        "Deletes the selected finalized revision, its analyzed CSV, trainable JSON, "
+        "and matching edit-state snapshot. Raw Runner data is never deleted. If the "
+        "copy was current, the newest remaining restorable revision becomes current."
+    ),
+    responses={
+        401: {"description": "Authentication is required or the token is invalid."},
+        404: {"description": "The Run or finalized analysis copy was not found."},
+    },
 )
 def delete_run_analysis_copy(
     run_id: uuid.UUID,
@@ -652,7 +687,12 @@ async def finalize_run_analysis(
     if_none_match: str | None = Header(default=None, alias="If-None-Match"),
     x_filename: str | None = Header(default=None, alias="X-Filename"),
     x_existing_analysis_policy: str = Header(
-        default="keep", alias="X-Existing-Analysis-Policy"
+        default="keep",
+        alias="X-Existing-Analysis-Policy",
+        description=(
+            "How to handle older finalized copies: 'keep' appends a new immutable "
+            "copy; 'replace' atomically retains only the newly finalized copy."
+        ),
     ),
     database: Session = Depends(get_db),
     storage=Depends(get_object_storage),
