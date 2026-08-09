@@ -118,6 +118,23 @@ def _calculate_experiment_info_from_config(config):
     return total_words, rows, cols
 
 
+def experiment_card_metadata(experiment):
+    """Return Block and distinct-participant counts for a home-screen card."""
+    blocks = experiment.get("blocks")
+    if blocks is None:
+        blocks = experiment.get("versions", [])
+    block_count = len(blocks)
+    participant_count = int(experiment.get("participant_count", 0) or 0)
+    analyzed_count = int(experiment.get("analyzed_participant_count", 0) or 0)
+    block_label = "1 Block" if block_count == 1 else f"{block_count} Blocks"
+    participant_label = (
+        "1 Participant"
+        if participant_count == 1
+        else f"{participant_count} Participants"
+    )
+    return f"{block_label} · {participant_label} ({analyzed_count} analyzed)"
+
+
 def _cluster_bounds(experiments, joined_boundaries, item_index):
     """Return the inclusive experiment index range for the combined cluster around one item."""
     start = item_index
@@ -613,11 +630,7 @@ class MainMenu(QWidget):
         text_area = QVBoxLayout()
         name = QLabel(experiment["name"])
         name.setStyleSheet("font-size: 16px; font-weight: 650; color: #172230;")
-        blocks = experiment.get("blocks")
-        if blocks is None:
-            blocks = experiment.get("versions", [])
-        count = len(blocks)
-        meta = QLabel(f"{count} Block" if count == 1 else f"{count} Blocks")
+        meta = QLabel(experiment_card_metadata(experiment))
         meta.setStyleSheet("font-size: 12px; color: #6b7987;")
         text_area.addWidget(name)
         text_area.addWidget(meta)

@@ -90,7 +90,11 @@ def _block_response(block):
     )
 
 
-def _experiment_response(experiment):
+def _experiment_response(
+    experiment,
+    participant_count=None,
+    analyzed_participant_count=None,
+):
     versions = sorted(
         experiment.versions,
         key=lambda version: version.version_number,
@@ -112,6 +116,18 @@ def _experiment_response(experiment):
             key=lambda item: item.revision_number,
             default=None,
         )
+    if participant_count is None:
+        participant_count = len(
+            {run.participant_number for run in experiment.runs}
+        )
+    if analyzed_participant_count is None:
+        analyzed_participant_count = len(
+            {
+                run.participant_number
+                for run in experiment.runs
+                if run.analysis_completed is True
+            }
+        )
     return ExperimentResponse(
         id=experiment.id,
         name=experiment.name,
@@ -125,6 +141,8 @@ def _experiment_response(experiment):
         blocks=[_block_response(block) for block in blocks],
         versions=[_version_response(version) for version in versions],
         current_revision=_revision_response(current_revision) if current_revision else None,
+        participant_count=participant_count,
+        analyzed_participant_count=analyzed_participant_count,
         download_url=f"/api/v1/experiments/{experiment.id}/download",
     )
 
@@ -821,7 +839,47 @@ def list_experiments(
         )
         .order_by(Experiment.created_at.desc())
     ).all()
-    return [_experiment_response(experiment) for experiment in experiments]
+    participant_counts = {}
+    analyzed_participant_counts = {}
+    if experiments:
+        experiment_ids = [experiment.id for experiment in experiments]
+        participant_counts = dict(
+            database.execute(
+                select(
+                    ExperimentRun.experiment_id,
+                    func.count(func.distinct(ExperimentRun.participant_number)),
+                )
+                .where(
+                    ExperimentRun.experiment_id.in_(
+                        experiment_ids
+                    )
+                )
+                .group_by(ExperimentRun.experiment_id)
+            ).all()
+        )
+        analyzed_participant_counts = dict(
+            database.execute(
+                select(
+                    ExperimentRun.experiment_id,
+                    func.count(func.distinct(ExperimentRun.participant_number)),
+                )
+                .where(
+                    ExperimentRun.experiment_id.in_(experiment_ids),
+                    ExperimentRun.analysis_completed.is_(True),
+                )
+                .group_by(ExperimentRun.experiment_id)
+            ).all()
+        )
+    return [
+        _experiment_response(
+            experiment,
+            participant_count=int(participant_counts.get(experiment.id, 0)),
+            analyzed_participant_count=int(
+                analyzed_participant_counts.get(experiment.id, 0)
+            ),
+        )
+        for experiment in experiments
+    ]
 
 
 @router.get("/experiments/{experiment_id}", response_model=ExperimentResponse)

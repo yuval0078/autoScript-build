@@ -19,7 +19,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from PyQt5.QtWidgets import QMessageBox
 
-from gui_menu import MainMenu
+from gui_menu import MainMenu, experiment_card_metadata
 from runner_launch_contract import (
     read_runtime_session_seed,
     session_seed_path,
@@ -33,6 +33,28 @@ SPEC_ROOT = ROOT / "packaging" / "pyinstaller"
 
 
 class RunnerLaunchContractTests(unittest.TestCase):
+    def test_experiment_card_metadata_pluralizes_blocks_and_distinct_participants(self):
+        self.assertEqual(
+            experiment_card_metadata(
+                {
+                    "blocks": [{"id": "block-1"}, {"id": "block-2"}],
+                    "participant_count": 3,
+                    "analyzed_participant_count": 2,
+                }
+            ),
+            "2 Blocks · 3 Participants (2 analyzed)",
+        )
+        self.assertEqual(
+            experiment_card_metadata(
+                {
+                    "blocks": [{"id": "block-1"}],
+                    "participant_count": 1,
+                    "analyzed_participant_count": 1,
+                }
+            ),
+            "1 Block · 1 Participant (1 analyzed)",
+        )
+
     def test_seed_sidecar_round_trip_and_legacy_absence(self):
         with tempfile.TemporaryDirectory() as temporary:
             config = Path(temporary) / "Block config.json"

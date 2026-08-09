@@ -16,7 +16,7 @@ from sqlalchemy.pool import StaticPool
 
 from app.database import get_db
 from app.main import create_app
-from app.models import Base, Experiment, StagedBlockAsset, User
+from app.models import Base, Experiment, ExperimentRun, StagedBlockAsset, User
 from app.services.storage import get_object_storage
 
 
@@ -226,6 +226,40 @@ class ExperimentApiTests(unittest.TestCase):
             json={"name": "Renamed Study"},
         )
         self.assertEqual(duplicate_name.status_code, 409)
+
+    def test_experiment_list_counts_distinct_participant_numbers(self):
+        experiment = self.create_experiment("Participant Count Study")
+        with self.session_factory() as session:
+            owner = session.query(User).filter_by(username="local-admin").one()
+            for session_id, participant_number, analysis_completed in (
+                ("session-1", 7, True),
+                ("session-2", 7, True),
+                ("session-3", 12, False),
+            ):
+                session.add(
+                    ExperimentRun(
+                        experiment_id=uuid.UUID(experiment["id"]),
+                        revision_id=None,
+                        session_id=session_id,
+                        participant_number=participant_number,
+                        participant_age=30,
+                        participant_gender="Other",
+                        block_count=1,
+                        source_experiment_name=experiment["name"],
+                        source_experiment_id=experiment["id"],
+                        status="running",
+                        analysis_completed=analysis_completed,
+                        created_by=owner.id,
+                    )
+                )
+            session.commit()
+
+        response = self.client.get("/api/v1/experiments")
+
+        self.assertEqual(response.status_code, 200, response.text)
+        listed = next(item for item in response.json() if item["id"] == experiment["id"])
+        self.assertEqual(listed["participant_count"], 2)
+        self.assertEqual(listed["analyzed_participant_count"], 1)
 
     def test_upload_insert_reorder_download_and_delete_blocks(self):
         experiment = self.create_experiment()

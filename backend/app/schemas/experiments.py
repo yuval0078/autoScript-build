@@ -186,4 +186,6 @@ class ExperimentResponse(BaseModel):
     blocks: list[ExperimentBlockResponse]
     versions: list[ExperimentVersionResponse]
     current_revision: ExperimentRevisionResponse | None
+    participant_count: int = Field(default=0, ge=0)
+    analyzed_participant_count: int = Field(default=0, ge=0)
     download_url: str
