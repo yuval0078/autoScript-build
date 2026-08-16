@@ -1,10 +1,12 @@
 import hashlib
 import json
+import os
 import tempfile
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 
 from autoscript_api import APICancelled, APIError, AutoScriptAPI, PaginatedList
@@ -375,6 +377,23 @@ class AutoScriptApiClientTests(unittest.TestCase):
         cls.server.shutdown()
         cls.server.server_close()
         cls.thread.join(timeout=2)
+
+    def test_cloud_is_default_and_environment_can_select_local_development(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("AUTOSCRIPT_API_URL", None)
+            self.assertEqual(
+                AutoScriptAPI().base_url,
+                "https://api.autoscript-lab.org",
+            )
+
+        with patch.dict(
+            os.environ,
+            {"AUTOSCRIPT_API_URL": "http://127.0.0.1:8000/"},
+        ):
+            self.assertEqual(
+                AutoScriptAPI().base_url,
+                "http://127.0.0.1:8000",
+            )
 
     def test_json_and_streaming_upload_requests(self):
         self.assertEqual(self.api.list_experiments()[0]["name"], "fixture")

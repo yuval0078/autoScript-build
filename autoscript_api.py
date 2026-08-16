@@ -1,16 +1,21 @@
-"""Small standard-library client for the local AutoScript API."""
+"""Small standard-library client for the AutoScript API."""
 
 import hashlib
 import http.client
 import json
 import os
 import socket
+import ssl
 import uuid
 from pathlib import Path
 from urllib.parse import quote, urlencode, urlsplit
 
+import certifi
+
 
 _SESSION_TOKEN = None
+DEFAULT_API_URL = "https://api.autoscript-lab.org"
+_TLS_CONTEXT = ssl.create_default_context(cafile=certifi.where())
 
 
 def set_session_token(token):
@@ -53,7 +58,7 @@ class PaginatedList(list):
 class AutoScriptAPI:
     def __init__(self, base_url=None, timeout=60, token=None):
         self.base_url = (base_url or os.environ.get(
-            "AUTOSCRIPT_API_URL", "http://127.0.0.1:8000"
+            "AUTOSCRIPT_API_URL", DEFAULT_API_URL
         )).rstrip("/")
         self.timeout = timeout
         self.token = token or os.environ.get("AUTOSCRIPT_API_TOKEN") or _SESSION_TOKEN
@@ -63,16 +68,15 @@ class AutoScriptAPI:
         self._parsed = parsed
 
     def _connection(self, timeout=None):
-        connection_class = (
-            http.client.HTTPSConnection
-            if self._parsed.scheme == "https"
-            else http.client.HTTPConnection
-        )
-        return connection_class(
-            self._parsed.hostname,
-            self._parsed.port,
-            timeout=self.timeout if timeout is None else timeout,
-        )
+        kwargs = {
+            "timeout": self.timeout if timeout is None else timeout,
+        }
+        if self._parsed.scheme == "https":
+            kwargs["context"] = _TLS_CONTEXT
+            connection_class = http.client.HTTPSConnection
+        else:
+            connection_class = http.client.HTTPConnection
+        return connection_class(self._parsed.hostname, self._parsed.port, **kwargs)
 
     def _path(self, path):
         prefix = self._parsed.path.rstrip("/")

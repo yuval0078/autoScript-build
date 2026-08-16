@@ -16,3 +16,6 @@ setuptools>=65.0.0
 
 # Signed component update catalogs
 cryptography>=43.0.0
+
+# Public CA bundle for secure cloud API connections
+certifi>=2026.7.22
