@@ -18,6 +18,15 @@ $outputRoot = if ([System.IO.Path]::IsPathRooted($OutputDirectory)) {
 }
 $bootstrapArtifact = $null
 
+function Write-Utf8NoBom {
+    param(
+        [Parameter(Mandatory = $true)][string]$LiteralPath,
+        [Parameter(Mandatory = $true)][string]$Content
+    )
+    $encoding = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($LiteralPath, $Content, $encoding)
+}
+
 $componentConfig = @{
     interface = @{ Spec = "Interface.spec"; Bundle = "AutoScriptInterface"; Entrypoint = "AutoScriptInterface.exe" }
     builder   = @{ Spec = "Builder.spec";   Bundle = "Builder";             Entrypoint = "Builder.exe" }
@@ -100,7 +109,8 @@ foreach ($component in $Components) {
         source_commit = $sourceCommit
     }
     $descriptorPath = Join-Path $bundlePath "component.json"
-    $descriptor | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $descriptorPath -Encoding UTF8
+    Write-Utf8NoBom -LiteralPath $descriptorPath `
+        -Content ($descriptor | ConvertTo-Json -Depth 4)
 
     $archiveName = "AutoScript-$component-$version-windows-x86_64.zip"
     $archivePath = Join-Path $outputRoot $archiveName
@@ -170,8 +180,8 @@ if ($Components -contains "interface") {
         protocol_version = 1
         source_commit = $sourceCommit
     }
-    $bootstrapDescriptor | ConvertTo-Json -Depth 4 |
-        Set-Content -LiteralPath (Join-Path $bootstrapStage "bootstrap.json") -Encoding UTF8
+    Write-Utf8NoBom -LiteralPath (Join-Path $bootstrapStage "bootstrap.json") `
+        -Content ($bootstrapDescriptor | ConvertTo-Json -Depth 4)
 
     $bootstrapName = "AutoScript-bootstrap-$interfaceVersion-windows-x86_64.zip"
     $bootstrapPath = Join-Path $outputRoot $bootstrapName
@@ -207,5 +217,6 @@ if ($null -ne $bootstrapArtifact) {
     $artifactManifest["bootstrap"] = $bootstrapArtifact
 }
 $manifestPath = Join-Path $outputRoot "component-artifacts.json"
-$artifactManifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $manifestPath -Encoding UTF8
+Write-Utf8NoBom -LiteralPath $manifestPath `
+    -Content ($artifactManifest | ConvertTo-Json -Depth 8)
 Write-Host "Component artifacts: $outputRoot" -ForegroundColor Green

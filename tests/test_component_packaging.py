@@ -314,6 +314,12 @@ class ComponentSpecTests(unittest.TestCase):
         self.assertIn('"AutoScriptInterface.exe"', build_script)
         self.assertIn('"bootstrap.json"', build_script)
         self.assertIn('"AutoScript-bootstrap-', build_script)
+        self.assertIn("function Write-Utf8NoBom", build_script)
+        self.assertIn("New-Object System.Text.UTF8Encoding($false)", build_script)
+        self.assertNotIn(
+            "Set-Content -LiteralPath $descriptorPath -Encoding UTF8",
+            build_script,
+        )
 
     def test_interface_inventory_excludes_builder_runner_and_analyzer(self):
         source = (SPEC_ROOT / "Interface.spec").read_text(encoding="utf-8")
