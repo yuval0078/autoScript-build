@@ -41,6 +41,7 @@ analysis = Analysis(
         "experiment_results",
         "gui_menu",
         "runner_launch_contract",
+        "user_management_dialog",
     ],
     hookspath=[],
     hooksconfig={},

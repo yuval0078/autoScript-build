@@ -334,6 +334,37 @@ class AutoScriptAPI:
         set_session_token(None)
         return result
 
+    def list_users(self):
+        """Return all application users (administrator only)."""
+        return self._json_request("GET", "/api/v1/users")
+
+    def create_user(self, username, password, role):
+        """Create an application user (administrator only)."""
+        return self._json_request(
+            "POST",
+            "/api/v1/users",
+            {
+                "username": str(username),
+                "password": str(password),
+                "role": str(role),
+            },
+        )
+
+    def update_user(self, user_id, **changes):
+        """Update an application user (administrator only)."""
+        allowed = {"username", "password", "role", "is_active"}
+        unexpected = set(changes) - allowed
+        if unexpected:
+            raise ValueError(
+                "Unsupported user fields: " + ", ".join(sorted(unexpected))
+            )
+        payload = {
+            name: value for name, value in changes.items() if value is not None
+        }
+        return self._json_request(
+            "PATCH", f"/api/v1/users/{user_id}", payload
+        )
+
     def create_run(self, revision_id, session_id, participant_number, participant_age, participant_gender):
         return self._json_request(
             "POST", f"/api/v1/experiment-revisions/{revision_id}/runs",

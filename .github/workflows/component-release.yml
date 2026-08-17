@@ -73,7 +73,7 @@ jobs:
         shell: powershell
         run: |
           $tests = switch ("${{ matrix.component }}") {
-            "interface" { @("tests.test_builder_process_separation", "tests.test_component_updates", "tests.test_component_update_ui", "tests.test_component_packaging", "tests.test_experiment_packages") }
+            "interface" { @("tests.test_builder_process_separation", "tests.test_component_updates", "tests.test_component_update_ui", "tests.test_component_packaging", "tests.test_experiment_packages", "tests.test_user_management") }
             "builder"   { @("tests.test_builder_workspace", "tests.test_data_contract_schemas") }
             "runner"    { @("tests.test_calibration_input", "tests.test_result_upload_queue", "tests.test_runner_analyzer_block_identity", "tests.test_runner_recovery_contracts") }
             "analyzer"  { @("tests.test_experiment_results", "tests.test_data_contract_fixtures") }

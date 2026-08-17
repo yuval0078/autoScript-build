@@ -20,6 +20,7 @@ from PyQt5.QtCore import QTimer, pyqtSignal
 from autoscript_api import APIError, AutoScriptAPI, get_session_token
 from component_runtime import component_launch_command, create_update_manager
 from component_updates_dialog import ComponentUpdatesDialog
+from user_management_dialog import UserManagementDialog
 
 from gui_menu import MainMenu
 from experiment_results import ExperimentResultsPage
@@ -74,6 +75,11 @@ class MainInterface(QMainWindow):
         self.statusBar().addPermanentWidget(self.version_label)
 
         if (self.api_user or {}).get("role") == "admin":
+            administration_menu = self.menuBar().addMenu("Administration")
+            users_action = QAction("User Management…", self)
+            users_action.triggered.connect(self.show_user_management)
+            administration_menu.addAction(users_action)
+
             updates_menu = self.menuBar().addMenu("Updates")
             updates_action = QAction("Manage Components…", self)
             updates_action.triggered.connect(self.show_component_updates)
@@ -249,6 +255,18 @@ class MainInterface(QMainWindow):
             dialog.exec_()
         finally:
             self.updates_dialog = None
+
+    def show_user_management(self):
+        if (self.api_user or {}).get("role") != "admin":
+            QMessageBox.warning(
+                self,
+                "Administrator access required",
+                "Only an administrator can manage application users.",
+            )
+            return None
+        dialog = UserManagementDialog(self, current_user=self.api_user)
+        dialog.exec_()
+        return dialog
 
     def _launch_builder(self, arguments):
         command = builder_launch_command(arguments, manager=self.component_manager)
