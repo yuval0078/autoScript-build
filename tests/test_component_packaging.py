@@ -83,7 +83,7 @@ class RunnerLaunchContractTests(unittest.TestCase):
             self.assertNotIn("Edit experiment", tooltips)
             self.assertNotIn("Duplicate experiment", tooltips)
             self.assertNotIn("Delete experiment", tooltips)
-            self.assertNotIn("View and analyze results", tooltips)
+            self.assertIn("View and analyze results", tooltips)
             self.assertNotIn("Create a new experiment", tooltips)
             self.assertNotIn("Open local or legacy ZIP", tooltips)
         finally:

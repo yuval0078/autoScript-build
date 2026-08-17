@@ -73,10 +73,11 @@ class MainInterface(QMainWindow):
         self.version_label.setStyleSheet("color: #6f7d8c; font-size: 11px; padding-left: 12px;")
         self.statusBar().addPermanentWidget(self.version_label)
 
-        updates_menu = self.menuBar().addMenu("Updates")
-        updates_action = QAction("Manage Components…", self)
-        updates_action.triggered.connect(self.show_component_updates)
-        updates_menu.addAction(updates_action)
+        if (self.api_user or {}).get("role") == "admin":
+            updates_menu = self.menuBar().addMenu("Updates")
+            updates_action = QAction("Manage Components…", self)
+            updates_action.triggered.connect(self.show_component_updates)
+            updates_menu.addAction(updates_action)
 
         self.setWindowTitle(APP_NAME)
         self.resize(1200, 800)
@@ -226,13 +227,17 @@ class MainInterface(QMainWindow):
         return self._launch_builder(["--import-block", str(package_path)])
 
     def open_experiment_results(self, experiment):
-        if (self.api_user or {}).get("role") == "operator":
-            QMessageBox.warning(self, "Permission denied", "Researcher access is required.")
-            return None
         self.experiment_results.set_experiment(experiment)
         self.stack.setCurrentWidget(self.experiment_results)
 
     def show_component_updates(self):
+        if (self.api_user or {}).get("role") != "admin":
+            QMessageBox.warning(
+                self,
+                "Administrator access required",
+                "Only an administrator can install or update application components.",
+            )
+            return None
         dialog = ComponentUpdatesDialog(self, manager=self.component_manager)
         dialog.component_installed.connect(
             lambda component, version: self.status_msg.setText(

@@ -23,6 +23,12 @@ class UserCreate(BaseModel):
 
 
 class UserUpdate(BaseModel):
+    username: str | None = Field(
+        default=None,
+        min_length=3,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9_.-]+$",
+    )
     password: str | None = Field(default=None, min_length=10, max_length=1024)
     role: str | None = None
     is_active: bool | None = None

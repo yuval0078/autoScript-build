@@ -171,15 +171,15 @@ def catalog_fixture(
 
 
 class ComponentVersionTests(unittest.TestCase):
-    def test_bundled_versions_start_at_exactly_zero_dot_zero(self):
+    def test_bundled_versions_track_independent_component_releases(self):
         versions = load_component_versions()
         self.assertEqual(
             versions,
             {
-                "interface": "0.0",
+                "interface": "0.1",
                 "builder": "0.0",
                 "runner": "0.0",
-                "analyzer": "0.0",
+                "analyzer": "0.1",
             },
         )
 

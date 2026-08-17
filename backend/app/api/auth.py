@@ -268,6 +268,8 @@ def update_user(
     user = database.get(User, user_id)
     if user is None:
         raise HTTPException(status_code=404, detail="User was not found.")
+    if payload.username is not None:
+        user.username = payload.username
     if payload.password is not None:
         user.password_hash = hash_password(payload.password)
     if payload.role is not None:
@@ -299,7 +301,11 @@ def update_user(
     )
     cleanup_counts = cleanup_security_state(database, get_security_settings())
     _record_cleanup_event(database, request_id, address_hash, cleanup_counts)
-    database.commit()
+    try:
+        database.commit()
+    except IntegrityError as exc:
+        database.rollback()
+        raise HTTPException(status_code=409, detail="Username already exists.") from exc
     return _user_response(user)
 
 

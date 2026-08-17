@@ -87,6 +87,20 @@ class ExperimentResultCardTests(unittest.TestCase):
             [("raw_data", "Raw data", 2), ("analysis_csv", "Analyzed CSV", 1)],
         )
 
+    def test_operator_can_analyze_but_cannot_delete_result_data(self):
+        parent = SimpleNamespace(api_user={"role": "operator"})
+        page = ExperimentResultsPage(parent)
+        try:
+            self.assertTrue(page.delete_button.isHidden())
+            self.assertFalse(page.analyze_button.isHidden())
+            self.assertNotIn("delete", page.subtitle.text().lower())
+            with patch.object(QMessageBox, "warning") as warning:
+                page.delete_selected()
+            warning.assert_called_once()
+        finally:
+            page.process_timer.stop()
+            page.deleteLater()
+
     def test_tag_counts_fall_back_to_legacy_embedded_files(self):
         run = {
             "results": [{"id": "raw-1"}],
@@ -667,6 +681,15 @@ class AnalyzerArtifactTests(unittest.TestCase):
             player.closeEvent(event)
         finalize.assert_called_once_with(completed=True, existing_policy="keep")
         self.assertTrue(event.accepted)
+
+    def test_operator_analysis_always_keeps_existing_versions(self):
+        player = PenDataPlayer.__new__(PenDataPlayer)
+        player.analysis_context = {
+            "allow_data_deletion": False,
+            "runs": [{"id": "run-1", "analysis_copy_count": 2}],
+        }
+        with patch.object(QMessageBox, "exec_", side_effect=AssertionError):
+            self.assertEqual(player._choose_existing_analysis_policy(), "keep")
 
     def test_finalize_bundle_contains_only_manifest_and_three_checksummed_files(self):
         with tempfile.TemporaryDirectory() as temp_dir:

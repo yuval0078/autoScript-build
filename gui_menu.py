@@ -488,7 +488,7 @@ class MainMenu(QWidget):
         self.api = AutoScriptAPI(timeout=10)
         api_user = getattr(parent, "api_user", None) or {}
         self.user_role = str(api_user.get("role", "researcher"))
-        self.can_research = self.user_role in {"admin", "researcher"}
+        self.can_author_experiments = self.user_role in {"admin", "researcher"}
         self.experiments = []
         self.experiment_cards = []
         self._experiment_cursor = None
@@ -511,8 +511,8 @@ class MainMenu(QWidget):
         title.setStyleSheet("font-size: 30px; font-weight: 700; color: #172230;")
         subtitle = QLabel(
             "Shared lab experiments are ready to edit, run, download, or analyze."
-            if self.can_research
-            else "Shared lab experiments are ready to download or run."
+            if self.can_author_experiments
+            else "Shared lab experiments are ready to run, download, or analyze."
         )
         subtitle.setStyleSheet("color: #657585; font-size: 13px;")
         title_area.addWidget(title)
@@ -526,7 +526,7 @@ class MainMenu(QWidget):
         open_local.setFixedSize(42, 42)
         open_local.setStyleSheet(self._icon_button_style("#536578"))
         open_local.clicked.connect(self.load_experiment_zip)
-        if self.can_research:
+        if self.can_author_experiments:
             header.addWidget(open_local)
 
         refresh = QToolButton()
@@ -546,7 +546,7 @@ class MainMenu(QWidget):
             "QPushButton:hover { background: #245f98; }"
         )
         new_experiment.clicked.connect(parent.open_new_experiment)
-        if self.can_research:
+        if self.can_author_experiments:
             header.addWidget(new_experiment)
         layout.addLayout(header)
 
@@ -797,7 +797,7 @@ class MainMenu(QWidget):
         actions = [
             ("↓", "Download experiment ZIP", self._download_cloud_experiment, "#2463a8"),
         ]
-        if self.can_research:
+        if self.can_author_experiments:
             actions.extend(
                 [
                     ("✎", "Edit experiment", self._edit_cloud_experiment, "#6b4ca5"),
@@ -811,10 +811,9 @@ class MainMenu(QWidget):
                 ("▶⚙", "Test-run experiment", lambda exp: self._run_cloud_experiment(exp, True), "#b07a00"),
             ]
         )
-        if self.can_research:
-            actions.append(
-                ("⌕", "View and analyze results", self._analyze_cloud_experiment, "#16788c")
-            )
+        actions.append(
+            ("⌕", "View and analyze results", self._analyze_cloud_experiment, "#16788c")
+        )
         for text, tooltip, handler, color in actions:
             row.addWidget(
                 self._action_button(

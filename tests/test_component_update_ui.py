@@ -12,7 +12,7 @@ from PyQt5.QtWidgets import QApplication
 import autoscript_launcher
 from component_runtime import component_launch_command, installed_component_entrypoint
 from component_updates_dialog import ComponentUpdatesDialog
-from component_versions import COMPONENT_NAMES
+from component_versions import COMPONENT_NAMES, COMPONENT_VERSIONS
 
 
 class FakeManager:
@@ -21,7 +21,7 @@ class FakeManager:
         self.components_dir = self.root / "components"
         self.components_dir.mkdir(parents=True, exist_ok=True)
         self.installed = dict(installed or {})
-        versions = {name: "0.0" for name in COMPONENT_NAMES} | (latest or {})
+        versions = dict(COMPONENT_VERSIONS) | (latest or {})
         self.catalog = SimpleNamespace(
             sequence=1,
             source="network",
@@ -65,7 +65,10 @@ class ComponentUpdateUiTests(unittest.TestCase):
             try:
                 interface = dialog.row_snapshot("interface")
                 builder = dialog.row_snapshot("builder")
-                self.assertEqual(interface["installed"], "0.0 (bundled)")
+                self.assertEqual(
+                    interface["installed"],
+                    f"{COMPONENT_VERSIONS['interface']} (bundled)",
+                )
                 self.assertEqual(interface["status"], "Up to date")
                 self.assertEqual(builder["installed"], "Not installed")
                 self.assertEqual(builder["latest"], "0.1")

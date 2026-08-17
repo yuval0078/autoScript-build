@@ -19,7 +19,7 @@ from starlette.background import BackgroundTask
 
 from ..config import get_settings
 from ..database import get_db
-from ..dependencies import require_researcher
+from ..dependencies import get_current_user
 from ..models import (
     Experiment,
     ExperimentRun,
@@ -306,7 +306,7 @@ def bulk_export_experiment_results(
     payload: BulkExportRequest,
     database: Session = Depends(get_db),
     storage=Depends(get_object_storage),
-    actor: User = Depends(require_researcher),
+    actor: User = Depends(get_current_user),
 ):
     experiment = database.scalar(
         select(Experiment).where(

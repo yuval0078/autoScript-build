@@ -193,13 +193,14 @@ only its SHA-256 hash is stored so the token can expire or be revoked.
 
 The three supported roles are:
 
-- `admin`: full shared-lab access, including user and security administration.
-- `researcher`: create/edit/delete Experiments and Runs, analyze results, and
-  download/export all shared-lab data.
-- `operator`: view and download shared Experiments and start/Test Run them.
-  Operators may upload and finalize raw results only for Runs they created;
-  they cannot author Experiments, browse results, analyze, bulk-export, delete,
-  or administer users.
+- `admin`: full shared-lab access, including user, security, deployment, and
+  application-component maintenance.
+- `researcher`: all Experiment, Run, analysis, download, export, and deletion
+  capabilities, without user administration or server/interface maintenance.
+- `operator`: the same research/result access as a researcher, including Run,
+  Test Run, analysis, and exports, but cannot create/edit/delete Experiments or
+  delete participant Runs or saved analysis copies. Operators may upload and
+  finalize raw results only for Runs they created.
 
 Login failures are rate-limited in shared database state by normalized account
 and a one-way hash of the client address, so limits apply across API workers.

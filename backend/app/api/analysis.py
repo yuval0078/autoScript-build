@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session, selectinload
 
 from ..config import get_settings
 from ..database import get_db
-from ..dependencies import require_researcher
+from ..dependencies import get_current_user, require_researcher
 from ..models import (
     Experiment,
     ExperimentRun,
@@ -409,7 +409,7 @@ def _finalized_analysis_copy(run, revision_id):
 def list_run_analysis_copies(
     run_id: uuid.UUID,
     database: Session = Depends(get_db),
-    actor: User = Depends(require_researcher),
+    actor: User = Depends(get_current_user),
 ):
     run = _owned_analysis_run(database, actor, run_id)
     revisions = sorted(
@@ -441,7 +441,7 @@ def set_run_analysis_copy_editable(
     revision_id: uuid.UUID,
     response: Response,
     database: Session = Depends(get_db),
-    actor: User = Depends(require_researcher),
+    actor: User = Depends(get_current_user),
 ):
     run = _owned_analysis_run(database, actor, run_id, lock=True)
     revision = _finalized_analysis_copy(run, revision_id)
@@ -526,7 +526,7 @@ def get_run_analysis_state(
     if_none_match: str | None = Header(default=None, alias="If-None-Match"),
     database: Session = Depends(get_db),
     storage=Depends(get_object_storage),
-    actor: User = Depends(require_researcher),
+    actor: User = Depends(get_current_user),
 ):
     run = _owned_analysis_run(database, actor, run_id)
     revision = run.current_analysis_revision
@@ -579,7 +579,7 @@ async def put_run_analysis_state(
     x_filename: str | None = Header(default=None, alias="X-Filename"),
     database: Session = Depends(get_db),
     storage=Depends(get_object_storage),
-    actor: User = Depends(require_researcher),
+    actor: User = Depends(get_current_user),
 ):
     del x_filename  # The canonical persisted state name is stable across clients.
     request_id = _parse_request_id(x_idempotency_key)
@@ -696,13 +696,18 @@ async def finalize_run_analysis(
     ),
     database: Session = Depends(get_db),
     storage=Depends(get_object_storage),
-    actor: User = Depends(require_researcher),
+    actor: User = Depends(get_current_user),
 ):
     del x_filename
     request_id = _parse_request_id(x_idempotency_key)
     existing_analysis_policy = _parse_existing_analysis_policy(
         x_existing_analysis_policy
     )
+    if actor.role == "operator" and existing_analysis_policy == "replace":
+        raise HTTPException(
+            status_code=403,
+            detail="Operators cannot replace or delete saved analysis copies.",
+        )
     response.headers["X-Existing-Analysis-Policy"] = existing_analysis_policy
     if request.headers.get("content-type", "").split(";", 1)[0].strip().lower() != "application/zip":
         raise HTTPException(
@@ -851,7 +856,7 @@ async def finalize_run_analysis(
 def resolve_run_results(
     payload: RunResultResolveRequest,
     database: Session = Depends(get_db),
-    actor: User = Depends(require_researcher),
+    actor: User = Depends(get_current_user),
 ):
     results = database.scalars(
         select(RunResult)

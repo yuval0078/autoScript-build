@@ -1,9 +1,9 @@
 {
   "schema_version": 1,
   "components": {
-    "interface": "0.0",
+    "interface": "0.1",
     "builder": "0.0",
     "runner": "0.0",
-    "analyzer": "0.0"
+    "analyzer": "0.1"
   }
 }

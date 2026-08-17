@@ -548,6 +548,61 @@ class AnalysisApiTests(unittest.TestCase):
         )
         self.assertEqual(invalid_policy.status_code, 400, invalid_policy.text)
 
+    def test_operator_can_finalize_but_cannot_replace_or_delete_analysis_copies(self):
+        draft = self.put_state(self.state())
+        self.assertEqual(draft.status_code, 200, draft.text)
+        first = self.client.post(
+            f"/api/v1/runs/{self.run['id']}/analysis/finalize",
+            content=self.bundle_bytes(self.state(), completed=True),
+            headers={
+                "Content-Type": "application/zip",
+                "X-Idempotency-Key": str(uuid.uuid4()),
+                "If-Match": draft.headers["etag"],
+            },
+        )
+        self.assertEqual(first.status_code, 200, first.text)
+        with self.sessions() as database:
+            actor = database.scalar(
+                select(User).where(User.username == "local-admin")
+            )
+            actor.role = "operator"
+            database.commit()
+
+        kept = self.client.post(
+            f"/api/v1/runs/{self.run['id']}/analysis/finalize",
+            content=self.bundle_bytes(self.state(), completed=False),
+            headers={
+                "Content-Type": "application/zip",
+                "X-Idempotency-Key": str(uuid.uuid4()),
+                "If-Match": first.headers["etag"],
+                "X-Existing-Analysis-Policy": "keep",
+            },
+        )
+        self.assertEqual(kept.status_code, 200, kept.text)
+        denied_replace = self.client.post(
+            f"/api/v1/runs/{self.run['id']}/analysis/finalize",
+            content=self.bundle_bytes(self.state(), completed=False),
+            headers={
+                "Content-Type": "application/zip",
+                "X-Idempotency-Key": str(uuid.uuid4()),
+                "If-Match": kept.headers["etag"],
+                "X-Existing-Analysis-Policy": "replace",
+            },
+        )
+        self.assertEqual(denied_replace.status_code, 403, denied_replace.text)
+        denied_delete = self.client.delete(
+            f"/api/v1/runs/{self.run['id']}/analysis-copies/{first.json()['id']}"
+        )
+        self.assertEqual(denied_delete.status_code, 403, denied_delete.text)
+        self.assertEqual(
+            len(
+                self.client.get(
+                    f"/api/v1/runs/{self.run['id']}/analysis-copies"
+                ).json()
+            ),
+            2,
+        )
+
     def test_draft_retention_never_prunes_finalizations(self):
         saved = self.put_state(self.state())
         bundle = self.bundle_bytes(self.state())

@@ -101,6 +101,13 @@ class AuthenticationApiTests(unittest.TestCase):
             json={"username": "second", "password": "second-password", "role": "researcher"},
         )
         self.assertEqual(created.status_code, 201, created.text)
+        renamed = self.client.patch(
+            f"/api/v1/users/{created.json()['id']}",
+            headers=self.headers(admin),
+            json={"username": "second-renamed"},
+        )
+        self.assertEqual(renamed.status_code, 200, renamed.text)
+        self.assertEqual(renamed.json()["username"], "second-renamed")
         self.assertEqual(
             self.client.post(
                 "/api/v1/users", headers=self.headers(researcher),
@@ -112,7 +119,7 @@ class AuthenticationApiTests(unittest.TestCase):
             "/api/v1/experiments", headers=self.headers(researcher), json={"name": "Private"}
         )
         self.assertEqual(experiment.status_code, 201, experiment.text)
-        second = self.login("second", "second-password")
+        second = self.login("second-renamed", "second-password")
         shared = self.client.get("/api/v1/experiments", headers=self.headers(second))
         self.assertEqual(shared.status_code, 200, shared.text)
         self.assertEqual([item["name"] for item in shared.json()], ["Private"])
@@ -131,7 +138,7 @@ class AuthenticationApiTests(unittest.TestCase):
             403,
         )
 
-    def test_operator_can_run_shared_experiments_but_cannot_author_or_analyze(self):
+    def test_operator_can_run_and_analyze_but_cannot_author_or_delete(self):
         admin = self.login("admin", "admin-password")
         researcher = self.login("researcher", "research-password")
         created_operator = self.client.post(
@@ -230,31 +237,71 @@ class AuthenticationApiTests(unittest.TestCase):
         self.assertEqual(started.status_code, 200, started.text)
         self.assertEqual(started.json()["status"], "running")
 
+        researcher_run = self.client.post(
+            f"/api/v1/experiment-revisions/{revision_id}/runs",
+            headers=self.headers(researcher),
+            json={
+                "session_id": "researcher-session",
+                "participant_number": 2,
+                "participant_age": 26,
+                "participant_gender": "Other",
+            },
+        )
+        self.assertEqual(researcher_run.status_code, 201, researcher_run.text)
+        researcher_run_id = researcher_run.json()["id"]
+        shared_detail = self.client.get(
+            f"/api/v1/runs/{researcher_run_id}", headers=operator_headers
+        )
+        self.assertEqual(shared_detail.status_code, 200, shared_detail.text)
         self.assertEqual(
-            self.client.get(
-                f"/api/v1/experiments/{experiment_id}/runs",
+            self.client.post(
+                f"/api/v1/runs/{researcher_run_id}/start",
                 headers=operator_headers,
             ).status_code,
-            403,
+            404,
         )
+
+        operator_runs = self.client.get(
+            f"/api/v1/experiments/{experiment_id}/runs",
+            headers=operator_headers,
+        )
+        self.assertEqual(operator_runs.status_code, 200, operator_runs.text)
         self.assertEqual(
-            self.client.get(
+            {item["id"] for item in operator_runs.json()},
+            {run_id, researcher_run_id},
+        )
+        operator_run = self.client.get(
+            f"/api/v1/runs/{run_id}", headers=operator_headers
+        )
+        self.assertEqual(operator_run.status_code, 200, operator_run.text)
+        analysis_copies = self.client.get(
+            f"/api/v1/runs/{run_id}/analysis-copies",
+            headers=operator_headers,
+        )
+        self.assertEqual(analysis_copies.status_code, 200, analysis_copies.text)
+        self.assertEqual(analysis_copies.json(), [])
+        analysis_status = self.client.patch(
+            f"/api/v1/runs/{run_id}/analysis",
+            headers=operator_headers,
+            json={"completed": False},
+        )
+        self.assertEqual(analysis_status.status_code, 200, analysis_status.text)
+        bulk = self.client.post(
+            f"/api/v1/experiments/{experiment_id}/bulk-export",
+            headers=operator_headers,
+            json={"run_ids": [run_id], "include": ["raw_data"]},
+        )
+        self.assertEqual(bulk.status_code, 200, bulk.text)
+        self.assertEqual(
+            self.client.delete(
                 f"/api/v1/runs/{run_id}", headers=operator_headers
             ).status_code,
             403,
         )
         self.assertEqual(
-            self.client.get(
-                f"/api/v1/runs/{run_id}/analysis-state",
+            self.client.delete(
+                f"/api/v1/runs/{run_id}/analysis-copies/{uuid.uuid4()}",
                 headers=operator_headers,
-            ).status_code,
-            403,
-        )
-        self.assertEqual(
-            self.client.post(
-                f"/api/v1/experiments/{experiment_id}/bulk-export",
-                headers=operator_headers,
-                json={"run_ids": [run_id], "include": ["raw_data"]},
             ).status_code,
             403,
         )
@@ -264,7 +311,10 @@ class AuthenticationApiTests(unittest.TestCase):
             headers=self.headers(researcher),
         )
         self.assertEqual(researcher_runs.status_code, 200, researcher_runs.text)
-        self.assertEqual([item["id"] for item in researcher_runs.json()], [run_id])
+        self.assertEqual(
+            {item["id"] for item in researcher_runs.json()},
+            {run_id, researcher_run_id},
+        )
 
     def test_login_rate_limit_is_durable_and_audited(self):
         request_ids = []

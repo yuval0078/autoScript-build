@@ -149,6 +149,11 @@ class ExperimentResultsPage(QWidget):
         super().__init__()
         self.parent = parent
         self.api = AutoScriptAPI(timeout=30)
+        api_user = getattr(parent, "api_user", None) or {}
+        self.can_delete_data = api_user.get("role", "researcher") in {
+            "admin",
+            "researcher",
+        }
         self.experiment = None
         self.runs = []
         self.selected_ids = set()
@@ -186,7 +191,11 @@ class ExperimentResultsPage(QWidget):
         title_area = QVBoxLayout()
         self.title = QLabel("Experiment Results")
         self.title.setStyleSheet("font-size: 28px; font-weight: 700; color: #172230;")
-        self.subtitle = QLabel("Select participant runs to analyze, download, or delete.")
+        self.subtitle = QLabel(
+            "Select participant runs to analyze, download, or delete."
+            if self.can_delete_data
+            else "Select participant runs to analyze or download."
+        )
         self.subtitle.setStyleSheet("color: #657585; font-size: 13px;")
         title_area.addWidget(self.title)
         title_area.addWidget(self.subtitle)
@@ -287,6 +296,7 @@ class ExperimentResultsPage(QWidget):
         self.delete_button = self._toolbar_button(
             "✕ Delete selected", self.delete_selected, "#c62828"
         )
+        self.delete_button.setVisible(self.can_delete_data)
         for button in (
             self.raw_button,
             self.csv_button,
@@ -1024,6 +1034,7 @@ class ExperimentResultsPage(QWidget):
             copy_layout.addWidget(use_current)
             delete = QPushButton("Delete")
             delete.setEnabled(not copy.get("legacy"))
+            delete.setVisible(self.can_delete_data)
             delete.clicked.connect(
                 lambda _checked=False, item=copy:
                 self._delete_analysis_copy(dialog, run, item)
@@ -1064,6 +1075,13 @@ class ExperimentResultsPage(QWidget):
             QMessageBox.critical(self, "Update Failed", str(exc))
 
     def _delete_analysis_copy(self, dialog, run, copy):
+        if not self.can_delete_data:
+            QMessageBox.warning(
+                self,
+                "Permission denied",
+                "Operators cannot delete participant or analysis data.",
+            )
+            return
         answer = QMessageBox.warning(
             self,
             "Delete Analyzed Copy",
@@ -1153,6 +1171,7 @@ class ExperimentResultsPage(QWidget):
                         "api_url": self.api.base_url,
                         "experiment_id": self.experiment["id"],
                         "experiment_name": self.experiment["name"],
+                        "allow_data_deletion": self.can_delete_data,
                         "runs": context_runs,
                         "output_dir": str(output_dir),
                     },
@@ -1183,6 +1202,13 @@ class ExperimentResultsPage(QWidget):
             self.refresh_runs()
 
     def delete_selected(self):
+        if not self.can_delete_data:
+            QMessageBox.warning(
+                self,
+                "Permission denied",
+                "Operators cannot delete participant or analysis data.",
+            )
+            return
         runs = self._selected_runs()
         if not runs:
             return

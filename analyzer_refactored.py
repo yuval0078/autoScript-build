@@ -1719,6 +1719,8 @@ class PenDataPlayer(QMainWindow):
             return False
 
     def _choose_existing_analysis_policy(self):
+        if not (self.analysis_context or {}).get("allow_data_deletion", True):
+            return "keep"
         dialog = QMessageBox(self)
         dialog.setIcon(QMessageBox.Question)
         dialog.setWindowTitle("Existing analyzed files")

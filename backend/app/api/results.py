@@ -387,6 +387,7 @@ def _owned_experiment(
 
 
 def _owned_run(database, actor, run_id):
+    del actor
     statement = (
         select(ExperimentRun)
         .join(Experiment, ExperimentRun.experiment_id == Experiment.id)
@@ -400,10 +401,16 @@ def _owned_run(database, actor, run_id):
             selectinload(ExperimentRun.revision).selectinload(ExperimentRevision.blocks),
         )
     )
-    if actor.role == "operator":
-        statement = statement.where(ExperimentRun.created_by == actor.id)
     run = database.scalar(statement)
     if run is None:
+        raise HTTPException(status_code=404, detail="Experiment run was not found.")
+    return run
+
+
+def _runnable_run(database, actor, run_id):
+    """Return a Run the actor may mutate through the Runner protocol."""
+    run = _owned_run(database, actor, run_id)
+    if actor.role == "operator" and run.created_by != actor.id:
         raise HTTPException(status_code=404, detail="Experiment run was not found.")
     return run
 
@@ -502,7 +509,7 @@ def start_run(
     run_id: uuid.UUID, database: Session = Depends(get_db),
     actor: User = Depends(get_current_user),
 ):
-    run = _owned_run(database, actor, run_id)
+    run = _runnable_run(database, actor, run_id)
     _transition_run(run, "running")
     database.commit()
     return _run_response(run)
@@ -513,7 +520,7 @@ def finalize_run(
     run_id: uuid.UUID, database: Session = Depends(get_db),
     actor: User = Depends(get_current_user),
 ):
-    run = _owned_run(database, actor, run_id)
+    run = _runnable_run(database, actor, run_id)
     _transition_run(run, "completed" if _run_is_complete(run) else "incomplete")
     database.commit()
     return _run_response(run)
@@ -524,7 +531,7 @@ def cancel_run(
     run_id: uuid.UUID, database: Session = Depends(get_db),
     actor: User = Depends(get_current_user),
 ):
-    run = _owned_run(database, actor, run_id)
+    run = _runnable_run(database, actor, run_id)
     _transition_run(run, "cancelled")
     database.commit()
     return _run_response(run)
@@ -535,7 +542,7 @@ def fail_run(
     run_id: uuid.UUID, database: Session = Depends(get_db),
     actor: User = Depends(get_current_user),
 ):
-    run = _owned_run(database, actor, run_id)
+    run = _runnable_run(database, actor, run_id)
     _transition_run(run, "failed")
     database.commit()
     return _run_response(run)
@@ -798,7 +805,7 @@ async def upload_run_result(
     storage=Depends(get_object_storage),
     actor: User = Depends(get_current_user),
 ):
-    run = _owned_run(database, actor, run_id)
+    run = _runnable_run(database, actor, run_id)
     experiment = _owned_experiment(database, actor, run.experiment_id, lock=True)
     upload_path, sha256, size_bytes, metadata = await _receive_result(request)
     try:
@@ -878,7 +885,6 @@ async def upload_result(
 @router.get(
     "/experiments/{experiment_id}/runs",
     response_model=list[ExperimentRunResponse],
-    dependencies=[Depends(require_researcher)],
     responses={
         200: {
             "description": (
@@ -1069,7 +1075,6 @@ def list_experiment_runs(
 @router.get(
     "/runs/{run_id}",
     response_model=ExperimentRunResponse,
-    dependencies=[Depends(require_researcher)],
 )
 def get_experiment_run(
     run_id: uuid.UUID,
@@ -1082,7 +1087,6 @@ def get_experiment_run(
 @router.patch(
     "/runs/{run_id}/analysis",
     response_model=ExperimentRunResponse,
-    dependencies=[Depends(require_researcher)],
 )
 def update_run_analysis(
     run_id: uuid.UUID,
@@ -1101,7 +1105,6 @@ def update_run_analysis(
     "/runs/{run_id}/artifacts/{kind}",
     response_model=RunArtifactResponse,
     status_code=status.HTTP_201_CREATED,
-    dependencies=[Depends(require_researcher)],
 )
 async def upload_run_artifact(
     run_id: uuid.UUID,
@@ -1185,7 +1188,6 @@ def delete_experiment_run(
 
 @router.get(
     "/run-results/{result_id}/download",
-    dependencies=[Depends(require_researcher)],
 )
 def download_run_result(
     result_id: uuid.UUID,
@@ -1219,7 +1221,6 @@ def download_run_result(
 
 @router.get(
     "/run-artifacts/{artifact_id}/download",
-    dependencies=[Depends(require_researcher)],
 )
 def download_run_artifact(
     artifact_id: uuid.UUID,
