@@ -196,7 +196,11 @@ class BulkExportApiTests(unittest.TestCase):
             2026, 8, 10, hour, minute, microsecond=microsecond,
             tzinfo=timezone.utc,
         )
-        suffix = ".csv" if kind == "analysis_csv" else ".json"
+        suffix = {
+            "analysis_csv": ".csv",
+            "trainable_json": ".json",
+            "screenshots_zip": ".zip",
+        }[kind]
         with self.sessions() as database:
             run = database.get(ExperimentRun, run_id)
             content = f"legacy:{kind}:{marker}".encode("utf-8")
@@ -311,6 +315,24 @@ class BulkExportApiTests(unittest.TestCase):
         )
         _, all_manifest = self._archive(all_copies)
         self.assertEqual(len(all_manifest["entries"]), 2)
+
+    def test_screenshot_archive_is_available_in_server_bulk_export(self):
+        self._add_legacy_artifact(
+            self.run_id, "screenshots_zip", "all-images", 3
+        )
+
+        response = self._export(include=["screenshots_zip"])
+
+        self.assertEqual(response.status_code, 200, response.text)
+        archive, manifest = self._archive(response)
+        self.assertEqual(len(manifest["entries"]), 1)
+        entry = manifest["entries"][0]
+        self.assertEqual(entry["kind"], "screenshots_zip")
+        self.assertTrue(entry["path"].endswith("screenshots.zip"))
+        self.assertEqual(
+            archive.read(entry["path"]),
+            b"legacy:screenshots_zip:all-images",
+        )
 
     def test_mixed_legacy_and_finalized_copies_obey_latest_and_all(self):
         self._add_legacy_artifact(self.run_id, "analysis_csv", "legacy", 1)

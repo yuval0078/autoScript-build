@@ -53,6 +53,7 @@ ARTIFACT_TYPES = {
     "analysis_csv": (".csv", "text/csv; charset=utf-8"),
     "trainable_json": (".json", "application/json"),
     "analysis_state": (".json", "application/json"),
+    "screenshots_zip": (".zip", "application/zip"),
 }
 
 
@@ -111,6 +112,9 @@ def _run_response(run, *, include_files=True, summary=None):
         trainable_json_count = sum(
             artifact.kind == "trainable_json" for artifact in artifacts
         )
+        screenshots_count = sum(
+            artifact.kind == "screenshots_zip" for artifact in artifacts
+        )
         complete = _run_is_complete(run, results)
         response_results = [_result_response(result) for result in results]
         response_artifacts = [_artifact_response(artifact) for artifact in artifacts]
@@ -121,6 +125,7 @@ def _run_response(run, *, include_files=True, summary=None):
         raw_data_count = summary["raw_data_count"]
         analyzed_csv_count = summary["analyzed_csv_count"]
         trainable_json_count = summary["trainable_json_count"]
+        screenshots_count = summary["screenshots_count"]
         completed_word_count = summary["completed_word_count"]
         expected_word_count = summary["expected_word_count"]
         complete = summary["complete"]
@@ -147,6 +152,7 @@ def _run_response(run, *, include_files=True, summary=None):
         raw_data_count=raw_data_count,
         analyzed_csv_count=analyzed_csv_count,
         trainable_json_count=trainable_json_count,
+        screenshots_count=screenshots_count,
         completed_word_count=completed_word_count,
         expected_word_count=expected_word_count,
         complete=complete,
@@ -350,6 +356,7 @@ def _run_summaries(database, runs):
             "raw_data_count": len(results),
             "analyzed_csv_count": artifact_counts[run.id]["analysis_csv"],
             "trainable_json_count": artifact_counts[run.id]["trainable_json"],
+            "screenshots_count": artifact_counts[run.id]["screenshots_zip"],
             "completed_word_count": sum(
                 result.completed_word_count for result in results
             ),

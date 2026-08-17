@@ -423,7 +423,7 @@ class RunArtifact(UUIDPrimaryKeyMixin, CreatedAtMixin, Base):
             name="uq_run_artifacts_analysis_revision_kind",
         ),
         CheckConstraint(
-            "kind IN ('analysis_csv', 'trainable_json', 'analysis_state')",
+            "kind IN ('analysis_csv', 'trainable_json', 'analysis_state', 'screenshots_zip')",
             name="ck_run_artifact_kind",
         ),
         CheckConstraint(

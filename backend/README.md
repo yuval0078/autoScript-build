@@ -128,16 +128,30 @@ retain the previous compatibility calculation.
 - `DELETE /api/v1/runs/{run_id}/analysis-copies/{revision_id}` deletes that CSV,
   trainable JSON, and matching state snapshot but never deletes Raw Runner data.
 - `POST /api/v1/experiments/{id}/bulk-export` accepts 1–500 unique `run_ids`,
-  one or more of `raw_data`, `analysis_csv`, and `trainable_json`, and
+  one or more of `raw_data`, `analysis_csv`, `trainable_json`, and
+  `screenshots_zip`, and
   `analysis_policy: latest|all`. The server streams one bounded ZIP containing
   `manifest.json`, all selected immutable objects, their checksums, creation
   times, and analysis revision numbers. Raw data always includes every selected
   Run's Block results; the policy applies to both finalized and legacy analyzed
   copies. The response includes `X-Checksum-SHA256` for the complete ZIP.
 - `PATCH /api/v1/runs/{run_id}/analysis` records whether analysis is completed.
-- `POST /api/v1/runs/{run_id}/artifacts/{analysis_csv|trainable_json|analysis_state}` stores
+- `POST /api/v1/runs/{run_id}/artifacts/{analysis_csv|trainable_json|analysis_state|screenshots_zip}` stores
   immutable Analyzer exports; exact retries are idempotent.
 - `GET /api/v1/run-artifacts/{artifact_id}/download` returns exact artifact bytes.
+
+Historical lab data can be staged with `scripts/prepare_historical_import.py`
+and audited on the server before any write with:
+
+```bash
+python -m app.historical_import /path/to/import.zip --actor-username admin --dry-run
+```
+
+After the reported counts and target Experiment are verified, repeat with
+`--apply`. Imports use deterministic session IDs and exact checksums: an exact
+retry is a no-op, while conflicting bytes for an existing session are rejected.
+Legacy Raw JSON bytes are retained unchanged, and screenshots are stored as one
+immutable ZIP artifact per participant Run.
 - `DELETE /api/v1/runs/{run_id}` removes a participant run and all raw/derived
   objects after explicit UI confirmation.
 

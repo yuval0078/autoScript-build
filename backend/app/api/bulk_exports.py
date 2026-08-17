@@ -35,6 +35,7 @@ router = APIRouter(prefix="/api/v1", tags=["bulk exports"])
 _ANALYSIS_FILENAMES = {
     "analysis_csv": "analysis.csv",
     "trainable_json": "trainable.json",
+    "screenshots_zip": "screenshots.zip",
 }
 _ZIP_CHUNK_SIZE = 1024 * 1024
 
@@ -166,7 +167,7 @@ def _selected_entries(runs, payload):
                 key=lambda item: (item.block_index, str(item.id)),
             ):
                 entries.append(_raw_entry(run, result))
-        for kind in ("analysis_csv", "trainable_json"):
+        for kind in ("analysis_csv", "trainable_json", "screenshots_zip"):
             if kind not in requested:
                 continue
             analysis_artifacts = _analysis_artifacts(

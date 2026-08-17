@@ -36,6 +36,7 @@ ARTIFACT_TAGS = (
     ("raw_data", "Raw data"),
     ("analysis_csv", "Analyzed CSV"),
     ("trainable_json", "Trainable Json"),
+    ("screenshots_zip", "Screenshots"),
 )
 
 
@@ -45,6 +46,7 @@ def cloud_file_count(run, kind):
         "raw_data": "raw_data_count",
         "analysis_csv": "analyzed_csv_count",
         "trainable_json": "trainable_json_count",
+        "screenshots_zip": "screenshots_count",
     }[kind]
     if count_key in run:
         try:
@@ -812,6 +814,22 @@ class ExperimentResultsPage(QWidget):
     def _analysis_copies(self, run, kind):
         """Load versioned exports, with a flat-artifact fallback for older servers."""
         run = self._get_run_detail(run)
+        if kind == "screenshots_zip":
+            copies = [
+                {
+                    "id": None,
+                    "revision": None,
+                    "created_at": artifact.get("created_at"),
+                    "completed": run.get("analysis_completed"),
+                    "is_current_editable": False,
+                    "artifact": artifact,
+                    "legacy": True,
+                }
+                for artifact in run.get("artifacts", [])
+                if artifact.get("kind") == kind
+            ]
+            copies.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
+            return copies
         try:
             revisions = self.api.list_run_analysis_copies(run["id"])
         except APIError as exc:
@@ -861,6 +879,8 @@ class ExperimentResultsPage(QWidget):
     def _artifact_details(kind):
         if kind == "analysis_csv":
             return "Analyzed CSV", ".csv", "analysis_csv"
+        if kind == "screenshots_zip":
+            return "Screenshots", ".zip", "screenshots"
         return "Trainable Json", ".json", "trainable_json"
 
     def _copy_filename(self, run, copy, kind, *, include_version=False):

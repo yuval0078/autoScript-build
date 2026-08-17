@@ -133,6 +133,7 @@ class ExperimentRunResponse(BaseModel):
     raw_data_count: int
     analyzed_csv_count: int
     trainable_json_count: int
+    screenshots_count: int
     completed_word_count: int
     expected_word_count: int
     complete: bool

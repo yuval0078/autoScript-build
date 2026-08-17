@@ -4,7 +4,12 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
-BulkExportKind = Literal["raw_data", "analysis_csv", "trainable_json"]
+BulkExportKind = Literal[
+    "raw_data",
+    "analysis_csv",
+    "trainable_json",
+    "screenshots_zip",
+]
 BulkAnalysisPolicy = Literal["latest", "all"]
 
 
@@ -23,6 +28,7 @@ class BulkExportRequest(BaseModel):
                         "raw_data",
                         "analysis_csv",
                         "trainable_json",
+                        "screenshots_zip",
                     ],
                     "analysis_policy": "latest",
                 }
@@ -41,18 +47,19 @@ class BulkExportRequest(BaseModel):
     )
     include: list[BulkExportKind] = Field(
         min_length=1,
-        max_length=3,
-        examples=[["raw_data", "analysis_csv", "trainable_json"]],
+        max_length=4,
+        examples=[["raw_data", "analysis_csv", "trainable_json", "screenshots_zip"]],
         description=(
             "Artifact categories to include. raw_data includes every immutable Block "
-            "result for each selected Run."
+            "result for each selected Run; screenshots_zip includes the archived "
+            "screenshots when available."
         ),
     )
     analysis_policy: BulkAnalysisPolicy = Field(
         default="latest",
         examples=["latest"],
         description=(
-            "For analyzed CSV and trainable JSON, include the newest saved copy "
+            "For analyzed CSV, trainable JSON, and screenshot archives, include the newest saved copy "
             "per Run or every saved copy. Versioned finalized revisions and legacy "
             "unversioned artifacts participate in the same selection."
         ),
