@@ -1,4 +1,4 @@
-"""Bounded, owner-scoped ZIP exports for immutable Runner and Analyzer data."""
+"""Bounded shared-lab ZIP exports for immutable Runner and Analyzer data."""
 
 import hashlib
 import json
@@ -19,7 +19,7 @@ from starlette.background import BackgroundTask
 
 from ..config import get_settings
 from ..database import get_db
-from ..dependencies import get_current_user
+from ..dependencies import require_researcher
 from ..models import (
     Experiment,
     ExperimentRun,
@@ -255,8 +255,8 @@ def _stream_and_remove(path):
     "/experiments/{experiment_id}/bulk-export",
     summary="Download selected Run data as one ZIP",
     description=(
-        "Builds a bounded temporary ZIP from immutable cloud objects owned by the "
-        "authenticated user. Raw data always contains every available Block result. "
+        "Builds a bounded temporary ZIP from immutable shared-lab cloud objects. "
+        "Raw data always contains every available Block result. "
         "The analysis policy applies independently to analyzed CSV and trainable JSON. "
         "Finalized analysis revisions and legacy unversioned artifacts participate "
         "in the same newest/all selection. The ZIP includes "
@@ -306,12 +306,11 @@ def bulk_export_experiment_results(
     payload: BulkExportRequest,
     database: Session = Depends(get_db),
     storage=Depends(get_object_storage),
-    actor: User = Depends(get_current_user),
+    actor: User = Depends(require_researcher),
 ):
     experiment = database.scalar(
         select(Experiment).where(
             Experiment.id == experiment_id,
-            Experiment.owner_id == actor.id,
             Experiment.archived_at.is_(None),
         )
     )

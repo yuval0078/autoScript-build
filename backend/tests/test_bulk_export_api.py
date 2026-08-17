@@ -424,7 +424,7 @@ class BulkExportApiTests(unittest.TestCase):
         self.assertEqual(duplicate_include.status_code, 422)
         self.assertIn("include must not contain duplicates", duplicate_include.text)
 
-    def test_missing_or_wrong_experiment_run_is_hidden(self):
+    def test_missing_or_wrong_experiment_run_is_hidden_but_shared_lab_is_visible(self):
         missing = self._export(run_ids=[str(uuid.uuid4())])
         hidden_run = self._add_run(
             self.hidden_experiment_id,
@@ -441,7 +441,7 @@ class BulkExportApiTests(unittest.TestCase):
 
         self.assertEqual(missing.status_code, 404)
         self.assertEqual(cross_experiment.status_code, 404)
-        self.assertEqual(hidden_experiment.status_code, 404)
+        self.assertEqual(hidden_experiment.status_code, 200, hidden_experiment.text)
 
     def test_source_size_is_rejected_before_storage_is_read(self):
         class ReadTrackingStorage(FakeStorage):

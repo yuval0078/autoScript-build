@@ -17,8 +17,8 @@ class UserCreate(BaseModel):
     @field_validator("role")
     @classmethod
     def valid_role(cls, value):
-        if value not in {"admin", "researcher"}:
-            raise ValueError("Role must be admin or researcher.")
+        if value not in {"admin", "researcher", "operator"}:
+            raise ValueError("Role must be admin, researcher, or operator.")
         return value
 
 
@@ -30,8 +30,8 @@ class UserUpdate(BaseModel):
     @field_validator("role")
     @classmethod
     def valid_role(cls, value):
-        if value is not None and value not in {"admin", "researcher"}:
-            raise ValueError("Role must be admin or researcher.")
+        if value is not None and value not in {"admin", "researcher", "operator"}:
+            raise ValueError("Role must be admin, researcher, or operator.")
         return value
 
 

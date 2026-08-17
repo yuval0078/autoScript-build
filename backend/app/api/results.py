@@ -24,7 +24,7 @@ from sqlalchemy.orm import Session, aliased, selectinload
 
 from ..config import get_settings
 from ..database import get_db
-from ..dependencies import get_current_user
+from ..dependencies import get_current_user, require_researcher
 from ..models import (
     Experiment,
     ExperimentBlock,
@@ -371,13 +371,10 @@ def _owned_experiment(
     lock=False,
     load_blocks=True,
 ):
-    statement = (
-        select(Experiment)
-        .where(
-            Experiment.id == experiment_id,
-            Experiment.owner_id == actor.id,
-            Experiment.archived_at.is_(None),
-        )
+    del actor
+    statement = select(Experiment).where(
+        Experiment.id == experiment_id,
+        Experiment.archived_at.is_(None),
     )
     if load_blocks:
         statement = statement.options(selectinload(Experiment.blocks))
@@ -390,12 +387,11 @@ def _owned_experiment(
 
 
 def _owned_run(database, actor, run_id):
-    run = database.scalar(
+    statement = (
         select(ExperimentRun)
         .join(Experiment, ExperimentRun.experiment_id == Experiment.id)
         .where(
             ExperimentRun.id == run_id,
-            Experiment.owner_id == actor.id,
             Experiment.archived_at.is_(None),
         )
         .options(
@@ -404,6 +400,9 @@ def _owned_run(database, actor, run_id):
             selectinload(ExperimentRun.revision).selectinload(ExperimentRevision.blocks),
         )
     )
+    if actor.role == "operator":
+        statement = statement.where(ExperimentRun.created_by == actor.id)
+    run = database.scalar(statement)
     if run is None:
         raise HTTPException(status_code=404, detail="Experiment run was not found.")
     return run
@@ -426,7 +425,6 @@ def create_experiment_run(
         .join(Experiment, ExperimentRevision.experiment_id == Experiment.id)
         .where(
             ExperimentRevision.id == revision_id,
-            Experiment.owner_id == actor.id,
             Experiment.archived_at.is_(None),
         )
         .options(selectinload(ExperimentRevision.blocks))
@@ -446,6 +444,8 @@ def create_experiment_run(
         )
     )
     if existing is not None:
+        if actor.role == "operator" and existing.created_by != actor.id:
+            raise HTTPException(status_code=409, detail="Session ID is already in use.")
         expected = (
             existing.revision_id,
             existing.participant_number,
@@ -864,6 +864,8 @@ async def upload_result(
             )
             database.add(run)
             database.flush()
+        elif actor.role == "operator" and run.created_by != actor.id:
+            raise HTTPException(status_code=409, detail="Session ID is already in use.")
         return _persist_received_result(
             database, storage, actor, experiment, run, metadata,
             upload_path, sha256, size_bytes, x_filename, response,
@@ -876,6 +878,7 @@ async def upload_result(
 @router.get(
     "/experiments/{experiment_id}/runs",
     response_model=list[ExperimentRunResponse],
+    dependencies=[Depends(require_researcher)],
     responses={
         200: {
             "description": (
@@ -884,7 +887,7 @@ async def upload_result(
             ),
             "headers": {
                 "X-Total-Count": {
-                    "description": "Total owner-scoped runs matching all filters.",
+                    "description": "Total shared-lab runs matching all filters.",
                     "schema": {"type": "integer", "minimum": 0},
                 },
                 "X-Next-Cursor": {
@@ -1063,7 +1066,11 @@ def list_experiment_runs(
     ]
 
 
-@router.get("/runs/{run_id}", response_model=ExperimentRunResponse)
+@router.get(
+    "/runs/{run_id}",
+    response_model=ExperimentRunResponse,
+    dependencies=[Depends(require_researcher)],
+)
 def get_experiment_run(
     run_id: uuid.UUID,
     database: Session = Depends(get_db),
@@ -1072,7 +1079,11 @@ def get_experiment_run(
     return _run_response(_owned_run(database, actor, run_id))
 
 
-@router.patch("/runs/{run_id}/analysis", response_model=ExperimentRunResponse)
+@router.patch(
+    "/runs/{run_id}/analysis",
+    response_model=ExperimentRunResponse,
+    dependencies=[Depends(require_researcher)],
+)
 def update_run_analysis(
     run_id: uuid.UUID,
     payload: RunAnalysisUpdate,
@@ -1090,6 +1101,7 @@ def update_run_analysis(
     "/runs/{run_id}/artifacts/{kind}",
     response_model=RunArtifactResponse,
     status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_researcher)],
 )
 async def upload_run_artifact(
     run_id: uuid.UUID,
@@ -1149,7 +1161,11 @@ async def upload_run_artifact(
         upload_path.unlink(missing_ok=True)
 
 
-@router.delete("/runs/{run_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete(
+    "/runs/{run_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(require_researcher)],
+)
 def delete_experiment_run(
     run_id: uuid.UUID,
     database: Session = Depends(get_db),
@@ -1167,7 +1183,10 @@ def delete_experiment_run(
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-@router.get("/run-results/{result_id}/download")
+@router.get(
+    "/run-results/{result_id}/download",
+    dependencies=[Depends(require_researcher)],
+)
 def download_run_result(
     result_id: uuid.UUID,
     database: Session = Depends(get_db),
@@ -1180,7 +1199,6 @@ def download_run_result(
         .join(Experiment)
         .where(
             RunResult.id == result_id,
-            Experiment.owner_id == actor.id,
             Experiment.archived_at.is_(None),
         )
     )
@@ -1199,7 +1217,10 @@ def download_run_result(
     )
 
 
-@router.get("/run-artifacts/{artifact_id}/download")
+@router.get(
+    "/run-artifacts/{artifact_id}/download",
+    dependencies=[Depends(require_researcher)],
+)
 def download_run_artifact(
     artifact_id: uuid.UUID,
     database: Session = Depends(get_db),
@@ -1212,7 +1233,6 @@ def download_run_artifact(
         .join(Experiment)
         .where(
             RunArtifact.id == artifact_id,
-            Experiment.owner_id == actor.id,
             Experiment.archived_at.is_(None),
         )
     )

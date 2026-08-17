@@ -20,6 +20,12 @@ bearer_auth = HTTPBearer(
     ),
 )
 
+ADMIN_ROLE = "admin"
+RESEARCHER_ROLE = "researcher"
+OPERATOR_ROLE = "operator"
+VALID_ROLES = frozenset({ADMIN_ROLE, RESEARCHER_ROLE, OPERATOR_ROLE})
+EDITOR_ROLES = frozenset({ADMIN_ROLE, RESEARCHER_ROLE})
+
 
 def get_current_user(
     authorization: str | None = Header(default=None, include_in_schema=False),
@@ -48,6 +54,8 @@ def get_current_user(
         user = database.get(User, token.user_id)
         if user is None or not user.is_active:
             raise HTTPException(status_code=401, detail="User account is inactive.")
+        if user.role not in VALID_ROLES:
+            raise HTTPException(status_code=403, detail="User role is not supported.")
         return user
     if settings.auth_mode == "token":
         raise HTTPException(
@@ -66,10 +74,19 @@ def get_current_user(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="The local API actor has not been bootstrapped.",
         )
+    if user.role not in VALID_ROLES:
+        raise HTTPException(status_code=403, detail="User role is not supported.")
     return user
 
 
 def require_admin(actor: User = Depends(get_current_user)):
-    if actor.role != "admin":
+    if actor.role != ADMIN_ROLE:
         raise HTTPException(status_code=403, detail="Administrator access is required.")
+    return actor
+
+
+def require_researcher(actor: User = Depends(get_current_user)):
+    """Allow users who can author Experiments and work with analysis data."""
+    if actor.role not in EDITOR_ROLES:
+        raise HTTPException(status_code=403, detail="Researcher access is required.")
     return actor

@@ -179,7 +179,7 @@ class ResultApiTests(unittest.TestCase):
         self.assertEqual(deleted.status_code, 204, deleted.text)
         self.assertEqual(self.storage.objects, {})
 
-    def test_run_list_pagination_filters_compact_mode_and_owner_scope(self):
+    def test_run_list_pagination_filters_compact_mode_and_shared_lab_scope(self):
         first_payload = raw_result(self.experiment["id"], block_count=1)
         first_payload.update(
             {
@@ -402,12 +402,14 @@ class ResultApiTests(unittest.TestCase):
             self.client.get(runs_url, params={"participant_number": 0}).status_code,
             422,
         )
+        shared_runs = self.client.get(
+            f"/api/v1/experiments/{private_experiment_id}/runs",
+            params={"participant_number": 7, "limit": 10},
+        )
+        self.assertEqual(shared_runs.status_code, 200, shared_runs.text)
         self.assertEqual(
-            self.client.get(
-                f"/api/v1/experiments/{private_experiment_id}/runs",
-                params={"participant_number": 7, "limit": 10},
-            ).status_code,
-            404,
+            [run["session_id"] for run in shared_runs.json()],
+            ["private-session"],
         )
 
     def test_compact_run_list_uses_lightweight_owner_lookup_and_validates_cursor_first(self):

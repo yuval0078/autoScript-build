@@ -17,7 +17,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from jsonschema import Draft202012Validator
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-from PyQt5.QtWidgets import QApplication, QMessageBox
+from PyQt5.QtWidgets import QApplication, QMessageBox, QPushButton, QToolButton
 
 from autoscript_api import PaginatedList
 from gui_menu import MainMenu, experiment_card_metadata
@@ -46,6 +46,48 @@ class RunnerLaunchContractTests(unittest.TestCase):
         self.assertIn('"saveResultsLocallyToggle"', source)
         self.assertIn('"run/recalibrate_between_blocks"', source)
         self.assertIn('"run/save_results_locally"', source)
+
+    def test_operator_home_exposes_only_download_and_run_actions(self):
+        experiment = {
+            "id": "experiment-operator",
+            "name": "Shared study",
+            "blocks": [],
+            "participant_count": 0,
+            "analyzed_participant_count": 0,
+        }
+
+        class API:
+            def __init__(self, timeout=0):
+                del timeout
+
+            def list_experiments(self, **_parameters):
+                return PaginatedList([experiment], headers={"x-total-count": "1"})
+
+        parent = SimpleNamespace(
+            api_user={"role": "operator"},
+            open_new_experiment=MagicMock(),
+        )
+        with patch("gui_menu.AutoScriptAPI", API):
+            menu = MainMenu(parent)
+        try:
+            tooltips = {
+                widget.toolTip()
+                for widget in (
+                    menu.findChildren(QToolButton) + menu.findChildren(QPushButton)
+                )
+                if widget.toolTip()
+            }
+            self.assertIn("Download experiment ZIP", tooltips)
+            self.assertIn("Run experiment", tooltips)
+            self.assertIn("Test-run experiment", tooltips)
+            self.assertNotIn("Edit experiment", tooltips)
+            self.assertNotIn("Duplicate experiment", tooltips)
+            self.assertNotIn("Delete experiment", tooltips)
+            self.assertNotIn("View and analyze results", tooltips)
+            self.assertNotIn("Create a new experiment", tooltips)
+            self.assertNotIn("Open local or legacy ZIP", tooltips)
+        finally:
+            menu.deleteLater()
 
     def test_experiment_card_metadata_pluralizes_blocks_and_distinct_participants(self):
         self.assertEqual(

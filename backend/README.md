@@ -16,7 +16,7 @@ JSON bytes.
   Block order/page layout and advances `current_revision_id`. Its body must
   include the revision seen by the editor as `expected_current_revision_id`;
   stale editors receive HTTP 409.
-- `GET /api/v1/experiments/{id}` returns one owner-scoped Experiment, including
+- `GET /api/v1/experiments/{id}` returns one shared-lab Experiment, including
   the explicit `current_revision_id` and immutable current revision.
 - `POST /api/v1/experiments` creates an empty experiment.
 - `GET /api/v1/experiments` lists experiments with their ordered `blocks`.
@@ -191,6 +191,16 @@ only its SHA-256 hash is stored so the token can expire or be revoked.
 - Admin-only: `GET /api/v1/security/events` returns recent durable login,
   logout, session-cleanup, and user-administration audit events.
 
+The three supported roles are:
+
+- `admin`: full shared-lab access, including user and security administration.
+- `researcher`: create/edit/delete Experiments and Runs, analyze results, and
+  download/export all shared-lab data.
+- `operator`: view and download shared Experiments and start/Test Run them.
+  Operators may upload and finalize raw results only for Runs they created;
+  they cannot author Experiments, browse results, analyze, bulk-export, delete,
+  or administer users.
+
 Login failures are rate-limited in shared database state by normalized account
 and a one-way hash of the client address, so limits apply across API workers.
 The default principal limit is five attempts in five minutes followed by a
@@ -209,9 +219,11 @@ status, duration, and these identifiers. Headers, query strings, request bodies,
 passwords, bearer tokens, and exception messages are never logged. Unexpected
 errors return a generic correlated HTTP 500 response.
 
-Experiments and all nested revisions, Runs, results, and artifacts are filtered
-through their owner's user ID. The desktop app prompts after an HTTP 401 and
-passes the session token only to its Runner and Analyzer child processes.
+Experiments and their Runs/results form one authenticated shared lab workspace.
+Staged Builder uploads and idempotency records remain scoped to their creator,
+and operator Run mutation is restricted to the operator who created that Run.
+The desktop app prompts after an HTTP 401 and passes the session token only to
+its Runner and Analyzer child processes.
 
 ## Production deployment
 

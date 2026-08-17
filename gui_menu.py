@@ -486,6 +486,9 @@ class MainMenu(QWidget):
         super().__init__()
         self.parent = parent
         self.api = AutoScriptAPI(timeout=10)
+        api_user = getattr(parent, "api_user", None) or {}
+        self.user_role = str(api_user.get("role", "researcher"))
+        self.can_research = self.user_role in {"admin", "researcher"}
         self.experiments = []
         self.experiment_cards = []
         self._experiment_cursor = None
@@ -506,7 +509,11 @@ class MainMenu(QWidget):
         title_area = QVBoxLayout()
         title = QLabel("Experiments")
         title.setStyleSheet("font-size: 30px; font-weight: 700; color: #172230;")
-        subtitle = QLabel("Cloud experiments are ready to edit, run, download, or analyze.")
+        subtitle = QLabel(
+            "Shared lab experiments are ready to edit, run, download, or analyze."
+            if self.can_research
+            else "Shared lab experiments are ready to download or run."
+        )
         subtitle.setStyleSheet("color: #657585; font-size: 13px;")
         title_area.addWidget(title)
         title_area.addWidget(subtitle)
@@ -519,7 +526,8 @@ class MainMenu(QWidget):
         open_local.setFixedSize(42, 42)
         open_local.setStyleSheet(self._icon_button_style("#536578"))
         open_local.clicked.connect(self.load_experiment_zip)
-        header.addWidget(open_local)
+        if self.can_research:
+            header.addWidget(open_local)
 
         refresh = QToolButton()
         refresh.setText("↻")
@@ -538,7 +546,8 @@ class MainMenu(QWidget):
             "QPushButton:hover { background: #245f98; }"
         )
         new_experiment.clicked.connect(parent.open_new_experiment)
-        header.addWidget(new_experiment)
+        if self.can_research:
+            header.addWidget(new_experiment)
         layout.addLayout(header)
 
         settings_frame = QFrame()
@@ -785,15 +794,27 @@ class MainMenu(QWidget):
         text_area.addWidget(meta)
         row.addLayout(text_area, 1)
 
-        actions = (
+        actions = [
             ("↓", "Download experiment ZIP", self._download_cloud_experiment, "#2463a8"),
-            ("✎", "Edit experiment", self._edit_cloud_experiment, "#6b4ca5"),
-            ("⧉", "Duplicate experiment", self._duplicate_cloud_experiment, "#5c6570"),
-            ("✕", "Delete experiment", self._delete_cloud_experiment, "#c62828"),
-            ("▶", "Run experiment", lambda exp: self._run_cloud_experiment(exp, False), "#198a43"),
-            ("▶⚙", "Test-run experiment", lambda exp: self._run_cloud_experiment(exp, True), "#b07a00"),
-            ("⌕", "View and analyze results", self._analyze_cloud_experiment, "#16788c"),
+        ]
+        if self.can_research:
+            actions.extend(
+                [
+                    ("✎", "Edit experiment", self._edit_cloud_experiment, "#6b4ca5"),
+                    ("⧉", "Duplicate experiment", self._duplicate_cloud_experiment, "#5c6570"),
+                    ("✕", "Delete experiment", self._delete_cloud_experiment, "#c62828"),
+                ]
+            )
+        actions.extend(
+            [
+                ("▶", "Run experiment", lambda exp: self._run_cloud_experiment(exp, False), "#198a43"),
+                ("▶⚙", "Test-run experiment", lambda exp: self._run_cloud_experiment(exp, True), "#b07a00"),
+            ]
         )
+        if self.can_research:
+            actions.append(
+                ("⌕", "View and analyze results", self._analyze_cloud_experiment, "#16788c")
+            )
         for text, tooltip, handler, color in actions:
             row.addWidget(
                 self._action_button(

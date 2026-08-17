@@ -208,15 +208,27 @@ class MainInterface(QMainWindow):
         self.stack.setCurrentWidget(self.main_menu)
 
     def open_new_experiment(self):
+        if (self.api_user or {}).get("role") == "operator":
+            QMessageBox.warning(self, "Permission denied", "Researcher access is required.")
+            return None
         return self._launch_builder(["--new"])
 
     def open_experiment_builder(self, experiment):
+        if (self.api_user or {}).get("role") == "operator":
+            QMessageBox.warning(self, "Permission denied", "Researcher access is required.")
+            return None
         return self._launch_builder(["--experiment-id", str(experiment["id"])])
 
     def open_builder_import(self, package_path):
+        if (self.api_user or {}).get("role") == "operator":
+            QMessageBox.warning(self, "Permission denied", "Researcher access is required.")
+            return None
         return self._launch_builder(["--import-block", str(package_path)])
 
     def open_experiment_results(self, experiment):
+        if (self.api_user or {}).get("role") == "operator":
+            QMessageBox.warning(self, "Permission denied", "Researcher access is required.")
+            return None
         self.experiment_results.set_experiment(experiment)
         self.stack.setCurrentWidget(self.experiment_results)
 

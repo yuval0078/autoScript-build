@@ -27,7 +27,7 @@ from starlette.background import BackgroundTask
 
 from ..config import get_settings
 from ..database import get_db
-from ..dependencies import get_current_user
+from ..dependencies import get_current_user, require_researcher
 from ..models import (
     Experiment,
     ExperimentBlock,
@@ -247,11 +247,11 @@ def _revision_response(revision):
 
 
 def _experiment_query(actor, experiment_id, *, lock=False):
+    del actor
     statement = (
         select(Experiment)
         .where(
             Experiment.id == experiment_id,
-            Experiment.owner_id == actor.id,
             Experiment.archived_at.is_(None),
         )
         .options(
@@ -500,6 +500,7 @@ def _validate_publish_page_group(group):
     "/staged-blocks",
     response_model=StagedBlockAssetResponse,
     status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_researcher)],
 )
 async def stage_block(
     request: Request,
@@ -852,6 +853,7 @@ def _atomic_publish_experiment(
     "/experiments/publish",
     response_model=ExperimentResponse,
     status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_researcher)],
 )
 def create_and_publish_experiment(
     payload: ExperimentPublishCreate,
@@ -869,6 +871,7 @@ def create_and_publish_experiment(
     "/experiments",
     response_model=ExperimentResponse,
     status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_researcher)],
 )
 def create_experiment(
     payload: ExperimentCreate,
@@ -904,7 +907,7 @@ def create_experiment(
             ),
             "headers": {
                 "X-Total-Count": {
-                    "description": "Total owner-scoped Experiments matching search.",
+                    "description": "Total shared-lab Experiments matching search.",
                     "schema": {"type": "integer", "minimum": 0},
                 },
                 "X-Next-Cursor": {
@@ -961,10 +964,7 @@ def list_experiments(
             detail="cursor requires limit.",
         )
 
-    filters = [
-        Experiment.owner_id == actor.id,
-        Experiment.archived_at.is_(None),
-    ]
+    filters = [Experiment.archived_at.is_(None)]
     normalized_search = (search or "").strip()
     if normalized_search:
         pattern = escaped_contains_pattern(normalized_search)
@@ -1089,6 +1089,7 @@ def get_experiment(
 @router.post(
     "/experiments/{experiment_id}/publish",
     response_model=ExperimentResponse,
+    dependencies=[Depends(require_researcher)],
 )
 def update_and_publish_experiment(
     experiment_id: uuid.UUID,
@@ -1109,7 +1110,11 @@ def update_and_publish_experiment(
     )
 
 
-@router.patch("/experiments/{experiment_id}", response_model=ExperimentResponse)
+@router.patch(
+    "/experiments/{experiment_id}",
+    response_model=ExperimentResponse,
+    dependencies=[Depends(require_researcher)],
+)
 def update_experiment(
     experiment_id: uuid.UUID,
     payload: ExperimentUpdate,
@@ -1132,7 +1137,11 @@ def update_experiment(
     return _experiment_response(experiment)
 
 
-@router.delete("/experiments/{experiment_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete(
+    "/experiments/{experiment_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(require_researcher)],
+)
 def delete_experiment(
     experiment_id: uuid.UUID,
     database: Session = Depends(get_db),
@@ -1202,6 +1211,7 @@ def _create_revision_snapshot(database, storage, actor, experiment):
     "/experiments/{experiment_id}/revisions",
     response_model=ExperimentRevisionResponse,
     status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_researcher)],
 )
 def create_experiment_revision(
     experiment_id: uuid.UUID,
@@ -1237,6 +1247,7 @@ def list_experiment_revisions(
     "/experiments/{experiment_id}/duplicate",
     response_model=ExperimentResponse,
     status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_researcher)],
 )
 def duplicate_experiment(
     experiment_id: uuid.UUID,
@@ -1246,9 +1257,7 @@ def duplicate_experiment(
 ):
     source = _owned_experiment(database, actor, experiment_id, lock=True)
     existing_names = set(
-        database.scalars(
-            select(Experiment.name).where(Experiment.owner_id == actor.id)
-        ).all()
+        database.scalars(select(Experiment.name)).all()
     )
     base_name = f"{source.name} copy"
     duplicate_name = base_name
@@ -1305,6 +1314,7 @@ def duplicate_experiment(
     "/experiments/{experiment_id}/blocks",
     response_model=ExperimentBlockResponse,
     status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_researcher)],
 )
 async def upload_block(
     experiment_id: uuid.UUID,
@@ -1374,11 +1384,13 @@ async def upload_block(
     "/experiments/{experiment_id}/blocks/order",
     response_model=ExperimentResponse,
     operation_id="patch_experiment_block_order",
+    dependencies=[Depends(require_researcher)],
 )
 @router.put(
     "/experiments/{experiment_id}/blocks/order",
     response_model=ExperimentResponse,
     operation_id="replace_experiment_block_order",
+    dependencies=[Depends(require_researcher)],
 )
 def reorder_blocks(
     experiment_id: uuid.UUID,
@@ -1403,7 +1415,11 @@ def reorder_blocks(
     return _experiment_response(experiment)
 
 
-@router.delete("/blocks/{block_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete(
+    "/blocks/{block_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(require_researcher)],
+)
 def delete_block(
     block_id: uuid.UUID,
     database: Session = Depends(get_db),
@@ -1415,7 +1431,6 @@ def delete_block(
         .join(Experiment)
         .where(
             ExperimentBlock.id == block_id,
-            Experiment.owner_id == actor.id,
             Experiment.archived_at.is_(None),
         )
     )
@@ -1445,7 +1460,6 @@ def download_block(
         .join(Experiment)
         .where(
             ExperimentBlock.id == block_id,
-            Experiment.owner_id == actor.id,
             Experiment.archived_at.is_(None),
         )
     )
@@ -1529,7 +1543,6 @@ def download_experiment_revision(
         .join(Experiment, ExperimentRevision.experiment_id == Experiment.id)
         .where(
             ExperimentRevision.id == revision_id,
-            Experiment.owner_id == actor.id,
             Experiment.archived_at.is_(None),
         ).options(selectinload(ExperimentRevision.blocks))
     )
@@ -1636,6 +1649,7 @@ def download_experiment(
     "/experiments/{experiment_id}/versions",
     response_model=ExperimentVersionResponse,
     status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_researcher)],
 )
 async def publish_experiment_version(
     experiment_id: uuid.UUID,
@@ -1741,7 +1755,6 @@ def download_experiment_version(
         .join(Experiment)
         .where(
             ExperimentVersion.id == version_id,
-            Experiment.owner_id == actor.id,
             Experiment.archived_at.is_(None),
         )
     )

@@ -636,7 +636,7 @@ class AnalysisApiTests(unittest.TestCase):
                 )
                 self.assertEqual(response.status_code, 422, response.text)
 
-    def test_legacy_state_cas_and_owner_isolation(self):
+    def test_legacy_state_cas_and_shared_lab_resolution(self):
         legacy_bytes = json.dumps(
             {"schema_version": "1.0", "sources": []}
         ).encode("utf-8")
@@ -714,19 +714,19 @@ class AnalysisApiTests(unittest.TestCase):
             "/api/v1/run-results/resolve", json={"sha256": [hidden_sha]}
         )
         self.assertEqual(resolved.status_code, 200, resolved.text)
-        self.assertEqual(resolved.json()["results"], [])
-        self.assertEqual(resolved.json()["missing_sha256"], [hidden_sha])
         self.assertEqual(
-            self.client.get(f"/api/v1/runs/{hidden_run_id}").status_code,
-            404,
+            [item["sha256"] for item in resolved.json()["results"]],
+            [hidden_sha],
         )
+        self.assertEqual(resolved.json()["missing_sha256"], [])
+        shared_run = self.client.get(f"/api/v1/runs/{hidden_run_id}")
+        self.assertEqual(shared_run.status_code, 200, shared_run.text)
         hidden_revision_id = uuid.uuid4()
-        self.assertEqual(
-            self.client.get(
-                f"/api/v1/runs/{hidden_run_id}/analysis-copies"
-            ).status_code,
-            404,
+        shared_copies = self.client.get(
+            f"/api/v1/runs/{hidden_run_id}/analysis-copies"
         )
+        self.assertEqual(shared_copies.status_code, 200, shared_copies.text)
+        self.assertEqual(shared_copies.json(), [])
         self.assertEqual(
             self.client.post(
                 f"/api/v1/runs/{hidden_run_id}/analysis-copies/"

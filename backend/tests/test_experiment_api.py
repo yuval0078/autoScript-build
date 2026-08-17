@@ -268,7 +268,7 @@ class ExperimentApiTests(unittest.TestCase):
         self.assertEqual(listed["participant_count"], 2)
         self.assertEqual(listed["analyzed_participant_count"], 1)
 
-    def test_experiment_list_cursor_search_and_owner_scope(self):
+    def test_experiment_list_cursor_search_and_shared_lab_scope(self):
         owned = [
             self.client.post(
                 "/api/v1/experiments",
@@ -301,21 +301,24 @@ class ExperimentApiTests(unittest.TestCase):
             )
             session.add(other_user)
             session.flush()
-            session.add(
-                Experiment(
+            shared_experiment = Experiment(
                     name="Private needle Study",
                     description="needle",
                     owner_id=other_user.id,
                     created_at=shared_timestamp,
                 )
-            )
+            session.add(shared_experiment)
             session.commit()
+            shared_experiment_id = str(shared_experiment.id)
 
         legacy = self.client.get("/api/v1/experiments")
         self.assertEqual(legacy.status_code, 200, legacy.text)
         self.assertNotIn("x-total-count", legacy.headers)
         expected_ids = [item["id"] for item in legacy.json()]
-        self.assertEqual(set(expected_ids), {item["id"] for item in owned})
+        self.assertEqual(
+            set(expected_ids),
+            {item["id"] for item in owned} | {shared_experiment_id},
+        )
 
         collected_ids = []
         cursor = None
@@ -325,7 +328,7 @@ class ExperimentApiTests(unittest.TestCase):
                 params["cursor"] = cursor
             page = self.client.get("/api/v1/experiments", params=params)
             self.assertEqual(page.status_code, 200, page.text)
-            self.assertEqual(page.headers["x-total-count"], "5")
+            self.assertEqual(page.headers["x-total-count"], "6")
             collected_ids.extend(item["id"] for item in page.json())
             cursor = page.headers.get("x-next-cursor")
             if cursor is None:
@@ -347,10 +350,10 @@ class ExperimentApiTests(unittest.TestCase):
             params={"search": "NEEDLE", "limit": 10},
         )
         self.assertEqual(
-            [item["name"] for item in description_search.json()],
-            ["Literal %_ Study"],
+            {item["name"] for item in description_search.json()},
+            {"Private needle Study", "Literal %_ Study"},
         )
-        self.assertEqual(description_search.headers["x-total-count"], "1")
+        self.assertEqual(description_search.headers["x-total-count"], "2")
 
         self.assertEqual(
             self.client.get(
