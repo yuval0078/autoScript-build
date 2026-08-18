@@ -105,6 +105,7 @@ class HistoricalAnalysisRepairTests(unittest.TestCase):
                         "words": [word_record(f"word-{index}")],
                     }
                 )
+                payload.pop("app_version")
                 raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
                 key = f"legacy/raw-{index}.json"
                 self.storage.objects[key] = (raw, "application/json")
@@ -227,6 +228,7 @@ class HistoricalAnalysisRepairTests(unittest.TestCase):
                 payload = json.loads(raw)
                 raw_sessions.add(payload["session_id"])
                 self.assertEqual(payload["server_run_id"], str(run.id))
+                self.assertEqual(payload["app_version"], "1.0.3.1")
             self.assertEqual(raw_sessions, {run.session_id})
             self.assertTrue(self.old_raw_keys.isdisjoint(self.storage.objects))
 

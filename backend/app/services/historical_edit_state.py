@@ -240,6 +240,20 @@ def _normalized_raw_result(storage, result, run, session_id, destination: Path):
         ) from exc
     if not isinstance(payload, dict):
         raise HistoricalEditStateError(f"Raw result {result.id} is not a JSON object.")
+    # Historical files predate a few now-required envelope fields.  Only fill
+    # values already stored authoritatively on this Run/Result; never infer or
+    # rewrite experimental word data.
+    payload.setdefault("schema_version", result.schema_version)
+    payload.setdefault("app_version", result.app_version or "legacy")
+    payload.setdefault("experiment_name", run.source_experiment_name)
+    payload.setdefault("experiment_id", None)
+    payload.setdefault("experiment_version", None)
+    payload.setdefault("session_experiment_index", result.block_index)
+    payload.setdefault("session_experiment_count", result.block_count)
+    payload.setdefault("participant_number", run.participant_number)
+    payload.setdefault("participant_age", run.participant_age)
+    payload.setdefault("participant_gender", run.participant_gender)
+    payload.setdefault("timestamp", result.result_timestamp)
     payload["session_id"] = session_id
     payload["server_run_id"] = str(run.id)
     normalized = json.dumps(
