@@ -512,18 +512,6 @@ def _participant_offsets(participants: List[ParticipantData]) -> List[int]:
     return offsets
 
 
-def apply_cloud_source_identity(participant: ParticipantData, source: dict, source_sha256: str):
-    """Attach authoritative cloud identity to a downloaded, possibly legacy, JSON."""
-    participant.server_run_id = source.get('run_id') or participant.server_run_id
-    participant.source_result_id = source.get('id')
-    participant.source_sha256 = source_sha256
-    # Historical raw JSON predates session_id.  Its immutable bytes and SHA must
-    # remain untouched, so the synthetic Run session is applied only to the
-    # in-memory participant loaded for this cloud analysis workspace.
-    if source.get('session_id'):
-        participant.session_id = source['session_id']
-
-
 def build_analysis_state(
     participants: List[ParticipantData],
     participant_indices: List[int],
@@ -1403,7 +1391,6 @@ class PenDataPlayer(QMainWindow):
                     self._context_sources_by_path[os.path.normcase(os.path.abspath(source_path))] = {
                         **source,
                         'run_id': run.get('id'),
-                        'session_id': run.get('session_id'),
                     }
             state_path = run.get('analysis_state_path')
             if not state_path:
@@ -2530,7 +2517,9 @@ class PenDataPlayer(QMainWindow):
                 else:
                     from analysis_local_state import file_sha256
                     source_sha256 = file_sha256(file_path)
-                apply_cloud_source_identity(participant, source, source_sha256)
+                participant.server_run_id = source.get('run_id') or participant.server_run_id
+                participant.source_result_id = source.get('id')
+                participant.source_sha256 = source_sha256
                 self.participants.append(participant)
                 newly_added += 1
                 print(f"Loaded: {file_path} (Participant {participant.participant_number})")

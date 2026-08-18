@@ -15,7 +15,6 @@ from autoscript_api import APICancelled, APIError, PaginatedList
 from analyzer_refactored import (
     ParticipantData,
     PenDataPlayer,
-    apply_cloud_source_identity,
     apply_analysis_state,
     build_analysis_state,
     build_trainable_payload,
@@ -490,25 +489,6 @@ class AnalyzerArtifactTests(unittest.TestCase):
         restored.source_sha256 = "b" * 64
         count = apply_analysis_state([restored], state, {}, {}, {})
         self.assertEqual(count, 0)
-
-    def test_legacy_cloud_source_uses_synthetic_run_session_in_memory(self):
-        participant = self.participant()
-        participant.session_id = None
-        apply_cloud_source_identity(
-            participant,
-            {
-                "run_id": "historical-run-1",
-                "id": "result-1",
-                "session_id": "historical-pilot-p7-20260801",
-            },
-            "a" * 64,
-        )
-        self.assertEqual(participant.server_run_id, "historical-run-1")
-        self.assertEqual(participant.source_result_id, "result-1")
-        self.assertEqual(participant.source_sha256, "a" * 64)
-        self.assertEqual(
-            participant.session_id, "historical-pilot-p7-20260801"
-        )
 
     def test_two_legacy_arrays_restore_by_exact_sha_not_shared_legacy_identity(self):
         with tempfile.TemporaryDirectory() as temp_dir:
