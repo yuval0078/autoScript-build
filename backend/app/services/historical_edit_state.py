@@ -31,6 +31,7 @@ from .raw_results import RawResultValidationError, validate_raw_result
 
 
 MAX_TRAINABLE_BYTES = 100 * 1024 * 1024
+MAX_RAW_BYTES = 512 * 1024 * 1024
 VALID_TRAINABILITY = {"trainable", "low-quality", "untrainable"}
 RESULT_TIMESTAMP_PATTERN = re.compile(r"^(\d{8})_(\d{6})$")
 
@@ -78,7 +79,169 @@ def _load_trainable(raw: bytes, run: ExperimentRun) -> list[dict]:
     return entries
 
 
-def _annotation(word: object, *, participant_number: int) -> dict:
+def _normalized_event(event: object) -> dict:
+    if not isinstance(event, dict):
+        raise HistoricalEditStateError("Stroke events must be JSON objects.")
+    return {key: value for key, value in event.items() if key != "event_id"}
+
+
+def _downsample_events(events: list[dict]) -> list[dict]:
+    """Mirror the historical Analyzer exporter exactly for strict comparison."""
+    if len(events) <= 2:
+        return [_normalized_event(event) for event in events]
+    filtered = []
+    last_kept = None
+    last_kept_time = None
+    for raw_event in events:
+        event = _normalized_event(raw_event)
+        if event.get("type") in {"press", "release"}:
+            filtered.append(event)
+            last_kept = event
+            last_kept_time = event.get("absolute_time", 0)
+            continue
+        if last_kept is None:
+            filtered.append(event)
+            last_kept = event
+            last_kept_time = event.get("absolute_time", 0)
+            continue
+        current_time = event.get("absolute_time", 0)
+        time_delta_ms = (
+            (current_time - last_kept_time) * 1000 if last_kept_time else 0
+        )
+        try:
+            distance = (
+                (event["x"] - last_kept["x"]) ** 2
+                + (event["y"] - last_kept["y"]) ** 2
+            ) ** 0.5
+        except (KeyError, TypeError) as exc:
+            raise HistoricalEditStateError(
+                "Raw pen events are missing coordinates required for stroke matching."
+            ) from exc
+        if time_delta_ms >= 25 or distance >= 3:
+            filtered.append(event)
+            last_kept = event
+            last_kept_time = current_time
+    return filtered
+
+
+def _infer_stroke_slices(
+    raw_word: object,
+    trainable_word: object,
+    *,
+    participant_number: int,
+    word_index: int,
+) -> list[int]:
+    """Recover virtual split points by exact Trainable-stroke/Raw-event matching."""
+    if not isinstance(raw_word, dict):
+        raise HistoricalEditStateError(
+            f"Raw word {word_index + 1} for participant {participant_number} is invalid."
+        )
+    raw_events = raw_word.get("pen_events")
+    trainable_strokes = (
+        trainable_word.get("strokes") if isinstance(trainable_word, dict) else None
+    )
+    if not isinstance(raw_events, list) or not isinstance(trainable_strokes, list):
+        raise HistoricalEditStateError(
+            f"Word {word_index + 1} for participant {participant_number} lacks stroke data."
+        )
+    if not raw_events and not trainable_strokes:
+        return []
+    if not raw_events or not trainable_strokes:
+        raise HistoricalEditStateError(
+            f"Word {word_index + 1} for participant {participant_number} has inconsistent stroke data."
+        )
+
+    targets = []
+    for expected_id, stroke in enumerate(trainable_strokes):
+        if not isinstance(stroke, dict) or stroke.get("stroke_id") != expected_id:
+            raise HistoricalEditStateError(
+                f"Word {word_index + 1} for participant {participant_number} has unordered strokes."
+            )
+        events = stroke.get("events")
+        if not isinstance(events, list) or not events:
+            raise HistoricalEditStateError(
+                f"Word {word_index + 1} for participant {participant_number} has an empty stroke."
+            )
+        targets.append([_normalized_event(event) for event in events])
+    for letter in trainable_word.get("letters", []):
+        for stroke_id in letter.get("stroke_ids", []):
+            if stroke_id >= len(targets):
+                raise HistoricalEditStateError(
+                    f"Word {word_index + 1} for participant {participant_number} "
+                    "references a stroke absent from the original Trainable JSON."
+                )
+
+    normalized_raw = [_normalized_event(event) for event in raw_events]
+    physical_starts = {
+        index
+        for index, event in enumerate(normalized_raw)
+        if event.get("type") == "press"
+    }
+    if not physical_starts:
+        physical_starts = {0}
+    first_start = min(physical_starts)
+    candidates = []
+    for target in targets:
+        candidates.append(
+            [
+                index
+                for index, event in enumerate(normalized_raw)
+                if event == target[0]
+            ]
+        )
+    if first_start not in candidates[0]:
+        raise HistoricalEditStateError(
+            f"Word {word_index + 1} for participant {participant_number} does not match its original first stroke."
+        )
+
+    solutions: list[list[int]] = []
+
+    def search(starts: list[int]):
+        if len(solutions) > 1:
+            return
+        target_index = len(starts) - 1
+        if len(starts) == len(targets):
+            if _downsample_events(raw_events[starts[-1] :]) != targets[-1]:
+                return
+            if not physical_starts.issubset(set(starts)):
+                return
+            solutions.append(list(starts))
+            return
+        for next_start in candidates[len(starts)]:
+            if next_start <= starts[-1]:
+                continue
+            if _downsample_events(raw_events[starts[-1] : next_start]) != targets[target_index]:
+                continue
+            search([*starts, next_start])
+
+    search([first_start])
+    if len(solutions) != 1:
+        reason = "ambiguous" if solutions else "not reproducible"
+        raise HistoricalEditStateError(
+            f"Sliced strokes for word {word_index + 1} of participant "
+            f"{participant_number} are {reason} from the original Raw and Trainable JSON."
+        )
+    starts = solutions[0]
+    slice_points = []
+    for start in starts[1:]:
+        if start in physical_starts:
+            continue
+        split_point = start - 1
+        if normalized_raw[split_point].get("type") != "move":
+            raise HistoricalEditStateError(
+                f"Recovered split {split_point} for participant {participant_number} is invalid."
+            )
+        slice_points.append(split_point)
+    return slice_points
+
+
+def _annotation(
+    word: object,
+    *,
+    participant_number: int,
+    raw_word: object | None = None,
+    word_index: int = 0,
+) -> dict:
     if not isinstance(word, dict):
         raise HistoricalEditStateError(
             f"Trainable JSON for participant {participant_number} contains an invalid word."
@@ -109,7 +272,32 @@ def _annotation(word: object, *, participant_number: int) -> dict:
     if trainability not in VALID_TRAINABILITY:
         raise HistoricalEditStateError("Every trainable word needs a valid trainability value.")
     assigned_letters = word.get("assigned_letters", {})
-    stroke_slices = word.get("stroke_slices", [])
+    stroke_slices = word.get("stroke_slices")
+    if raw_word is not None:
+        inferred_slices = _infer_stroke_slices(
+            raw_word,
+            word,
+            participant_number=participant_number,
+            word_index=word_index,
+        )
+        if stroke_slices is None:
+            stroke_slices = inferred_slices
+        elif stroke_slices != inferred_slices:
+            raise HistoricalEditStateError(
+                f"Stored and reconstructed stroke slices differ for word "
+                f"{word_index + 1} of participant {participant_number}."
+            )
+    if stroke_slices is None:
+        stroke_slices = []
+    if (
+        not isinstance(stroke_slices, list)
+        or any(
+            not isinstance(value, int) or isinstance(value, bool) or value < 0
+            for value in stroke_slices
+        )
+        or len(stroke_slices) != len(set(stroke_slices))
+    ):
+        raise HistoricalEditStateError("Historical stroke_slices must be unique non-negative integers.")
     annotation = {
         "letters": normalized_letters,
         # Old Trainable JSON stores the authoritative letter-to-stroke mapping in
@@ -125,7 +313,12 @@ def _annotation(word: object, *, participant_number: int) -> dict:
     return annotation
 
 
-def _build_state(run: ExperimentRun, trainable_bytes: bytes) -> dict:
+def _build_state(
+    run: ExperimentRun,
+    trainable_bytes: bytes,
+    *,
+    raw_payloads_by_timestamp: dict[str, dict] | None = None,
+) -> dict:
     entries = _load_trainable(trainable_bytes, run)
     by_timestamp: dict[str, dict] = {}
     for entry in entries:
@@ -153,6 +346,20 @@ def _build_state(run: ExperimentRun, trainable_bytes: bytes) -> dict:
             raise HistoricalEditStateError(
                 f"Trainable word count does not match Block {result.block_index}."
             )
+        raw_words = None
+        if raw_payloads_by_timestamp is not None:
+            raw_payload = raw_payloads_by_timestamp.get(result.result_timestamp)
+            if not isinstance(raw_payload, dict) or not isinstance(
+                raw_payload.get("words"), list
+            ):
+                raise HistoricalEditStateError(
+                    f"Raw Block {result.block_index} is missing for stroke reconstruction."
+                )
+            raw_words = raw_payload["words"]
+            if len(raw_words) != len(words):
+                raise HistoricalEditStateError(
+                    f"Raw and Trainable word counts differ for Block {result.block_index}."
+                )
         sources.append(
             {
                 "result_id": str(result.id),
@@ -163,8 +370,13 @@ def _build_state(run: ExperimentRun, trainable_bytes: bytes) -> dict:
                 "block_name": result.block_name,
                 "word_count": result.completed_word_count,
                 "words": [
-                    _annotation(word, participant_number=run.participant_number)
-                    for word in words
+                    _annotation(
+                        word,
+                        participant_number=run.participant_number,
+                        raw_word=raw_words[word_index] if raw_words is not None else None,
+                        word_index=word_index,
+                    )
+                    for word_index, word in enumerate(words)
                 ],
             }
         )
@@ -186,6 +398,37 @@ def _state_bytes(state: dict) -> bytes:
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
+
+
+def _load_raw_payload(storage, result, run) -> dict:
+    if result.size_bytes <= 0 or result.size_bytes > MAX_RAW_BYTES:
+        raise HistoricalEditStateError(f"Raw result {result.id} has an invalid size.")
+    data = bytearray()
+    for chunk in storage.iter_object(result.storage_key):
+        data.extend(chunk)
+        if len(data) > MAX_RAW_BYTES:
+            raise HistoricalEditStateError("Raw result exceeds the migration size limit.")
+    raw = bytes(data)
+    if len(raw) != result.size_bytes:
+        raise HistoricalEditStateError(f"Raw result {result.id} has a size mismatch.")
+    if hashlib.sha256(raw).hexdigest() != result.sha256.lower():
+        raise HistoricalEditStateError(f"Raw result {result.id} has a checksum mismatch.")
+    try:
+        payload = json.loads(raw.decode("utf-8-sig"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise HistoricalEditStateError(f"Raw result {result.id} is invalid JSON.") from exc
+    if not isinstance(payload, dict) or not isinstance(payload.get("words"), list):
+        raise HistoricalEditStateError(f"Raw result {result.id} has no words array.")
+    if (
+        str(payload.get("timestamp")) != str(result.result_timestamp)
+        or int(payload.get("participant_number")) != int(run.participant_number)
+        or payload.get("session_id") != run.session_id
+        or len(payload["words"]) != result.completed_word_count
+    ):
+        raise HistoricalEditStateError(
+            f"Raw result {result.id} identity does not match its Run metadata."
+        )
+    return payload
 
 
 def _state_artifact(run: ExperimentRun):
@@ -495,6 +738,182 @@ def repair_historical_analysis_sessions(
             database.commit()
             committed = True
             drain_object_deletions(database, storage)
+            return summary
+        except Exception:
+            if not committed:
+                database.rollback()
+                for storage_key in reversed(created_storage_keys):
+                    try:
+                        storage.remove_object(storage_key)
+                    except Exception:
+                        pass
+            raise
+
+
+def rebuild_edit_states_from_original_trainable(
+    database,
+    storage,
+    *,
+    actor_username: str = "admin",
+    experiment_name: str | None = None,
+    apply: bool = False,
+):
+    """Rebuild current editable state from immutable, flat imported Trainable JSON.
+
+    Finalized/current exports are deliberately ignored as inputs.  Raw results
+    and every original artifact remain byte-exact; only a new draft
+    ``analysis_state`` revision may be created.
+    """
+    actor = database.scalar(
+        select(User).where(
+            User.username == actor_username,
+            User.role == "admin",
+            User.is_active.is_(True),
+        )
+    )
+    if actor is None:
+        raise HistoricalEditStateError("The migration actor must be an active administrator.")
+
+    statement = select(ExperimentRun).options(
+        selectinload(ExperimentRun.experiment),
+        selectinload(ExperimentRun.results),
+        selectinload(ExperimentRun.artifacts),
+        selectinload(ExperimentRun.analysis_revisions).selectinload(
+            RunAnalysisRevision.artifacts
+        ),
+        selectinload(ExperimentRun.current_analysis_revision).selectinload(
+            RunAnalysisRevision.artifacts
+        ),
+    )
+    if experiment_name is not None:
+        statement = statement.join(Experiment).where(
+            func.lower(Experiment.name) == str(experiment_name).lower(),
+            Experiment.archived_at.is_(None),
+        )
+    runs = list(database.scalars(statement.order_by(ExperimentRun.id)))
+
+    prepared = []
+    unchanged = []
+    verified_words = 0
+    sliced_words = 0
+    recovered_slice_points = 0
+    with tempfile.TemporaryDirectory(prefix="autoscript-original-trainable-rebuild-") as temporary:
+        root = Path(temporary)
+        for run in runs:
+            original_trainables = [
+                artifact
+                for artifact in run.artifacts
+                if artifact.kind == "trainable_json"
+                and artifact.analysis_revision_id is None
+            ]
+            if not original_trainables:
+                continue
+            if len(original_trainables) != 1:
+                raise HistoricalEditStateError(
+                    f"Participant {run.participant_number} has ambiguous original Trainable JSON copies."
+                )
+            trainable = original_trainables[0]
+            raw_payloads = {}
+            for result in run.results:
+                timestamp = str(result.result_timestamp)
+                if timestamp in raw_payloads:
+                    raise HistoricalEditStateError(
+                        f"Participant {run.participant_number} has duplicate Raw timestamps."
+                    )
+                raw_payloads[timestamp] = _load_raw_payload(storage, result, run)
+
+            state = _build_state(
+                run,
+                _read_artifact(storage, trainable),
+                raw_payloads_by_timestamp=raw_payloads,
+            )
+            state_path = root / f"{run.id}.json"
+            state_path.write_bytes(_state_bytes(state))
+            try:
+                validated = validate_analysis_state(state_path, run)
+            except AnalysisValidationError as exc:
+                raise HistoricalEditStateError(str(exc)) from exc
+
+            for source in state["sources"]:
+                for word in source["words"]:
+                    verified_words += 1
+                    slices = word.get("stroke_slices", [])
+                    if slices:
+                        sliced_words += 1
+                        recovered_slice_points += len(slices)
+
+            current = _state_artifact(run)
+            if (
+                current is not None
+                and current.sha256 == validated.sha256
+                and current.size_bytes == validated.size_bytes
+            ):
+                unchanged.append(run)
+                continue
+            prepared.append((run, trainable, state_path, validated))
+
+        summary = {
+            "eligible_runs": len(prepared) + len(unchanged),
+            "new_edit_states": len(prepared),
+            "unchanged_runs": len(unchanged),
+            "verified_words": verified_words,
+            "sliced_words": sliced_words,
+            "recovered_slice_points": recovered_slice_points,
+            "participants": sorted(run.participant_number for run, *_rest in prepared),
+            "source": "original_flat_trainable_json_only",
+            "raw_results_modified": 0,
+            "original_artifacts_modified": 0,
+            "applied": bool(apply),
+        }
+        if not apply:
+            return summary
+
+        created_storage_keys = []
+        committed = False
+        try:
+            for run, trainable, state_path, validated in prepared:
+                revision = RunAnalysisRevision(
+                    id=uuid.uuid4(),
+                    run_id=run.id,
+                    revision_number=_next_revision_number(run),
+                    source_fingerprint=validated.source_fingerprint,
+                    finalized=False,
+                    completed=None,
+                    finalized_at=None,
+                    created_by=actor.id,
+                )
+                artifact_id = uuid.uuid4()
+                state_key = (
+                    f"experiments/{run.experiment_id}/runs/{run.id}/analysis/"
+                    f"{revision.revision_number}/{revision.id}/analysis_state/"
+                    f"{artifact_id}/{validated.sha256}.json"
+                )
+                state_artifact = RunArtifact(
+                    id=artifact_id,
+                    run_id=run.id,
+                    analysis_revision_id=revision.id,
+                    kind="analysis_state",
+                    storage_key=state_key,
+                    original_filename="analysis_state.json",
+                    sha256=validated.sha256,
+                    size_bytes=validated.size_bytes,
+                    created_by=actor.id,
+                )
+                operation = RunAnalysisOperation(
+                    id=uuid.uuid4(),
+                    run_id=run.id,
+                    request_id=f"original-trainable-rebuild-v1-{trainable.sha256[:24]}",
+                    operation_kind="state",
+                    request_sha256=validated.sha256,
+                    revision_id=revision.id,
+                    revision_number=revision.revision_number,
+                )
+                created_storage_keys.append(state_key)
+                storage.put_file(state_key, state_path, "application/json")
+                database.add_all([revision, state_artifact, operation])
+                run.current_analysis_revision = revision
+            database.commit()
+            committed = True
             return summary
         except Exception:
             if not committed:

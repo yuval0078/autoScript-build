@@ -21,6 +21,9 @@ from app.models import (
 )
 from app.services.analysis import validate_analysis_state
 from app.services.historical_edit_state import (
+    HistoricalEditStateError,
+    _infer_stroke_slices,
+    rebuild_edit_states_from_original_trainable,
     repair_historical_analysis_sessions,
     seed_historical_edit_states,
 )
@@ -91,6 +94,14 @@ class HistoricalAnalysisRepairTests(unittest.TestCase):
             timestamps = ["20260801_120000", "20260801_120500"]
             results = []
             for index, timestamp in enumerate(timestamps, start=1):
+                pen_events = [
+                    {"type": "press", "x": 0, "y": 0, "pressure": 0.5, "timestamp": 0, "absolute_time": 1.00, "speed": 0},
+                    {"type": "move", "x": 1, "y": 0, "pressure": 0.5, "timestamp": 10, "absolute_time": 1.01, "speed": 1},
+                    {"type": "move", "x": 4, "y": 0, "pressure": 0.5, "timestamp": 20, "absolute_time": 1.02, "speed": 1},
+                    {"type": "move", "x": 5, "y": 0, "pressure": 0.5, "timestamp": 30, "absolute_time": 1.03, "speed": 1},
+                    {"type": "move", "x": 8, "y": 0, "pressure": 0.5, "timestamp": 40, "absolute_time": 1.04, "speed": 1},
+                    {"type": "release", "x": 9, "y": 0, "pressure": 0, "timestamp": 50, "absolute_time": 1.05, "speed": 0},
+                ]
                 payload = raw_result(
                     str(experiment.id), block_index=index, block_count=2
                 )
@@ -102,7 +113,12 @@ class HistoricalAnalysisRepairTests(unittest.TestCase):
                         "timestamp": timestamp,
                         "completed_word_count": 1,
                         "expected_word_count": 1,
-                        "words": [word_record(f"word-{index}")],
+                        "words": [
+                            {
+                                **word_record(f"word-{index}"),
+                                "pen_events": pen_events,
+                            }
+                        ],
                     }
                 )
                 payload.pop("app_version")
@@ -140,6 +156,17 @@ class HistoricalAnalysisRepairTests(unittest.TestCase):
                             "letters": [{"char": str(index), "stroke_ids": [0]}],
                             "written_word": f"edited-{index}",
                             "trainability": "trainable",
+                            "strokes": [
+                                {"stroke_id": 0, "events": [
+                                    {"type": "press", "x": 0, "y": 0, "pressure": 0.5, "timestamp": 0, "absolute_time": 1.00, "speed": 0},
+                                    {"type": "move", "x": 4, "y": 0, "pressure": 0.5, "timestamp": 20, "absolute_time": 1.02, "speed": 1},
+                                ]},
+                                {"stroke_id": 1, "events": [
+                                    {"type": "move", "x": 5, "y": 0, "pressure": 0.5, "timestamp": 30, "absolute_time": 1.03, "speed": 1},
+                                    {"type": "move", "x": 8, "y": 0, "pressure": 0.5, "timestamp": 40, "absolute_time": 1.04, "speed": 1},
+                                    {"type": "release", "x": 9, "y": 0, "pressure": 0, "timestamp": 50, "absolute_time": 1.05, "speed": 0},
+                                ]},
+                            ],
                         }
                     ],
                 }
@@ -254,6 +281,77 @@ class HistoricalAnalysisRepairTests(unittest.TestCase):
             self.assertEqual(retried["new_sessions"], 0)
             self.assertEqual(retried["unchanged_runs"], 1)
             self.assertEqual(len(self.storage.objects), object_count)
+
+    def test_original_trainable_rebuild_recovers_slices_without_mutating_sources(self):
+        with self.sessions() as database:
+            repair_historical_analysis_sessions(
+                database, self.storage, experiment_name="pilot", apply=True
+            )
+        original_objects = dict(self.storage.objects)
+
+        with self.sessions() as database:
+            dry_run = rebuild_edit_states_from_original_trainable(
+                database, self.storage, experiment_name="pilot", apply=False
+            )
+            self.assertEqual(dry_run["eligible_runs"], 1)
+            self.assertEqual(dry_run["new_edit_states"], 1)
+            self.assertEqual(dry_run["verified_words"], 2)
+            self.assertEqual(dry_run["sliced_words"], 2)
+            self.assertEqual(dry_run["recovered_slice_points"], 2)
+            self.assertEqual(dry_run["raw_results_modified"], 0)
+
+        with self.sessions() as database:
+            applied = rebuild_edit_states_from_original_trainable(
+                database, self.storage, experiment_name="pilot", apply=True
+            )
+            self.assertTrue(applied["applied"])
+            run = self._run(database)
+            state_artifact = next(
+                artifact
+                for artifact in run.current_analysis_revision.artifacts
+                if artifact.kind == "analysis_state"
+            )
+            state = json.loads(self.storage.objects[state_artifact.storage_key][0])
+            self.assertEqual(
+                [source["words"][0]["stroke_slices"] for source in state["sources"]],
+                [[2], [2]],
+            )
+            self.assertEqual(
+                [source["words"][0]["written_word"] for source in state["sources"]],
+                ["edited-1", "edited-2"],
+            )
+
+        for key, value in original_objects.items():
+            self.assertEqual(self.storage.objects[key], value)
+        object_count = len(self.storage.objects)
+        with self.sessions() as database:
+            retried = rebuild_edit_states_from_original_trainable(
+                database, self.storage, experiment_name="pilot", apply=True
+            )
+            self.assertEqual(retried["new_edit_states"], 0)
+            self.assertEqual(retried["unchanged_runs"], 1)
+            self.assertEqual(len(self.storage.objects), object_count)
+
+    def test_slice_reconstruction_rejects_ambiguous_boundaries(self):
+        press = {"type": "press", "x": 0, "y": 0, "pressure": 0.5, "timestamp": 0, "absolute_time": 1.0, "speed": 0}
+        kept = {"type": "move", "x": 4, "y": 0, "pressure": 0.5, "timestamp": 10, "absolute_time": 1.01, "speed": 1}
+        repeated = {"type": "move", "x": 5, "y": 0, "pressure": 0.5, "timestamp": 20, "absolute_time": 1.02, "speed": 1}
+        release = {"type": "release", "x": 6, "y": 0, "pressure": 0, "timestamp": 30, "absolute_time": 1.03, "speed": 0}
+        raw_word = {"pen_events": [press, kept, repeated, repeated, release]}
+        trainable_word = {
+            "letters": [{"char": "x", "stroke_ids": [0, 1]}],
+            "strokes": [
+                {"stroke_id": 0, "events": [press, kept]},
+                {"stroke_id": 1, "events": [repeated, release]},
+            ],
+        }
+        with self.assertRaisesRegex(HistoricalEditStateError, "ambiguous"):
+            _infer_stroke_slices(
+                raw_word,
+                trainable_word,
+                participant_number=7,
+                word_index=0,
+            )
 
 
 if __name__ == "__main__":
