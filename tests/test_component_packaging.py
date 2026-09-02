@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import base64
 import hashlib
+import inspect
 import json
 import os
 import tempfile
@@ -495,6 +496,16 @@ class ComponentArtifactContractTests(unittest.TestCase):
         private_key.public_key().verify(signature, catalog_raw)
         self.assertEqual(envelope["signatures"][0]["key_id"], "release-2026-08")
         self.assertEqual(set(catalog["components"]), set(self.EXPECTED_COMPONENTS))
+        self.assertEqual(catalog["published_at"], "2026-08-08T00:00:00Z")
+        self.assertEqual(catalog["expires_at"], "2027-02-04T00:00:00Z")
+
+    def test_catalog_validity_is_bounded(self):
+        parameters = inspect.signature(create_signed_catalog).parameters
+        self.assertEqual(parameters["validity_days"].default, 180)
+        source = (ROOT / "scripts" / "create_signed_update_catalog.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("1 <= validity_days <= 365", source)
 
     EXPECTED_COMPONENTS = ("interface", "builder", "runner", "analyzer")
 
@@ -521,6 +532,8 @@ class ComponentArtifactContractTests(unittest.TestCase):
         self.assertIn("create_draft_release", workflow)
         self.assertIn("AUTOSCRIPT_UPDATE_SIGNING_KEY", workflow)
         self.assertIn("create_signed_update_catalog.py", workflow)
+        self.assertIn("catalog_validity_days", workflow)
+        self.assertIn("--validity-days", workflow)
         self.assertIn("--draft", workflow)
         self.assertIn("gh release list", workflow)
         self.assertNotIn("gh release view $tag", workflow)

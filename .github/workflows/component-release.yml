@@ -19,6 +19,11 @@ on:
         required: true
         type: boolean
         default: false
+      catalog_validity_days:
+        description: "Signed update catalog validity in days (1-365)"
+        required: true
+        type: number
+        default: 180
 
 jobs:
   build-component:
@@ -202,6 +207,7 @@ jobs:
             --tag $tag `
             --sequence $env:GITHUB_RUN_NUMBER `
             --trust update_trust.json `
+            --validity-days "${{ inputs.catalog_validity_days }}" `
             --output-directory release-assets/catalog
           if ($LASTEXITCODE -ne 0) { throw "Catalog signing failed" }
           "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
@@ -232,5 +238,5 @@ jobs:
             --draft `
             --target $env:GITHUB_SHA `
             --title "AutoScript component builds $tag" `
-            --notes "Draft only. Promote through the signed update-catalog workflow after review."
+            --notes "Verified AutoScript component release. Includes the latest API-backed desktop components and a signed update catalog."
           if ($LASTEXITCODE -ne 0) { throw "Could not create draft release" }

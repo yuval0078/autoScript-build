@@ -27,6 +27,7 @@ from component_versions import COMPONENT_NAMES, parse_component_version
 
 
 KEY_ID = "release-2026-08"
+DEFAULT_VALIDITY_DAYS = 180
 _REPOSITORY_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _TAG_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,100}$")
 _FILENAME_PATTERN = re.compile(r"^[A-Za-z0-9._-]+\.zip$")
@@ -94,6 +95,7 @@ def create_signed_catalog(
     private_seed_b64: str,
     trust_path: Path,
     now: datetime | None = None,
+    validity_days: int = DEFAULT_VALIDITY_DAYS,
 ):
     if not _REPOSITORY_PATTERN.fullmatch(repository):
         raise ValueError("Repository must use the GitHub owner/name form")
@@ -101,6 +103,12 @@ def create_signed_catalog(
         raise ValueError("Release tag contains unsafe characters")
     if isinstance(sequence, bool) or sequence < 1:
         raise ValueError("Catalog sequence must be a positive integer")
+    if (
+        isinstance(validity_days, bool)
+        or not isinstance(validity_days, int)
+        or not 1 <= validity_days <= 365
+    ):
+        raise ValueError("Catalog validity must be between 1 and 365 days")
     components, _source_commit = _load_artifacts(artifacts_root)
 
     try:
@@ -145,7 +153,7 @@ def create_signed_catalog(
         "sequence": sequence,
         "channel": "stable",
         "published_at": _rfc3339(published_at),
-        "expires_at": _rfc3339(published_at + timedelta(days=30)),
+        "expires_at": _rfc3339(published_at + timedelta(days=validity_days)),
         "components": catalog_components,
     }
     catalog_raw = json.dumps(
@@ -176,6 +184,12 @@ def main(arguments=None):
     parser.add_argument("--sequence", required=True, type=int)
     parser.add_argument("--trust", required=True, type=Path)
     parser.add_argument("--output-directory", required=True, type=Path)
+    parser.add_argument(
+        "--validity-days",
+        type=int,
+        default=DEFAULT_VALIDITY_DAYS,
+        help="Signed catalog lifetime in days (1-365; default: 180)",
+    )
     args = parser.parse_args(arguments)
 
     signing_seed = os.environ.get("AUTOSCRIPT_UPDATE_SIGNING_KEY", "").strip()
@@ -190,6 +204,7 @@ def main(arguments=None):
         sequence=args.sequence,
         private_seed_b64=signing_seed,
         trust_path=args.trust,
+        validity_days=args.validity_days,
     )
     args.output_directory.mkdir(parents=True, exist_ok=True)
     (args.output_directory / "autoscript-update-catalog.json").write_bytes(catalog_raw)

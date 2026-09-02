@@ -22,6 +22,12 @@ version, exact byte length, SHA-256 digest, entry point, protocol version and
 minimum launcher version for every component. The client accepts a catalog
 only after an Ed25519 signature verifies against `update_trust.json`.
 
+New release catalogs are valid for 180 days by default. The manual release
+workflow accepts a bounded 1-365 day validity period. Expiration prevents a new
+install or update from trusting stale release metadata; it does not disable
+components that are already installed. Publishing the next signed release
+renews the validity window.
+
 Each component ZIP also contains a root `component.json`. The updater verifies
 that its component ID, version, platform, architecture, entry point, protocol
 and source commit agree with the signed catalog before activation. An archive

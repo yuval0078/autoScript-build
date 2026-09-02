@@ -176,10 +176,10 @@ class ComponentVersionTests(unittest.TestCase):
         self.assertEqual(
             versions,
             {
-                "interface": "0.2",
-                "builder": "0.0",
-                "runner": "0.0",
-                "analyzer": "0.3",
+                "interface": "0.3",
+                "builder": "0.1",
+                "runner": "0.1",
+                "analyzer": "0.4",
             },
         )
 
