@@ -15,6 +15,7 @@ from app.main import create_app
 from app.models import (
     AccessToken,
     Base,
+    DeviceToken,
     Experiment,
     ExperimentRevision,
     ExperimentRevisionBlock,
@@ -92,6 +93,94 @@ class AuthenticationApiTests(unittest.TestCase):
                 event_type="logout"
             ).all()
         self.assertEqual(len(logout_events), 1)
+
+    def test_admin_can_create_use_list_and_revoke_device_token(self):
+        admin = self.login("admin", "admin-password")
+        denied = self.client.post(
+            "/api/v1/auth/device-tokens",
+            headers=self.headers(admin),
+            json={"label": "Current Windows device", "password": "wrong-password"},
+        )
+        self.assertEqual(denied.status_code, 401, denied.text)
+
+        created = self.client.post(
+            "/api/v1/auth/device-tokens",
+            headers=self.headers(admin),
+            json={
+                "label": "Current Windows device",
+                "password": "admin-password",
+            },
+        )
+        self.assertEqual(created.status_code, 201, created.text)
+        self.assertEqual(created.headers["cache-control"], "no-store")
+        raw_token = created.json()["device_token"]
+        self.assertTrue(raw_token.startswith("asd_"))
+        self.assertNotIn("expires_at", created.json())
+
+        with self.sessions() as database:
+            stored = database.query(DeviceToken).one()
+            self.assertEqual(stored.label, "Current Windows device")
+            self.assertEqual(stored.token_hash, hash_token(raw_token))
+            self.assertNotEqual(stored.token_hash, raw_token)
+
+        device_headers = self.headers(raw_token)
+        me = self.client.get("/api/v1/auth/me", headers=device_headers)
+        self.assertEqual(me.status_code, 200, me.text)
+        self.assertEqual(me.json()["username"], "admin")
+        listed = self.client.get(
+            "/api/v1/auth/device-tokens", headers=device_headers
+        )
+        self.assertEqual(listed.status_code, 200, listed.text)
+        self.assertEqual(listed.json()[0]["label"], "Current Windows device")
+        self.assertNotIn("device_token", listed.json()[0])
+
+        revoked = self.client.delete(
+            f"/api/v1/auth/device-tokens/{created.json()['id']}",
+            headers=device_headers,
+        )
+        self.assertEqual(revoked.status_code, 204, revoked.text)
+        self.assertEqual(
+            self.client.get("/api/v1/auth/me", headers=device_headers).status_code,
+            401,
+        )
+        with self.sessions() as database:
+            event_types = {
+                event.event_type for event in database.query(SecurityEvent).all()
+            }
+        self.assertIn("device_token_created", event_types)
+        self.assertIn("device_token_revoked", event_types)
+
+    def test_non_admin_cannot_create_device_token_and_password_change_revokes_it(self):
+        researcher = self.login("researcher", "research-password")
+        forbidden = self.client.post(
+            "/api/v1/auth/device-tokens",
+            headers=self.headers(researcher),
+            json={"label": "Forbidden", "password": "research-password"},
+        )
+        self.assertEqual(forbidden.status_code, 403, forbidden.text)
+
+        admin = self.login("admin", "admin-password")
+        created = self.client.post(
+            "/api/v1/auth/device-tokens",
+            headers=self.headers(admin),
+            json={"label": "Admin shell", "password": "admin-password"},
+        )
+        self.assertEqual(created.status_code, 201, created.text)
+        raw_token = created.json()["device_token"]
+        me = self.client.get("/api/v1/auth/me", headers=self.headers(admin))
+        admin_id = me.json()["id"]
+        changed = self.client.patch(
+            f"/api/v1/users/{admin_id}",
+            headers=self.headers(admin),
+            json={"password": "new-admin-password"},
+        )
+        self.assertEqual(changed.status_code, 200, changed.text)
+        self.assertEqual(
+            self.client.get(
+                "/api/v1/auth/me", headers=self.headers(raw_token)
+            ).status_code,
+            401,
+        )
 
     def test_admin_user_management_and_shared_lab_workspace(self):
         admin = self.login("admin", "admin-password")

@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 
 from .config import get_settings
 from .database import get_db
-from .models import AccessToken, User
+from .models import AccessToken, DeviceToken, User
 from .services.auth import hash_token
 
 
@@ -15,7 +15,7 @@ bearer_auth = HTTPBearer(
     auto_error=False,
     bearerFormat="opaque access token",
     description=(
-        "AutoScript access token returned by POST /api/v1/auth/login. "
+        "AutoScript access or device token. "
         "Local development mode may use its configured local actor without a token."
     ),
 )
@@ -40,17 +40,30 @@ def get_current_user(
         scheme, _, raw_token = authorization.partition(" ")
         if scheme.lower() != "bearer" or not raw_token:
             raise HTTPException(status_code=401, detail="Invalid Authorization header.")
-        token = database.scalar(
-            select(AccessToken).where(
-                AccessToken.token_hash == hash_token(raw_token),
-                AccessToken.revoked_at.is_(None),
+        token_hash = hash_token(raw_token)
+        if raw_token.startswith("asd_"):
+            token = database.scalar(
+                select(DeviceToken).where(
+                    DeviceToken.token_hash == token_hash,
+                    DeviceToken.revoked_at.is_(None),
+                )
             )
-        )
-        expires_at = token.expires_at if token is not None else None
-        if expires_at is not None and expires_at.tzinfo is None:
-            expires_at = expires_at.replace(tzinfo=timezone.utc)
-        if token is None or expires_at <= datetime.now(timezone.utc):
-            raise HTTPException(status_code=401, detail="Access token is invalid or expired.")
+            if token is None:
+                raise HTTPException(status_code=401, detail="Device token is invalid or revoked.")
+        else:
+            token = database.scalar(
+                select(AccessToken).where(
+                    AccessToken.token_hash == token_hash,
+                    AccessToken.revoked_at.is_(None),
+                )
+            )
+            expires_at = token.expires_at if token is not None else None
+            if expires_at is not None and expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=timezone.utc)
+            if token is None or expires_at <= datetime.now(timezone.utc):
+                raise HTTPException(
+                    status_code=401, detail="Access token is invalid or expired."
+                )
         user = database.get(User, token.user_id)
         if user is None or not user.is_active:
             raise HTTPException(status_code=401, detail="User account is inactive.")

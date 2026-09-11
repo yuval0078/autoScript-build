@@ -51,6 +51,10 @@ class MigrationTests(unittest.TestCase):
                     column["name"]
                     for column in inspector.get_columns("security_events")
                 }
+                run_columns = {
+                    column["name"]
+                    for column in inspector.get_columns("experiment_runs")
+                }
             finally:
                 engine.dispose()
 
@@ -59,6 +63,7 @@ class MigrationTests(unittest.TestCase):
                 {
                     "alembic_version",
                     "access_tokens",
+                    "device_tokens",
                     "users",
                     "experiments",
                     "experiment_blocks",
@@ -78,6 +83,7 @@ class MigrationTests(unittest.TestCase):
                 },
             )
             self.assertIn("current_revision_id", experiment_columns)
+            self.assertIn("is_test", run_columns)
             self.assertTrue(
                 {"request_id", "expires_at", "consumed_at"}.issubset(staged_columns)
             )

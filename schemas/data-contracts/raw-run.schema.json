@@ -65,6 +65,9 @@
     "test_mode": {
       "type": "boolean"
     },
+    "test_run": {
+      "type": "boolean"
+    },
     "block_name": {
       "type": "string",
       "minLength": 1

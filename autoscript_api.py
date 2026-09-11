@@ -334,6 +334,22 @@ class AutoScriptAPI:
         set_session_token(None)
         return result
 
+    def create_device_token(self, label, password):
+        """Create a revocable long-lived token; the secret is returned once."""
+        return self._json_request(
+            "POST",
+            "/api/v1/auth/device-tokens",
+            {"label": str(label), "password": str(password)},
+        )
+
+    def list_device_tokens(self):
+        return self._json_request("GET", "/api/v1/auth/device-tokens")
+
+    def revoke_device_token(self, token_id):
+        return self._json_request(
+            "DELETE", f"/api/v1/auth/device-tokens/{token_id}"
+        )
+
     def list_users(self):
         """Return all application users (administrator only)."""
         return self._json_request("GET", "/api/v1/users")
@@ -365,7 +381,16 @@ class AutoScriptAPI:
             "PATCH", f"/api/v1/users/{user_id}", payload
         )
 
-    def create_run(self, revision_id, session_id, participant_number, participant_age, participant_gender):
+    def create_run(
+        self,
+        revision_id,
+        session_id,
+        participant_number,
+        participant_age,
+        participant_gender,
+        *,
+        is_test=False,
+    ):
         return self._json_request(
             "POST", f"/api/v1/experiment-revisions/{revision_id}/runs",
             {
@@ -373,6 +398,7 @@ class AutoScriptAPI:
                 "participant_number": int(participant_number),
                 "participant_age": int(participant_age),
                 "participant_gender": participant_gender,
+                "is_test": bool(is_test),
             },
         )
 
@@ -417,6 +443,7 @@ class AutoScriptAPI:
         has_raw_data=None,
         has_analyzed_csv=None,
         has_trainable_json=None,
+        is_test=None,
         include_files=None,
         limit=None,
         cursor=None,
@@ -430,6 +457,7 @@ class AutoScriptAPI:
             has_raw_data=has_raw_data,
             has_analyzed_csv=has_analyzed_csv,
             has_trainable_json=has_trainable_json,
+            is_test=is_test,
             include_files=include_files,
             limit=limit,
             cursor=cursor,

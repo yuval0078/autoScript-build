@@ -207,6 +207,7 @@ class ResultApiTests(unittest.TestCase):
         incomplete_payload.update(
             {
                 "participant_number": 9,
+                "test_run": True,
                 "session_id": "9_20260807_120001_abcdee",
                 "block_completed": False,
                 "experiment_completed": False,
@@ -220,6 +221,11 @@ class ResultApiTests(unittest.TestCase):
             "incomplete-participant.json",
         )
         self.assertEqual(incomplete_result.status_code, 201, incomplete_result.text)
+        self.assertTrue(
+            self.client.get(f"/api/v1/runs/{incomplete_result.json()['run_id']}").json()[
+                "is_test"
+            ]
+        )
 
         shared_timestamp = datetime(2026, 8, 10, 11, 0, tzinfo=timezone.utc)
         with self.session_factory() as session:
@@ -382,6 +388,20 @@ class ResultApiTests(unittest.TestCase):
             {run["session_id"] for run in no_raw.json()},
             {"literal%_session", "literalXXsession"},
         )
+        test_only = self.client.get(
+            runs_url,
+            params={"is_test": "true", "limit": 10},
+        )
+        self.assertEqual(test_only.status_code, 200, test_only.text)
+        self.assertEqual(
+            [run["participant_number"] for run in test_only.json()],
+            [9],
+        )
+        regular_only = self.client.get(
+            runs_url,
+            params={"is_test": "false", "limit": 10},
+        )
+        self.assertEqual(regular_only.headers["x-total-count"], "3")
 
         self.assertEqual(
             self.client.get(runs_url, params={"cursor": "opaque"}).status_code,
@@ -545,6 +565,7 @@ class ResultApiTests(unittest.TestCase):
             "participant_number": 7,
             "participant_age": 25,
             "participant_gender": "Other",
+            "is_test": True,
         }
         created = self.client.post(
             f"/api/v1/experiment-revisions/{revision_id}/runs", json=create_payload
@@ -552,6 +573,7 @@ class ResultApiTests(unittest.TestCase):
         self.assertEqual(created.status_code, 201, created.text)
         run_id = created.json()["id"]
         self.assertEqual(created.json()["status"], "created")
+        self.assertTrue(created.json()["is_test"])
         retried = self.client.post(
             f"/api/v1/experiment-revisions/{revision_id}/runs", json=create_payload
         )
@@ -565,6 +587,7 @@ class ResultApiTests(unittest.TestCase):
                 "experiment_revision_id": str(revision_id),
                 "experiment_revision_number": 1,
                 "server_run_id": run_id,
+                "test_run": True,
                 "block_id": str(revision.blocks[block_index - 1].id),
             })
             content = json.dumps(payload).encode("utf-8")

@@ -25,6 +25,7 @@ class RawResultMetadata:
     experiment_revision_id: str | None
     experiment_revision_number: int | None
     server_run_id: str | None
+    is_test: bool
     block_name: str
     source_block_id: str | None
     block_index: int
@@ -144,6 +145,7 @@ def validate_raw_result(result_path) -> RawResultMetadata:
             None if payload.get("server_run_id") is None
             else str(payload["server_run_id"])
         ),
+        is_test=bool(payload.get("test_run", payload.get("test_mode", False))),
         block_name=payload.get("block_name") or payload["experiment_name"],
         source_block_id=None if source_block_id is None else str(source_block_id),
         block_index=block_index,

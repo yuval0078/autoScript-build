@@ -40,5 +40,9 @@ def issue_token() -> str:
     return secrets.token_urlsafe(48)
 
 
+def issue_device_token() -> str:
+    return "asd_" + secrets.token_urlsafe(48)
+
+
 def hash_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()

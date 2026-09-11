@@ -11,6 +11,7 @@ class RunCreate(BaseModel):
     participant_number: int = Field(gt=0)
     participant_age: int = Field(gt=0)
     participant_gender: str = Field(min_length=1, max_length=32)
+    is_test: bool = False
 
 
 class RunArtifactResponse(BaseModel):
@@ -123,6 +124,7 @@ class ExperimentRunResponse(BaseModel):
     participant_number: int
     participant_age: int
     participant_gender: str
+    is_test: bool
     block_count: int
     source_experiment_name: str
     source_experiment_id: str | None

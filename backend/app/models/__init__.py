@@ -14,7 +14,7 @@ from .experiment import (
     RunResult,
     StagedBlockAsset,
 )
-from .user import AccessToken, User
+from .user import AccessToken, DeviceToken, User
 
 __all__ = [
     "Base",
@@ -33,4 +33,5 @@ __all__ = [
     "StagedBlockAsset",
     "User",
     "AccessToken",
+    "DeviceToken",
 ]

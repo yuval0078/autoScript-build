@@ -25,6 +25,9 @@ class User(UUIDPrimaryKeyMixin, CreatedAtMixin, Base):
     tokens: Mapped[list["AccessToken"]] = relationship(
         back_populates="user", cascade="all, delete-orphan", passive_deletes=True
     )
+    device_tokens: Mapped[list["DeviceToken"]] = relationship(
+        back_populates="user", cascade="all, delete-orphan", passive_deletes=True
+    )
 
 
 class AccessToken(UUIDPrimaryKeyMixin, CreatedAtMixin, Base):
@@ -41,3 +44,24 @@ class AccessToken(UUIDPrimaryKeyMixin, CreatedAtMixin, Base):
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     user: Mapped[User] = relationship(back_populates="tokens")
+
+
+class DeviceToken(UUIDPrimaryKeyMixin, CreatedAtMixin, Base):
+    """Long-lived, individually revocable token stored as a one-way hash."""
+
+    __tablename__ = "device_tokens"
+    __table_args__ = (
+        UniqueConstraint("token_hash"),
+        Index("ix_device_tokens_token_hash", "token_hash", unique=True),
+    )
+
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    label: Mapped[str] = mapped_column(String(100), nullable=False)
+    token_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    user: Mapped[User] = relationship(back_populates="device_tokens")

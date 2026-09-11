@@ -9,12 +9,27 @@ from sqlalchemy.orm import Session
 from ..config import get_settings
 from ..database import get_db
 from ..dependencies import get_current_user, require_admin
-from ..models import AccessToken, User
-from ..schemas.auth import LoginRequest, TokenResponse, UserCreate, UserResponse, UserUpdate
+from ..models import AccessToken, DeviceToken, User
+from ..schemas.auth import (
+    DeviceTokenCreate,
+    DeviceTokenIssuedResponse,
+    DeviceTokenResponse,
+    LoginRequest,
+    TokenResponse,
+    UserCreate,
+    UserResponse,
+    UserUpdate,
+)
 from ..schemas.security import SecurityEventResponse
 from ..security_models import SecurityEvent
 from ..security_settings import get_security_settings
-from ..services.auth import hash_password, hash_token, issue_token, verify_password
+from ..services.auth import (
+    hash_password,
+    hash_token,
+    issue_device_token,
+    issue_token,
+    verify_password,
+)
 from ..services.security import (
     cleanup_security_state,
     client_address_hash,
@@ -29,6 +44,7 @@ from ..services.security import (
 
 
 router = APIRouter(prefix="/api/v1", tags=["authentication"])
+MAX_ACTIVE_DEVICE_TOKENS = 10
 
 _DUMMY_PASSWORD_HASH = (
     "pbkdf2_sha256$600000$ujEHW9ceS_1zl9ScxwywqA==$"
@@ -40,6 +56,15 @@ def _user_response(user):
     return UserResponse(
         id=user.id, username=user.username, role=user.role,
         is_active=user.is_active, created_at=user.created_at,
+    )
+
+
+def _device_token_response(token):
+    return DeviceTokenResponse(
+        id=token.id,
+        label=token.label,
+        created_at=token.created_at,
+        revoked_at=token.revoked_at,
     )
 
 
@@ -196,9 +221,11 @@ def logout(
 ):
     request_id, address_hash = _request_security_context(request)
     if authorization and authorization.lower().startswith("bearer "):
-        token = database.scalar(select(AccessToken).where(
-            AccessToken.token_hash == hash_token(authorization.split(None, 1)[1])
-        ))
+        raw_token = authorization.split(None, 1)[1]
+        token_model = DeviceToken if raw_token.startswith("asd_") else AccessToken
+        token = database.scalar(
+            select(token_model).where(token_model.token_hash == hash_token(raw_token))
+        )
         if token is not None:
             token.revoked_at = utc_now()
     record_security_event(
@@ -220,6 +247,122 @@ def logout(
 @router.get("/auth/me", response_model=UserResponse)
 def me(actor: User = Depends(get_current_user)):
     return _user_response(actor)
+
+
+@router.post(
+    "/auth/device-tokens",
+    response_model=DeviceTokenIssuedResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_device_token(
+    payload: DeviceTokenCreate,
+    request: Request,
+    response: Response,
+    database: Session = Depends(get_db),
+    actor: User = Depends(require_admin),
+):
+    request_id, address_hash = _request_security_context(request)
+    if not verify_password(payload.password, actor.password_hash):
+        record_security_event(
+            database,
+            "device_token_creation",
+            "denied",
+            actor_user_id=actor.id,
+            subject_user_id=actor.id,
+            username=actor.username,
+            request_id=request_id,
+            address_hash=address_hash,
+            metadata={"reason": "step_up_authentication_failed"},
+        )
+        database.commit()
+        raise HTTPException(status_code=401, detail="Current password is incorrect.")
+
+    active_tokens = database.scalars(
+        select(DeviceToken).where(
+            DeviceToken.user_id == actor.id,
+            DeviceToken.revoked_at.is_(None),
+        )
+    ).all()
+    if len(active_tokens) >= MAX_ACTIVE_DEVICE_TOKENS:
+        raise HTTPException(
+            status_code=409,
+            detail="Revoke an existing device token before creating another.",
+        )
+
+    raw_token = issue_device_token()
+    token = DeviceToken(
+        id=uuid.uuid4(),
+        user_id=actor.id,
+        label=payload.label,
+        token_hash=hash_token(raw_token),
+    )
+    database.add(token)
+    database.flush()
+    record_security_event(
+        database,
+        "device_token_created",
+        "success",
+        actor_user_id=actor.id,
+        subject_user_id=actor.id,
+        username=actor.username,
+        request_id=request_id,
+        address_hash=address_hash,
+        metadata={"device_token_id": str(token.id), "label": token.label},
+    )
+    database.commit()
+    database.refresh(token)
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+    return DeviceTokenIssuedResponse(
+        **_device_token_response(token).model_dump(),
+        device_token=raw_token,
+    )
+
+
+@router.get("/auth/device-tokens", response_model=list[DeviceTokenResponse])
+def list_device_tokens(
+    database: Session = Depends(get_db),
+    actor: User = Depends(require_admin),
+):
+    tokens = database.scalars(
+        select(DeviceToken)
+        .where(DeviceToken.user_id == actor.id)
+        .order_by(DeviceToken.created_at.desc(), DeviceToken.id.desc())
+    ).all()
+    return [_device_token_response(token) for token in tokens]
+
+
+@router.delete("/auth/device-tokens/{token_id}", status_code=status.HTTP_204_NO_CONTENT)
+def revoke_device_token(
+    token_id: uuid.UUID,
+    request: Request,
+    database: Session = Depends(get_db),
+    actor: User = Depends(require_admin),
+):
+    token = database.scalar(
+        select(DeviceToken).where(
+            DeviceToken.id == token_id,
+            DeviceToken.user_id == actor.id,
+        )
+    )
+    if token is None:
+        raise HTTPException(status_code=404, detail="Device token was not found.")
+    if token.revoked_at is None:
+        token.revoked_at = utc_now()
+        request_id, address_hash = _request_security_context(request)
+        record_security_event(
+            database,
+            "device_token_revoked",
+            "success",
+            actor_user_id=actor.id,
+            subject_user_id=actor.id,
+            username=actor.username,
+            request_id=request_id,
+            address_hash=address_hash,
+            metadata={"device_token_id": str(token.id), "label": token.label},
+        )
+        database.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.get("/users", response_model=list[UserResponse])
@@ -284,6 +427,11 @@ def update_user(
         database.execute(
             update(AccessToken)
             .where(AccessToken.user_id == user.id, AccessToken.revoked_at.is_(None))
+            .values(revoked_at=datetime.now(timezone.utc))
+        )
+        database.execute(
+            update(DeviceToken)
+            .where(DeviceToken.user_id == user.id, DeviceToken.revoked_at.is_(None))
             .values(revoked_at=datetime.now(timezone.utc))
         )
     changed_fields = sorted(payload.model_fields_set)

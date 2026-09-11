@@ -142,6 +142,7 @@ def _run_response(run, *, include_files=True, summary=None):
         participant_number=run.participant_number,
         participant_age=run.participant_age,
         participant_gender=run.participant_gender,
+        is_test=run.is_test,
         block_count=run.block_count,
         source_experiment_name=run.source_experiment_name,
         source_experiment_id=run.source_experiment_id,
@@ -465,12 +466,14 @@ def create_experiment_run(
             existing.participant_number,
             existing.participant_age,
             existing.participant_gender,
+            existing.is_test,
         )
         actual = (
             revision.id,
             payload.participant_number,
             payload.participant_age,
             payload.participant_gender,
+            payload.is_test,
         )
         if expected != actual:
             raise HTTPException(status_code=409, detail="Run creation metadata conflicts with the existing session.")
@@ -482,6 +485,7 @@ def create_experiment_run(
         participant_number=payload.participant_number,
         participant_age=payload.participant_age,
         participant_gender=payload.participant_gender,
+        is_test=payload.is_test,
         block_count=len(revision.blocks),
         source_experiment_name=revision.name,
         source_experiment_id=str(revision.experiment_id),
@@ -644,6 +648,7 @@ def _ensure_consistent_run(run, metadata):
         run.source_experiment_name,
         run.source_experiment_id,
         str(run.revision_id) if run.revision_id else None,
+        run.is_test,
     )
     actual = (
         metadata.participant_number,
@@ -653,6 +658,7 @@ def _ensure_consistent_run(run, metadata):
         metadata.experiment_name,
         metadata.source_experiment_id,
         metadata.experiment_revision_id,
+        metadata.is_test,
     )
     if expected != actual:
         raise HTTPException(
@@ -869,6 +875,7 @@ async def upload_result(
                 participant_number=metadata.participant_number,
                 participant_age=metadata.participant_age,
                 participant_gender=metadata.participant_gender,
+                is_test=metadata.is_test,
                 block_count=metadata.block_count,
                 source_experiment_name=metadata.experiment_name,
                 source_experiment_id=metadata.source_experiment_id,
@@ -958,6 +965,10 @@ def list_experiment_runs(
         default=None,
         description="Filter by whether a trainable JSON artifact exists.",
     ),
+    is_test: bool | None = Query(
+        default=None,
+        description="Return only Test Runs or only regular runs.",
+    ),
     include_files: bool = Query(
         default=True,
         description=(
@@ -1009,6 +1020,8 @@ def list_experiment_runs(
         )
     if run_status is not None:
         filters.append(ExperimentRun.status == run_status)
+    if is_test is not None:
+        filters.append(ExperimentRun.is_test.is_(is_test))
 
     has_raw_expression, has_csv_expression, has_json_expression = (
         _run_presence_expressions()

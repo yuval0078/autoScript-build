@@ -277,6 +277,9 @@ class ExperimentRun(UUIDPrimaryKeyMixin, CreatedAtMixin, Base):
     participant_number: Mapped[int] = mapped_column(Integer, nullable=False)
     participant_age: Mapped[int] = mapped_column(Integer, nullable=False)
     participant_gender: Mapped[str] = mapped_column(String(32), nullable=False)
+    is_test: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false", index=True
+    )
     block_count: Mapped[int] = mapped_column(Integer, nullable=False)
     source_experiment_name: Mapped[str] = mapped_column(String(200), nullable=False)
     source_experiment_id: Mapped[Optional[str]] = mapped_column(String(255))
