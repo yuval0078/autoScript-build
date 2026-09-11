@@ -1,3 +1,3 @@
 """Deployment invariants shared by migrations and readiness checks."""
 
-DATABASE_SCHEMA_REVISION = "20260817_0014"
+DATABASE_SCHEMA_REVISION = "20260911_0016"

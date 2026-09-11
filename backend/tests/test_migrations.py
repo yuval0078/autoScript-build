@@ -8,15 +8,28 @@ from unittest.mock import patch
 
 from alembic import command
 from alembic.config import Config
+from alembic.script import ScriptDirectory
 from sqlalchemy import MetaData, Table, create_engine, inspect, select
 
 from app.config import get_settings
+from app.runtime_state import DATABASE_SCHEMA_REVISION
 
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 
 
 class MigrationTests(unittest.TestCase):
+    def test_runtime_schema_revision_matches_migration_head(self):
+        config = Config(str(BACKEND_ROOT / "alembic.ini"))
+        config.set_main_option(
+            "script_location",
+            str(BACKEND_ROOT / "migrations"),
+        )
+
+        migration_head = ScriptDirectory.from_config(config).get_current_head()
+
+        self.assertEqual(DATABASE_SCHEMA_REVISION, migration_head)
+
     def test_migrations_create_current_schema(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             database_path = Path(temp_dir) / "migration.sqlite"
