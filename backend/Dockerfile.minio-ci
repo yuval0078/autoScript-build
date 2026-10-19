@@ -1,0 +1,16 @@
+# CI-only source build of the exact MinIO release used by compose.yml.
+# Upstream public container images are no longer anonymously pullable.
+FROM golang:1.24-bookworm AS build
+RUN git init /src && cd /src \
+    && git remote add origin https://github.com/minio/minio.git \
+    && git fetch --depth 1 origin 01ce918d8279a20e4706b96a64396146894adee4 \
+    && git checkout --detach FETCH_HEAD \
+    && test "$(git rev-parse HEAD)" = "01ce918d8279a20e4706b96a64396146894adee4"
+WORKDIR /src
+RUN CGO_ENABLED=0 go build -trimpath -o /out/minio .
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=build /out/minio /usr/local/bin/minio
+ENTRYPOINT ["/usr/local/bin/minio"]
