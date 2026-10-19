@@ -14,7 +14,7 @@ def create_app():
     settings = get_settings()
     application = FastAPI(
         title=settings.app_name,
-        version="0.8.0",
+        version="0.8.1",
         docs_url="/docs" if settings.environment != "production" else None,
         redoc_url=None,
     )

@@ -14,6 +14,33 @@ All four component versions start at `0.0`. Experiment, Block, raw-result and
 analysis schema versions are separate data-contract versions and must never be
 derived from a component version.
 
+## October 2026 release
+
+The non-ML release advances Interface to 0.4, Builder to 0.2, Runner to 0.2,
+and Analyzer to 0.5. These versions supersede the stable r23 catalog
+(Interface 0.3, Builder 0.1, Runner 0.1, Analyzer 0.4).
+
+- Results are grouped by participant within the selected experiment. Expand a
+  participant to see each original session, its Test label, files and analysis.
+  Group selection selects the currently loaded sessions; Load more adds further
+  sessions to their participant group. Source results and run IDs stay intact.
+- Every signed-in role can open Updates. User administration remains admin-only.
+- Component installs show progress and continue in the background; Interface
+  updates restart the application after activation.
+- Test Run independently chooses Mouse or Tablet input and whether to save.
+  Saved test sessions are labeled TEST and can be filtered in Results. Unsaved
+  tests do not create a cloud Run or retain result files.
+- Interface 0.4 requires managed Runner 0.2 or newer. Runner 0.1 in r23 does not
+  implement the new Test Run/save-results contract despite the older local
+  documentation suggesting otherwise.
+- Experiment downloads pin the selected immutable revision. Published experiments
+  reject legacy block mutations and use the Builder's atomic publication flow.
+- The packaged Interface runs a Qt/results-page smoke check before archiving.
+  ML imports, menus, models and training dependencies are excluded.
+
+Deploy the server block-mutation guard with Builder 0.2. No database migration
+is required beyond the already deployed device-token schema revision.
+
 ## Distribution model
 
 The application does not update by running `git pull`. GitHub Releases stores

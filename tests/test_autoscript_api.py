@@ -364,6 +364,22 @@ class ApiHandler(BaseHTTPRequestHandler):
 
 
 class AutoScriptApiClientTests(unittest.TestCase):
+    def test_download_pins_selected_revision_and_never_falls_back(self):
+        for experiment in (
+            {"id": "experiment", "current_revision": {"id": "revision-1"}},
+            {"id": "experiment", "current_revision_id": "revision-1"},
+        ):
+            with self.subTest(experiment=experiment), patch.object(self.api, "download_version") as download:
+                self.api.download_experiment(experiment, "destination.zip")
+                download.assert_called_once_with(
+                    {"download_url": "/api/v1/experiment-revisions/revision-1/download"},
+                    "destination.zip", progress=None)
+                download.reset_mock()
+                download.side_effect = RuntimeError("revision unavailable")
+                with self.assertRaisesRegex(RuntimeError, "revision unavailable"):
+                    self.api.download_experiment(experiment, "destination.zip")
+                self.assertEqual(download.call_count, 1)
+
     @classmethod
     def setUpClass(cls):
         cls.server = ThreadingHTTPServer(("127.0.0.1", 0), ApiHandler)
@@ -451,6 +467,7 @@ class AutoScriptApiClientTests(unittest.TestCase):
             has_raw_data=True,
             has_analyzed_csv=False,
             has_trainable_json=True,
+            is_test=True,
             include_files=False,
             limit=50,
             cursor="next page",
@@ -469,6 +486,7 @@ class AutoScriptApiClientTests(unittest.TestCase):
             "has_raw_data": ["true"],
             "has_analyzed_csv": ["false"],
             "has_trainable_json": ["true"],
+            "is_test": ["true"],
             "include_files": ["false"],
             "limit": ["50"],
             "cursor": ["next page"],
@@ -757,8 +775,19 @@ class AutoScriptApiClientTests(unittest.TestCase):
         api = AutoScriptAPI(self.api.base_url)
         logged_in = api.login("tester", "long-password")
         self.assertEqual(logged_in["user"]["username"], "tester")
-        run = api.create_run("revision-1", "session-1", 7, 25, "Other")
+        run = api.create_run(
+            "revision-1", "session-1", 7, 25, "Other", is_test=True
+        )
         self.assertEqual(run["status"], "created")
+        create_request = next(
+            request
+            for request in reversed(ApiHandler.requests)
+            if request[:2] == (
+                "POST",
+                "/api/v1/experiment-revisions/revision-1/runs",
+            )
+        )
+        self.assertTrue(create_request[2]["is_test"])
         self.assertEqual(ApiHandler.last_authorization, "Bearer session-token")
         self.assertEqual(api.start_run("run-1")["status"], "running")
         with tempfile.TemporaryDirectory() as temp_dir:

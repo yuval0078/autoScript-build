@@ -47,6 +47,41 @@ class RunnerLaunchContractTests(unittest.TestCase):
         self.assertIn('"run/recalibrate_between_blocks"', source)
         self.assertIn('"run/save_results_locally"', source)
 
+    def test_test_run_prompts_for_device_then_save_choice(self):
+        harness = SimpleNamespace()
+
+        with (
+            patch("gui_menu.QInputDialog.getItem", return_value=("Tablet", True)),
+            patch(
+                "gui_menu.QMessageBox.question",
+                return_value=QMessageBox.Yes,
+            ) as question,
+        ):
+            self.assertEqual(
+                MainMenu._prompt_test_run_options(harness),
+                (False, True),
+            )
+        question.assert_called_once()
+
+        with (
+            patch("gui_menu.QInputDialog.getItem", return_value=("Mouse", True)),
+            patch(
+                "gui_menu.QMessageBox.question",
+                return_value=QMessageBox.No,
+            ),
+        ):
+            self.assertEqual(
+                MainMenu._prompt_test_run_options(harness),
+                (True, False),
+            )
+
+        with (
+            patch("gui_menu.QInputDialog.getItem", return_value=("Mouse", False)),
+            patch("gui_menu.QMessageBox.question") as question,
+        ):
+            self.assertIsNone(MainMenu._prompt_test_run_options(harness))
+        question.assert_not_called()
+
     def test_operator_home_exposes_only_download_and_run_actions(self):
         experiment = {
             "id": "experiment-operator",
@@ -88,6 +123,7 @@ class RunnerLaunchContractTests(unittest.TestCase):
             self.assertNotIn("Open local or legacy ZIP", tooltips)
         finally:
             menu.deleteLater()
+
 
     def test_experiment_card_metadata_pluralizes_blocks_and_distinct_participants(self):
         self.assertEqual(
@@ -250,11 +286,13 @@ class RunnerLaunchContractTests(unittest.TestCase):
                 [ROOT / "block.json"],
                 ROOT / "plan.json",
                 test_mode=True,
+                test_run=True,
             )
         self.assertIs(launched, process)
         call = resolve.call_args
         self.assertEqual(call.args[0], "runner")
         self.assertIn("--test-mode", call.args[1])
+        self.assertIn("--test-run", call.args[1])
         self.assertEqual(call.kwargs["source_script"], "tablet_experiment.py")
         self.assertEqual(call.kwargs["legacy_executable"], "ExperimentRunner.exe")
         self.assertIs(call.kwargs["manager"], manager)
@@ -295,6 +333,39 @@ class RunnerLaunchContractTests(unittest.TestCase):
         ):
             self.assertIsNone(MainMenu.launch_analyzer(harness, []))
         parent.show_component_updates.assert_called_once_with()
+
+    def test_first_install_blocks_launch_but_update_keeps_old_version_usable(self):
+        coordinator = SimpleNamespace(is_installing=lambda component: True)
+        manager = MagicMock()
+        parent = SimpleNamespace(
+            component_manager=manager,
+            component_update_coordinator=coordinator,
+        )
+        harness = SimpleNamespace(
+            parent=parent,
+            _api_child_environment=lambda: {},
+        )
+
+        manager.get_installed_component.return_value = None
+        with (
+            patch("gui_menu.QMessageBox.information") as information,
+            patch("gui_menu.component_launch_command") as resolve,
+        ):
+            self.assertIsNone(MainMenu.launch_analyzer(harness, []))
+        information.assert_called_once()
+        resolve.assert_not_called()
+
+        manager.get_installed_component.return_value = SimpleNamespace(version="0.1")
+        process = MagicMock()
+        with (
+            patch(
+                "gui_menu.component_launch_command",
+                return_value=["Analyzer-0.1.exe"],
+            ) as resolve,
+            patch("gui_menu.subprocess.Popen", return_value=process),
+        ):
+            self.assertIs(MainMenu.launch_analyzer(harness, []), process)
+        resolve.assert_called_once()
 
 
 class ComponentSpecTests(unittest.TestCase):
@@ -377,7 +448,7 @@ class ComponentSpecTests(unittest.TestCase):
                 "audio_processor",
                 "pygame",
                 "pydub",
-                "numpy",
+                "torch",
             }.issubset(forbidden)
         )
         analysis = next(
@@ -393,6 +464,7 @@ class ComponentSpecTests(unittest.TestCase):
             if keyword.arg == "hiddenimports"
         )
         self.assertTrue(forbidden.isdisjoint(hidden_imports))
+        self.assertIn("numpy", forbidden)
         self.assertNotIn("ffmpeg", source.casefold())
 
     def test_only_builder_and_runner_bundle_ffmpeg(self):

@@ -12,6 +12,7 @@ from app_paths import ensure_dir, user_data_dir, asset_path
 from archive_utils import safe_extract_zip
 from autoscript_api import APIError, AutoScriptAPI, get_session_token
 from component_runtime import component_launch_command
+from component_update_manager import CompatibilityError
 from experiment_packages import unpack_experiment_package
 from runner_launch_contract import write_runtime_session_seed
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
@@ -880,6 +881,13 @@ class MainMenu(QWidget):
             QMessageBox.critical(self, "Delete Failed", str(exc))
 
     def _run_cloud_experiment(self, experiment, test_mode=False):
+        mouse_input = False
+        save_results = True
+        if test_mode:
+            options = self._prompt_test_run_options()
+            if options is None:
+                return
+            mouse_input, save_results = options
         try:
             downloads = ensure_dir(user_data_dir() / "server_downloads")
             safe_name = "".join(
@@ -889,12 +897,37 @@ class MainMenu(QWidget):
             package_path = downloads / f"{safe_name}_{experiment['id'][:8]}.zip"
             self.api.download_experiment(experiment, package_path)
             self.load_experiment_zip(
-                test_mode=test_mode,
+                test_mode=mouse_input,
+                test_run=test_mode,
+                save_results=save_results,
                 file_paths=[str(package_path)],
                 parent_experiment=experiment,
             )
         except APIError as exc:
             QMessageBox.critical(self, "Run Failed", str(exc))
+
+    def _prompt_test_run_options(self):
+        """Choose the Test Run input device and whether its results are retained."""
+        device, accepted = QInputDialog.getItem(
+            self,
+            "Test Run Input",
+            "Choose the input device for this Test Run:",
+            ["Mouse", "Tablet"],
+            0,
+            False,
+        )
+        if not accepted:
+            return None
+
+        save_answer = QMessageBox.question(
+            self,
+            "Save Results?",
+            "Save results from this Test Run?\n\n"
+            "Saved results will be labeled Test.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        return device == "Mouse", save_answer == QMessageBox.Yes
 
     def _analyze_cloud_experiment(self, experiment):
         self.parent.open_experiment_results(experiment)
@@ -903,6 +936,8 @@ class MainMenu(QWidget):
         self,
         checked=False,
         test_mode=False,
+        test_run=False,
+        save_results=True,
         file_paths=None,
         parent_experiment=None,
     ):
@@ -1038,6 +1073,9 @@ class MainMenu(QWidget):
                     save_results_locally=self._local_result_save_enabled(),
                 )
 
+            session_plan["test_run"] = bool(test_run or test_mode)
+            session_plan["save_results"] = bool(save_results)
+
             for final_block_index, experiment in enumerate(experiments, start=1):
                 config_path = Path(experiment["config_path"])
                 with config_path.open("r", encoding="utf-8") as handle:
@@ -1071,17 +1109,23 @@ class MainMenu(QWidget):
                     )
                 
                 QApplication.restoreOverrideCursor()
-                run_label = "test mode" if test_mode else "standard mode"
+                run_label = "test mode" if test_run or test_mode else "standard mode"
                 refresh_count = session_plan.get('refresh_count', 0)
                 page_count = session_plan.get('page_count', 0)
                 recalibration_label = "on" if session_plan.get('recalibrate_between_pages') else "off"
                 local_save_label = "on" if session_plan.get('save_results_locally') else "off"
+                save_results_label = "yes" if session_plan.get('save_results', True) else "no"
                 msg = (
                     f"Experiment Loaded: {session_name}\n\n"
                     + "\n".join(summaries)
                     + f"\n\n{len(experiments)} Blocks, {page_count} pages, {refresh_count} refreshes."
                     + f"\nRe-calibrate between pages: {recalibration_label}."
-                    + f"\nSave result data locally: {local_save_label}."
+                    + f"\nSave results: {save_results_label}."
+                    + (
+                        f"\nSave result data locally: {local_save_label}."
+                        if session_plan.get('save_results', True)
+                        else ""
+                    )
                     + f"\n\nClick OK to start in {run_label}."
                 )
                 QMessageBox.information(self, "Experiment Info", msg)
@@ -1090,7 +1134,12 @@ class MainMenu(QWidget):
                 print(f"Error calculating pages: {e}")
                 QApplication.restoreOverrideCursor()
             
-            self.launch_runner(config_files, session_plan_path, test_mode=test_mode)
+            self.launch_runner(
+                config_files,
+                session_plan_path,
+                test_mode=test_mode,
+                test_run=test_run,
+            )
             
         except Exception as e:
             QApplication.restoreOverrideCursor()
@@ -1098,6 +1147,13 @@ class MainMenu(QWidget):
 
     def load_experiment_from_server(self, checked=False, test_mode=False):
         """Select and download an immutable server version, then use the normal loader."""
+        mouse_input = False
+        save_results = True
+        if test_mode:
+            options = self._prompt_test_run_options()
+            if options is None:
+                return
+            mouse_input, save_results = options
         try:
             QApplication.setOverrideCursor(Qt.WaitCursor)
             try:
@@ -1177,7 +1233,9 @@ class MainMenu(QWidget):
                 QApplication.restoreOverrideCursor()
 
             self.load_experiment_zip(
-                test_mode=test_mode,
+                test_mode=mouse_input,
+                test_run=test_mode,
+                save_results=save_results,
                 file_paths=[str(download_path)],
             )
         except (APIError, OSError, ValueError) as exc:
@@ -1220,12 +1278,40 @@ class MainMenu(QWidget):
         if answer == QMessageBox.Yes and hasattr(self.parent, "show_component_updates"):
             self.parent.show_component_updates()
 
-    def launch_runner(self, config_files, session_plan_path, test_mode=False):
+    def _component_is_being_installed(self, component, display_name):
+        coordinator = getattr(self.parent, "component_update_coordinator", None)
+        manager = getattr(self.parent, "component_manager", None)
+        if (
+            coordinator is None
+            or not coordinator.is_installing(component)
+            or manager is None
+            or manager.get_installed_component(component) is not None
+        ):
+            return False
+        QMessageBox.information(
+            self,
+            f"{display_name} Update In Progress",
+            f"Wait until the {display_name} installation is finished.",
+        )
+        return True
+
+    def launch_runner(
+        self,
+        config_files,
+        session_plan_path,
+        test_mode=False,
+        test_run=False,
+    ):
         """Resolve and launch the independently installed Runner component."""
+
+        if MainMenu._component_is_being_installed(self, "runner", "Runner"):
+            return None
 
         arguments = []
         if test_mode:
             arguments.append("--test-mode")
+        if test_run:
+            arguments.append("--test-run")
         arguments.extend(["--session-plan", str(session_plan_path)])
         arguments.extend(str(Path(path).resolve()) for path in config_files)
         try:
@@ -1235,17 +1321,29 @@ class MainMenu(QWidget):
                 source_script="tablet_experiment.py",
                 legacy_executable="ExperimentRunner.exe",
                 manager=getattr(self.parent, "component_manager", None),
+                minimum_version="0.2",
             )
             if command is None:
                 self._offer_component_install("runner", "Runner")
                 return None
             return subprocess.Popen(command, env=self._api_child_environment())
+        except CompatibilityError as exc:
+            answer = QMessageBox.question(
+                self, "Runner Update Required", f"{exc}\n\nOpen Updates now?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
+            )
+            if answer == QMessageBox.Yes and hasattr(self.parent, "show_component_updates"):
+                self.parent.show_component_updates()
+            return None
         except Exception as exc:
             QMessageBox.critical(self, "Runner Launch Failed", str(exc))
             return None
 
     def launch_analyzer(self, file_paths=None, extra_args=None):
         """Resolve and launch the independently installed Analyzer component."""
+
+        if MainMenu._component_is_being_installed(self, "analyzer", "Analyzer"):
+            return None
 
         file_paths = [str(Path(path).resolve()) for path in (file_paths or [])]
         extra_args = [str(argument) for argument in (extra_args or [])]

@@ -13,13 +13,13 @@ from component_versions import (
 )
 
 from PyQt5.QtWidgets import (
-    QAction, QApplication, QInputDialog, QLineEdit, QMainWindow, QMessageBox,
-    QStackedWidget, QLabel,
+    QAction, QApplication, QInputDialog, QLineEdit, QMainWindow,
+    QMessageBox, QProgressDialog, QStackedWidget, QLabel,
 )
-from PyQt5.QtCore import QTimer, pyqtSignal
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from autoscript_api import APIError, AutoScriptAPI, get_session_token
 from component_runtime import component_launch_command, create_update_manager
-from component_updates_dialog import ComponentUpdatesDialog
+from component_updates_dialog import ComponentUpdateCoordinator, ComponentUpdatesDialog
 from user_management_dialog import UserManagementDialog
 
 from gui_menu import MainMenu
@@ -61,7 +61,20 @@ class MainInterface(QMainWindow):
         super().__init__()
         self.api_user = self._authenticate_if_required()
         self.component_manager = create_update_manager()
+        self.component_update_coordinator = ComponentUpdateCoordinator(
+            self.component_manager, self
+        )
+        self.component_update_coordinator.progress_changed.connect(
+            self._handle_component_update_progress
+        )
+        self.component_update_coordinator.install_finished.connect(
+            self._handle_component_update_finished
+        )
+        self.component_update_coordinator.install_failed.connect(
+            self._handle_component_update_failed
+        )
         self.updates_dialog = None
+        self._interface_update_progress = None
         self._automatic_update_result = None
         # Status Bar
         self.status_msg = QLabel("Ready")
@@ -80,10 +93,10 @@ class MainInterface(QMainWindow):
             users_action.triggered.connect(self.show_user_management)
             administration_menu.addAction(users_action)
 
-            updates_menu = self.menuBar().addMenu("Updates")
-            updates_action = QAction("Manage Components…", self)
-            updates_action.triggered.connect(self.show_component_updates)
-            updates_menu.addAction(updates_action)
+        updates_menu = self.menuBar().addMenu("Updates")
+        updates_action = QAction("Manage Components…", self)
+        updates_action.triggered.connect(self.show_component_updates)
+        updates_menu.addAction(updates_action)
 
         self.setWindowTitle(APP_NAME)
         self.resize(1200, 800)
@@ -236,25 +249,88 @@ class MainInterface(QMainWindow):
         self.experiment_results.set_experiment(experiment)
         self.stack.setCurrentWidget(self.experiment_results)
 
+
     def show_component_updates(self):
-        if (self.api_user or {}).get("role") != "admin":
-            QMessageBox.warning(
-                self,
-                "Administrator access required",
-                "Only an administrator can install or update application components.",
-            )
-            return None
-        dialog = ComponentUpdatesDialog(self, manager=self.component_manager)
-        dialog.component_installed.connect(
-            lambda component, version: self.status_msg.setText(
-                f"{component.title()} {version} is ready"
-            )
+        dialog = ComponentUpdatesDialog(
+            self,
+            manager=self.component_manager,
+            coordinator=self.component_update_coordinator,
         )
+        dialog.interface_update_started.connect(self._begin_interface_update)
         self.updates_dialog = dialog
         try:
             dialog.exec_()
         finally:
             self.updates_dialog = None
+
+    def _begin_interface_update(self):
+        progress = QProgressDialog(self)
+        progress.setWindowTitle("Updating AutoScript")
+        progress.setLabelText(
+            "Updating, the app will restart when finished."
+        )
+        progress.setCancelButton(None)
+        progress.setRange(0, 100)
+        progress.setValue(self.component_update_coordinator.progress)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.setMinimumDuration(0)
+        progress.setWindowModality(Qt.ApplicationModal)
+        progress.setWindowFlag(Qt.WindowCloseButtonHint, False)
+        self._interface_update_progress = progress
+        progress.show()
+
+    def _handle_component_update_progress(self, component, percentage):
+        display_name = component.replace("_", " ").title()
+        self.status_msg.setText(
+            f"Updating {display_name}… {percentage}%"
+        )
+        if component == "interface" and self._interface_update_progress is not None:
+            self._interface_update_progress.setValue(percentage)
+
+    def _handle_component_update_finished(self, component, installed):
+        self.status_msg.setText(
+            f"{component.replace('_', ' ').title()} {installed.version} is ready"
+        )
+        if component == "interface":
+            if self._interface_update_progress is not None:
+                self._interface_update_progress.setValue(100)
+                self._interface_update_progress.setLabelText(
+                    "Update complete. Restarting AutoScript…"
+                )
+            QTimer.singleShot(250, self._restart_after_interface_update)
+
+    def _handle_component_update_failed(self, component, error):
+        self.status_msg.setText(
+            f"{component.replace('_', ' ').title()} update failed"
+        )
+        if component != "interface":
+            return
+        if self._interface_update_progress is not None:
+            self._interface_update_progress.close()
+            self._interface_update_progress.deleteLater()
+            self._interface_update_progress = None
+        QMessageBox.critical(self, "Update Failed", error)
+
+    def _restart_after_interface_update(self):
+        command = component_launch_command(
+            "interface",
+            sys.argv[1:],
+            source_script="main_interface.py",
+            legacy_executable="AutoScriptInterface.exe",
+            manager=self.component_manager,
+        )
+        if command is None:
+            self._handle_component_update_failed(
+                "interface", "The updated Main Interface entry point is unavailable."
+            )
+            return
+        try:
+            subprocess.Popen(command, env=builder_child_environment())
+        except OSError as exc:
+            self._handle_component_update_failed("interface", str(exc))
+            return
+        QApplication.instance().quit()
 
     def show_user_management(self):
         if (self.api_user or {}).get("role") != "admin":
@@ -268,7 +344,19 @@ class MainInterface(QMainWindow):
         dialog.exec_()
         return dialog
 
+
+
     def _launch_builder(self, arguments):
+        if (
+            self.component_update_coordinator.is_installing("builder")
+            and self.component_manager.get_installed_component("builder") is None
+        ):
+            QMessageBox.information(
+                self,
+                "Builder Update In Progress",
+                "Wait until the Builder installation is finished.",
+            )
+            return None
         command = builder_launch_command(arguments, manager=self.component_manager)
         if command is None:
             answer = QMessageBox.question(
@@ -308,6 +396,21 @@ class MainInterface(QMainWindow):
 
 
 if __name__ == "__main__":
+    if len(sys.argv) == 3 and sys.argv[1] == "--smoke-test":
+        # Exercise the packaged runtime without login, network or research data.
+        import json
+        from pathlib import Path
+        os.environ["QT_QPA_PLATFORM"] = "offscreen"
+        ensure_qt_platform_plugin_path()
+        app = QApplication([])
+        page = ExperimentResultsPage(type("SmokeParent", (), {"api_user": {"role": "operator"}})())
+        page.process_timer.stop()
+        page.close()
+        Path(sys.argv[2]).write_text(
+            json.dumps({"status": "ok", "qt": True, "results_page": True}),
+            encoding="utf-8",
+        )
+        sys.exit(0)
     ensure_qt_platform_plugin_path()
     app = QApplication(sys.argv)
     window = MainInterface()

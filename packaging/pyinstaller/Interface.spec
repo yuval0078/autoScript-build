@@ -19,6 +19,13 @@ FORBIDDEN_COMPONENT_MODULES = (
     "pygame",
     "pydub",
     "numpy",
+    "torch",
+    "ml_pipeline",
+    "ml_training",
+    "ml_segmentation_viewer",
+    "ml_training_selection_dialog",
+    "ml_review_registry",
+    "ml_segment_editor",
 )
 
 analysis = Analysis(

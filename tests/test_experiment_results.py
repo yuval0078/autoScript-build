@@ -9,7 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from PyQt5.QtWidgets import QApplication, QFileDialog, QMessageBox
+from PyQt5.QtWidgets import QApplication, QFileDialog, QLabel, QMessageBox
 
 from autoscript_api import APICancelled, APIError, PaginatedList
 from analyzer_refactored import (
@@ -53,6 +53,7 @@ class ExperimentResultCardTests(unittest.TestCase):
             "participant_number": participant_number,
             "participant_age": 25,
             "participant_gender": "Other",
+            "is_test": False,
             "session_id": f"session-{run_id}",
             "status": "completed",
             "created_at": "2026-08-09T10:45:00Z",
@@ -189,6 +190,7 @@ class ExperimentResultCardTests(unittest.TestCase):
         page.raw_filter.setCurrentIndex(1)
         page.csv_filter.setCurrentIndex(2)
         page.trainable_filter.setCurrentIndex(1)
+        page.test_filter.setCurrentIndex(1)
         page.filter_timer.stop()
 
         page.refresh_runs()
@@ -200,6 +202,7 @@ class ExperimentResultCardTests(unittest.TestCase):
         self.assertTrue(first_parameters["has_raw_data"])
         self.assertFalse(first_parameters["has_analyzed_csv"])
         self.assertTrue(first_parameters["has_trainable_json"])
+        self.assertTrue(first_parameters["is_test"])
         self.assertFalse(first_parameters["include_files"])
         self.assertEqual(first_parameters["limit"], 50)
         self.assertEqual([run["id"] for run in page.runs], ["run-1"])
@@ -213,6 +216,64 @@ class ExperimentResultCardTests(unittest.TestCase):
         self.assertTrue(page.load_more_button.isHidden())
         page.process_timer.stop()
         page.deleteLater()
+
+    def test_participant_sessions_group_across_pages_and_keep_run_selection(self):
+        from PyQt5.QtWidgets import QFrame, QToolButton
+        from PyQt5.QtCore import Qt
+        first = self.run_summary("run-a", 7)
+        second = self.run_summary("run-b", 7)
+        other = self.run_summary("run-c", 8)
+
+        class API:
+            def list_experiment_runs(self, _experiment_id, **parameters):
+                if parameters.get("cursor"):
+                    return PaginatedList([second, other], headers={"x-total-count": "3"})
+                return PaginatedList([first], headers={
+                    "x-total-count": "3", "x-next-cursor": "next",
+                })
+
+        page = ExperimentResultsPage(SimpleNamespace(api_user={"role": "operator"}))
+        page.api = API()
+        page.experiment = {"id": "experiment-1", "name": "Study"}
+        try:
+            page.refresh_runs()
+            page._selection_changed("run-a", Qt.Checked)
+            page.load_more_runs()
+            groups = [page.list_layout.itemAt(i).widget()
+                      for i in range(page.list_layout.count() - 1)]
+            self.assertEqual(len(groups), 2)
+            self.assertEqual([r["id"] for r in page.runs], ["run-a", "run-b", "run-c"])
+            self.assertEqual(page.selected_ids, {"run-a"})
+            self.assertIn("2 session", groups[0].findChild(QToolButton).text())
+            first_ids, first_checkbox = page.participant_checkboxes[0]
+            self.assertEqual(first_checkbox.checkState(), Qt.PartiallyChecked)
+            page._select_participant_runs(first_ids, True)
+            self.assertEqual(page.selected_ids, {"run-a", "run-b"})
+            self.assertEqual(first_checkbox.checkState(), Qt.Checked)
+            page._selection_changed("run-b", Qt.Unchecked)
+            self.assertEqual(first_checkbox.checkState(), Qt.PartiallyChecked)
+            self.assertEqual([r["id"] for r in page._selected_runs()], ["run-a"])
+            page._toggle_all(Qt.Checked)
+            self.assertTrue(all(c.checkState() == Qt.Checked for _, c in page.participant_checkboxes))
+            page._toggle_all(Qt.Unchecked)
+            self.assertFalse(page.selected_ids)
+            self.assertTrue(page.delete_button.isHidden())
+        finally:
+            page.process_timer.stop()
+            page.deleteLater()
+
+    def test_test_run_has_a_visible_label(self):
+        page = ExperimentResultsPage(SimpleNamespace())
+        try:
+            run = self.run_summary()
+            run["is_test"] = True
+            card = page._build_run_row(run)
+
+            labels = card.findChildren(QLabel, "testRunLabel")
+            self.assertEqual([label.text() for label in labels], ["TEST"])
+        finally:
+            page.process_timer.stop()
+            page.deleteLater()
 
     def test_reset_failure_clears_selection_header_and_actions(self):
         run = self.run_summary()

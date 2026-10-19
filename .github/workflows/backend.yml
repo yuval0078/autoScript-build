@@ -44,14 +44,14 @@ jobs:
           python-version: "3.13"
 
       - name: Install smoke-client dependencies
-        run: python -m pip install "jsonschema>=4.23,<5"
+        run: python -m pip install "jsonschema>=4.23,<5" "certifi>=2026.7.22"
 
       - name: Build and start the complete API stack
-        run: docker compose -f backend/compose.yml up -d --build --wait
+        run: docker compose -f backend/compose.yml -f backend/compose.ci.yml up -d --build --wait
 
       - name: Verify migrations have no model drift
         working-directory: backend
-        run: docker compose -f compose.yml exec -T api alembic check
+        run: docker compose -f compose.yml -f compose.ci.yml exec -T api alembic check
 
       - name: Exercise the API through the desktop client
         env:
@@ -60,8 +60,8 @@ jobs:
 
       - name: Collect service logs on failure
         if: failure()
-        run: docker compose -f backend/compose.yml logs --no-color
+        run: docker compose -f backend/compose.yml -f backend/compose.ci.yml logs --no-color
 
       - name: Stop the ephemeral stack
         if: always()
-        run: docker compose -f backend/compose.yml down --volumes --remove-orphans
+        run: docker compose -f backend/compose.yml -f backend/compose.ci.yml down --volumes --remove-orphans

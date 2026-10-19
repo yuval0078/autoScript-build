@@ -1,0 +1,7 @@
+# Ephemeral integration tests only; does not change production storage.
+services:
+  minio:
+    image: autoscript-minio-ci:2025-09-07
+    build:
+      context: ..
+      dockerfile: backend/Dockerfile.minio-ci

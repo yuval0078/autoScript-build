@@ -863,6 +863,16 @@ class AutoScriptAPI:
         return self.download_version(resource, destination, progress=progress)
 
     def download_experiment(self, experiment, destination, progress=None):
+        revision = experiment.get("current_revision") or {}
+        revision_id = revision.get("id") or experiment.get("current_revision_id")
+        if revision_id:
+            # Pin bytes to the same immutable revision used for Runner metadata.
+            # Do not fall back to a moving live URL when that revision is absent.
+            return self.download_version(
+                {"download_url": f"/api/v1/experiment-revisions/{revision_id}/download"},
+                destination,
+                progress=progress,
+            )
         resource = {
             "download_url": experiment.get("download_url")
             or f"/api/v1/experiments/{experiment['id']}/download",

@@ -92,8 +92,12 @@ class RunnerBlockIdentityTests(unittest.TestCase):
         calls = []
 
         class FakeAPI:
-            def create_run(self, revision, session, number, age, gender):
-                calls.append(("create", revision, session, number, age, gender))
+            def create_run(
+                self, revision, session, number, age, gender, *, is_test=False
+            ):
+                calls.append(
+                    ("create", revision, session, number, age, gender, is_test)
+                )
                 return {"id": "run-1"}
 
             def start_run(self, run_id):
@@ -105,6 +109,7 @@ class RunnerBlockIdentityTests(unittest.TestCase):
         self.assertEqual(first, "run-1")
         self.assertEqual(second, "run-1")
         self.assertEqual([call[0] for call in calls], ["create", "start"])
+        self.assertFalse(calls[0][-1])
         self.assertTrue(all(config["__server_run_id__"] == "run-1" for config in configs))
 
     def test_test_mode_also_creates_a_cloud_run(self):
@@ -116,8 +121,12 @@ class RunnerBlockIdentityTests(unittest.TestCase):
         calls = []
 
         class FakeAPI:
-            def create_run(self, revision, session, number, age, gender):
-                calls.append(("create", revision, session, number, age, gender))
+            def create_run(
+                self, revision, session, number, age, gender, *, is_test=False
+            ):
+                calls.append(
+                    ("create", revision, session, number, age, gender, is_test)
+                )
                 return {"id": "test-run-1"}
 
             def start_run(self, run_id):
@@ -134,6 +143,21 @@ class RunnerBlockIdentityTests(unittest.TestCase):
 
         self.assertEqual(run_id, "test-run-1")
         self.assertEqual([call[0] for call in calls], ["create", "start"])
+        self.assertTrue(calls[0][-1])
+
+    def test_discarded_test_run_does_not_create_a_cloud_run(self):
+        configs = [{
+            "experiment_id": str(uuid.uuid4()),
+            "experiment_revision_id": str(uuid.uuid4()),
+            "__save_results__": False,
+            "__test_run__": True,
+        }]
+
+        with patch("autoscript_api.AutoScriptAPI") as api:
+            run_id = initialize_cloud_run(configs, 12, 30, "Other")
+
+        self.assertIsNone(run_id)
+        api.assert_not_called()
 
     def test_legacy_config_is_one_block_experiment(self):
         identity = get_block_run_identity(
@@ -232,6 +256,7 @@ class RunnerBlockIdentityTests(unittest.TestCase):
         self.assertEqual(result["session_experiment_count"], 3)
         self.assertEqual(result["session_id"], "12_20260807_120000_abcdef")
         self.assertFalse(result["test_mode"])
+        self.assertFalse(result["test_run"])
         self.assertIn("+", result["recorded_at"])
 
     def test_cloud_result_upload_uses_parent_uuid_and_preserves_local_file(self):

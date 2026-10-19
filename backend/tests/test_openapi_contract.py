@@ -9,7 +9,7 @@ class OpenApiContractTests(unittest.TestCase):
         cls.document = create_app().openapi()
 
     def test_operation_ids_are_unique(self):
-        self.assertEqual(self.document["info"]["version"], "0.8.0")
+        self.assertEqual(self.document["info"]["version"], "0.8.1")
         bearer = self.document["components"]["securitySchemes"]["HTTPBearer"]
         self.assertEqual(bearer["type"], "http")
         self.assertEqual(bearer["scheme"], "bearer")

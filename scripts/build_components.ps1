@@ -97,6 +97,20 @@ foreach ($component in $Components) {
     if (-not (Test-Path -LiteralPath $entrypointPath -PathType Leaf)) {
         throw "Component '$component' did not produce $($config.Entrypoint)."
     }
+    if ($component -eq "interface") {
+        $smokeReport = Join-Path $componentBuildRoot "runtime-smoke.json"
+        $smokeArguments = @("--smoke-test", ('"' + $smokeReport + '"'))
+        $smokeProcess = Start-Process -FilePath $entrypointPath -ArgumentList $smokeArguments -WindowStyle Hidden -PassThru
+        if (-not $smokeProcess.WaitForExit(60000)) {
+            $smokeProcess.Kill()
+            throw "Packaged Interface smoke test timed out."
+        }
+        if ($smokeProcess.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $smokeReport)) {
+            throw "Packaged Interface failed to load its Qt/results runtime."
+        }
+        $smokeResult = Get-Content -LiteralPath $smokeReport -Raw | ConvertFrom-Json
+        if ($smokeResult.status -ne "ok") { throw "Packaged Interface smoke test failed." }
+    }
 
     $descriptor = [ordered]@{
         format_version = 1

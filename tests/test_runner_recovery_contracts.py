@@ -100,6 +100,8 @@ class RunnerRecoveryContractsTests(unittest.TestCase):
 
         self.assertFalse(plan["save_results_locally"])
         self.assertFalse(configs[0]["__save_results_locally__"])
+        self.assertTrue(configs[0]["__save_results__"])
+        self.assertFalse(configs[0]["__test_run__"])
         # A single Block has no boundary at which to re-calibrate.
         self.assertFalse(plan["recalibrate_between_pages"])
 
@@ -110,6 +112,24 @@ class RunnerRecoveryContractsTests(unittest.TestCase):
         apply_session_plan(configs, None)
 
         self.assertTrue(configs[0]["__save_results_locally__"])
+        self.assertTrue(configs[0]["__save_results__"])
+        self.assertFalse(configs[0]["__test_run__"])
+
+    def test_test_run_save_choice_is_carried_in_the_session_plan(self):
+        from tablet_experiment import apply_session_plan
+
+        configs = [{"__file_path__": str((ROOT / "test.json").resolve())}]
+        apply_session_plan(
+            configs,
+            {
+                "test_run": True,
+                "save_results": False,
+                "experiments": [],
+            },
+        )
+
+        self.assertTrue(configs[0]["__test_run__"])
+        self.assertFalse(configs[0]["__save_results__"])
 
     def test_runner_supports_session_plan_and_cell_offsets(self):
         source = _source("tablet_experiment.py")
