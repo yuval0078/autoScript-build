@@ -44,7 +44,7 @@ jobs:
           python-version: "3.13"
 
       - name: Install smoke-client dependencies
-        run: python -m pip install "jsonschema>=4.23,<5"
+        run: python -m pip install "jsonschema>=4.23,<5" "certifi>=2026.7.22"
 
       - name: Build and start the complete API stack
         run: docker compose -f backend/compose.yml -f backend/compose.ci.yml up -d --build --wait
