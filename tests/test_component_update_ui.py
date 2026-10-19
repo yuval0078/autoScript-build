@@ -73,7 +73,7 @@ class ComponentUpdateUiTests(unittest.TestCase):
             entrypoint.touch()
             command = component_launch_command("runner", ["--test-run"], manager=manager,
                 frozen=True, minimum_version="0.1")
-            self.assertEqual(command, [str(entrypoint), "--test-run"])
+            self.assertEqual(command, [str(entrypoint.resolve()), "--test-run"])
 
     @classmethod
     def setUpClass(cls):
