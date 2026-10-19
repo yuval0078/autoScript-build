@@ -24,6 +24,7 @@ from PyQt5.QtWidgets import (
     QProgressDialog,
     QPushButton,
     QScrollArea,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -160,6 +161,7 @@ class ExperimentResultsPage(QWidget):
         self.runs = []
         self.selected_ids = set()
         self.row_checkboxes = []
+        self.participant_checkboxes = []
         self.run_details = {}
         self.analysis_processes = []
         self._bulk_export_jobs = []
@@ -251,6 +253,9 @@ class ExperimentResultsPage(QWidget):
         self.trainable_filter = self._boolean_filter_combo(
             "Any trainable JSON", "Has trainable JSON", "No trainable JSON"
         )
+        self.test_filter = self._boolean_filter_combo(
+            "Any run type", "Test runs", "Regular runs"
+        )
         clear_filters = QPushButton("Clear filters")
         clear_filters.setStyleSheet(self._button_style("#536578"))
         clear_filters.clicked.connect(self._clear_filters)
@@ -261,7 +266,8 @@ class ExperimentResultsPage(QWidget):
         filter_layout.addWidget(self.session_filter, 0, 3)
         filter_layout.addWidget(QLabel("Status"), 0, 4)
         filter_layout.addWidget(self.status_filter, 0, 5)
-        filter_layout.addWidget(self.complete_filter, 1, 0, 1, 2)
+        filter_layout.addWidget(self.test_filter, 1, 0)
+        filter_layout.addWidget(self.complete_filter, 1, 1)
         filter_layout.addWidget(self.raw_filter, 1, 2)
         filter_layout.addWidget(self.csv_filter, 1, 3)
         filter_layout.addWidget(self.trainable_filter, 1, 4)
@@ -278,6 +284,7 @@ class ExperimentResultsPage(QWidget):
             self.raw_filter,
             self.csv_filter,
             self.trainable_filter,
+            self.test_filter,
         ):
             control.currentIndexChanged.connect(self._queue_filter_refresh)
 
@@ -391,6 +398,7 @@ class ExperimentResultsPage(QWidget):
             self.raw_filter,
             self.csv_filter,
             self.trainable_filter,
+            self.test_filter,
         ):
             combo.setCurrentIndex(0)
         self._queue_filter_refresh()
@@ -407,6 +415,7 @@ class ExperimentResultsPage(QWidget):
             "has_raw_data": self.raw_filter.currentData(),
             "has_analyzed_csv": self.csv_filter.currentData(),
             "has_trainable_json": self.trainable_filter.currentData(),
+            "is_test": self.test_filter.currentData(),
         }
 
     def _clear_rows(self):
@@ -415,6 +424,7 @@ class ExperimentResultsPage(QWidget):
             if item.widget():
                 item.widget().deleteLater()
         self.row_checkboxes = []
+        self.participant_checkboxes = []
 
     def refresh_runs(self):
         self._load_run_page(reset=True)
@@ -480,10 +490,13 @@ class ExperimentResultsPage(QWidget):
         elif not self._run_cursor and len(self.runs) != self._run_total_count:
             self._run_total_count = len(self.runs)
         self._clear_rows()
+        groups = {}
         for run in self.runs:
+            groups.setdefault(run["participant_number"], []).append(run)
+        for participant_number, runs in groups.items():
             self.list_layout.insertWidget(
                 self.list_layout.count() - 1,
-                self._build_run_row(run),
+                self._build_participant_group(participant_number, runs),
             )
         loaded_count = len(self.runs)
         self.status_label.setText(
@@ -496,6 +509,62 @@ class ExperimentResultsPage(QWidget):
             )
         )
         self.load_more_button.setVisible(bool(self._run_cursor))
+        self._sync_select_all()
+        self._update_actions()
+
+    def _build_participant_group(self, participant_number, runs):
+        """Group visible sessions without merging or rewriting their research data."""
+        card = QFrame()
+        card.setObjectName("participantGroup")
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(0, 0, 0, 0)
+        header = QHBoxLayout()
+        checkbox = QCheckBox()
+        checkbox.setTristate(True)
+        run_ids = {run["id"] for run in runs}
+        checkbox.clicked.connect(
+            lambda checked, ids=run_ids: self._select_participant_runs(ids, checked)
+        )
+        self.participant_checkboxes.append((run_ids, checkbox))
+        header.addWidget(checkbox)
+        toggle = QToolButton()
+        toggle.setObjectName("participantToggle")
+        toggle.setText(f"Participant {participant_number} · {len(runs)} session(s)")
+        toggle.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        toggle.setCheckable(True)
+        toggle.setChecked(False)
+        toggle.setArrowType(Qt.RightArrow)
+        toggle.setStyleSheet("font-size: 16px; font-weight: 700; padding: 8px;")
+        header.addWidget(toggle, 1)
+        summary = QLabel(" · ".join(
+            f"{sum(cloud_file_count(run, kind) for run in runs)} {label}"
+            for kind, label in ARTIFACT_TAGS
+            if any(cloud_file_count(run, kind) for run in runs)
+        ))
+        header.addWidget(summary)
+        layout.addLayout(header)
+        sessions = QWidget()
+        session_layout = QVBoxLayout(sessions)
+        session_layout.setContentsMargins(20, 0, 0, 0)
+        for run in runs:
+            session_layout.addWidget(self._build_run_row(run))
+        sessions.setVisible(False)
+        toggle.toggled.connect(sessions.setVisible)
+        toggle.toggled.connect(
+            lambda expanded: toggle.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
+        )
+        layout.addWidget(sessions)
+        return card
+
+    def _select_participant_runs(self, run_ids, checked):
+        if checked:
+            self.selected_ids.update(run_ids)
+        else:
+            self.selected_ids.difference_update(run_ids)
+        for run_id, checkbox in self.row_checkboxes:
+            checkbox.blockSignals(True)
+            checkbox.setChecked(run_id in self.selected_ids)
+            checkbox.blockSignals(False)
         self._sync_select_all()
         self._update_actions()
 
@@ -519,15 +588,28 @@ class ExperimentResultsPage(QWidget):
         row.addWidget(checkbox)
 
         identity = QVBoxLayout()
+        participant_row = QHBoxLayout()
+        participant_row.setSpacing(7)
         participant = QLabel(f"Participant {run['participant_number']}")
         participant.setStyleSheet("font-size: 16px; font-weight: 700; color: #172230;")
+        participant_row.addWidget(participant)
+        if run.get("is_test", False):
+            test_label = QLabel("TEST")
+            test_label.setObjectName("testRunLabel")
+            test_label.setStyleSheet(
+                "background: #fff3cd; color: #8a5a00; border: 1px solid #e4bd63; "
+                "border-radius: 5px; padding: 2px 6px; font-size: 10px; "
+                "font-weight: 750;"
+            )
+            participant_row.addWidget(test_label)
+        participant_row.addStretch()
         details = QLabel(
             f"Age {run['participant_age']} · {run['participant_gender']} · "
             f"{format_run_datetime(run.get('started_at') or run.get('created_at'))} · "
             f"Session {run['session_id']}"
         )
         details.setStyleSheet("font-size: 12px; color: #617181;")
-        identity.addWidget(participant)
+        identity.addLayout(participant_row)
         identity.addWidget(details)
         row.addLayout(identity, 1)
 
@@ -607,12 +689,21 @@ class ExperimentResultsPage(QWidget):
             checkbox.blockSignals(True)
             checkbox.setChecked(checked)
             checkbox.blockSignals(False)
+        self._sync_select_all()
         self._update_actions()
 
     def _sync_select_all(self):
         self.select_all.blockSignals(True)
         self.select_all.setChecked(bool(self.runs) and len(self.selected_ids) == len(self.runs))
         self.select_all.blockSignals(False)
+        for run_ids, checkbox in self.participant_checkboxes:
+            selected = len(run_ids & self.selected_ids)
+            state = Qt.Checked if selected == len(run_ids) else (
+                Qt.PartiallyChecked if selected else Qt.Unchecked
+            )
+            checkbox.blockSignals(True)
+            checkbox.setCheckState(state)
+            checkbox.blockSignals(False)
 
     def _update_actions(self):
         enabled = bool(self.selected_ids)

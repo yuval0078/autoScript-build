@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
-from PyQt5.QtCore import Qt, pyqtSignal
+import threading
+
+from PyQt5.QtCore import QObject, Qt, pyqtSignal
 from PyQt5.QtWidgets import (
     QApplication,
     QDialog,
     QHBoxLayout,
     QLabel,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QTableWidget,
     QTableWidgetItem,
@@ -28,16 +31,117 @@ DISPLAY_NAMES = {
 }
 
 
-class ComponentUpdatesDialog(QDialog):
-    component_installed = pyqtSignal(str, str)
+class ComponentUpdateCoordinator(QObject):
+    """Run one component installation at a time without blocking the Qt thread."""
 
-    def __init__(self, parent=None, *, manager=None, bundled_versions=None):
+    progress_changed = pyqtSignal(str, int)
+    install_finished = pyqtSignal(str, object)
+    install_failed = pyqtSignal(str, str)
+
+    def __init__(self, manager=None, parent=None):
         super().__init__(parent)
         self.manager = manager or create_update_manager()
+        self._state_lock = threading.Lock()
+        self._active_component = None
+        self._active_catalog = None
+        self._progress = 0
+        self._thread = None
+
+    @property
+    def active_component(self):
+        with self._state_lock:
+            return self._active_component
+
+    @property
+    def active_catalog(self):
+        with self._state_lock:
+            return self._active_catalog
+
+    @property
+    def progress(self):
+        with self._state_lock:
+            return self._progress
+
+    def is_installing(self, component=None):
+        active = self.active_component
+        return active is not None and (component is None or active == component)
+
+    def start_install(self, catalog, component):
+        with self._state_lock:
+            if self._active_component is not None:
+                return False
+            self._active_component = component
+            self._active_catalog = catalog
+            self._progress = 0
+
+        def publish_progress(value):
+            value = max(0, min(100, int(value)))
+            with self._state_lock:
+                if self._active_component != component:
+                    return
+                self._progress = value
+            self.progress_changed.emit(component, value)
+
+        def install():
+            try:
+                installed = self.manager.install_component(
+                    catalog, component, progress=publish_progress
+                )
+            except (UpdateError, OSError, ValueError) as exc:
+                with self._state_lock:
+                    self._active_component = None
+                    self._active_catalog = None
+                self.install_failed.emit(component, str(exc))
+                return
+            except Exception as exc:
+                with self._state_lock:
+                    self._active_component = None
+                    self._active_catalog = None
+                self.install_failed.emit(component, str(exc))
+                return
+            with self._state_lock:
+                self._progress = 100
+                self._active_component = None
+                self._active_catalog = None
+            self.install_finished.emit(component, installed)
+
+        self._thread = threading.Thread(
+            target=install,
+            name=f"autoscript-{component}-update",
+            daemon=True,
+        )
+        self.progress_changed.emit(component, 0)
+        self._thread.start()
+        return True
+
+
+class ComponentUpdatesDialog(QDialog):
+    component_installed = pyqtSignal(str, str)
+    interface_update_started = pyqtSignal()
+
+    def __init__(
+        self,
+        parent=None,
+        *,
+        manager=None,
+        bundled_versions=None,
+        coordinator=None,
+    ):
+        super().__init__(parent)
+        self.manager = manager or (
+            coordinator.manager if coordinator is not None else create_update_manager()
+        )
+        self.coordinator = coordinator or ComponentUpdateCoordinator(
+            self.manager, self
+        )
         self.bundled_versions = dict(bundled_versions or COMPONENT_VERSIONS)
-        self.catalog = None
+        self.catalog = self.coordinator.active_catalog
         self._buttons = {}
         self._rows = {}
+
+        self.coordinator.progress_changed.connect(self._on_install_progress)
+        self.coordinator.install_finished.connect(self._on_install_finished)
+        self.coordinator.install_failed.connect(self._on_install_failed)
 
         self.setWindowTitle("AutoScript Updates")
         self.resize(760, 360)
@@ -59,6 +163,13 @@ class ComponentUpdatesDialog(QDialog):
         self.table.setSelectionMode(QTableWidget.NoSelection)
         self.table.horizontalHeader().setStretchLastSection(True)
         layout.addWidget(self.table)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat("%p%")
+        self.progress_bar.setVisible(self.coordinator.is_installing())
+        layout.addWidget(self.progress_bar)
 
         for row, component in enumerate(COMPONENT_NAMES):
             self._rows[component] = row
@@ -86,6 +197,10 @@ class ComponentUpdatesDialog(QDialog):
         layout.addLayout(controls)
 
         self._render_rows()
+        if self.coordinator.active_component is not None:
+            self._on_install_progress(
+                self.coordinator.active_component, self.coordinator.progress
+            )
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -116,18 +231,13 @@ class ComponentUpdatesDialog(QDialog):
             self.table.item(row, 2).setText(latest or "Unavailable")
 
             button = self._buttons[component]
-            if latest is None:
-                state, action, enabled = "Latest version unavailable", "Install", False
-            elif installed is None:
-                state, action, enabled = "Not installed", "Install", True
+            if self.coordinator.is_installing(component):
+                state, action, enabled = "Installing…", "Installing…", False
+            elif self.coordinator.is_installing():
+                state, action, enabled = state_for_component(installed, latest)
+                enabled = False
             else:
-                comparison = compare_component_versions(latest, installed)
-                if comparison > 0:
-                    state, action, enabled = "Update available", "Update", True
-                elif comparison == 0:
-                    state, action, enabled = "Up to date", "Up to date", False
-                else:
-                    state, action, enabled = "Installed version is newer", "Installed", False
+                state, action, enabled = state_for_component(installed, latest)
             self.table.item(row, 3).setText(state)
             button.setText(action)
             button.setEnabled(enabled)
@@ -151,29 +261,44 @@ class ComponentUpdatesDialog(QDialog):
     def install_component(self, component):
         if self.catalog is None:
             return
-        button = self._buttons[component]
-        old_text = button.text()
-        button.setEnabled(False)
-        button.setText("Installing…")
-        QApplication.processEvents()
-        try:
-            installed = self.manager.install_component(self.catalog, component)
-            self.component_installed.emit(component, installed.version)
-            if component == "interface":
-                message = (
-                    "The Main Interface update is installed. Close and reopen "
-                    "AutoScript to activate it."
-                )
-            else:
-                message = f"{DISPLAY_NAMES[component]} {installed.version} is ready."
+        if not self.coordinator.start_install(self.catalog, component):
+            QMessageBox.information(
+                self,
+                "Update Already Running",
+                "Wait until the current component update is finished.",
+            )
+            return
+        self._on_install_progress(component, 0)
+        self._render_rows()
+        if component == "interface":
+            self.accept()
+            self.interface_update_started.emit()
+
+    def _on_install_progress(self, component, percentage):
+        if component != self.coordinator.active_component and percentage < 100:
+            return
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(percentage)
+        self.status.setText(
+            f"Installing {DISPLAY_NAMES[component]}… {percentage}%"
+        )
+
+    def _on_install_finished(self, component, installed):
+        self.component_installed.emit(component, installed.version)
+        self.progress_bar.setValue(100)
+        message = f"{DISPLAY_NAMES[component]} {installed.version} is ready."
+        self.status.setText(message)
+        self._render_rows()
+        if self.isVisible() and component != "interface":
             QMessageBox.information(self, "Component Ready", message)
-            self.status.setText(message)
-        except (UpdateError, OSError, ValueError) as exc:
-            QMessageBox.critical(self, "Update Failed", str(exc))
-            self.status.setText(f"{DISPLAY_NAMES[component]} update failed: {exc}")
-        finally:
-            button.setText(old_text)
-            self._render_rows()
+
+    def _on_install_failed(self, component, error):
+        self.progress_bar.setVisible(False)
+        message = f"{DISPLAY_NAMES[component]} update failed: {error}"
+        self.status.setText(message)
+        self._render_rows()
+        if self.isVisible() and component != "interface":
+            QMessageBox.critical(self, "Update Failed", error)
 
     def row_snapshot(self, component):
         row = self._rows[component]
@@ -183,7 +308,25 @@ class ComponentUpdatesDialog(QDialog):
             "status": self.table.item(row, 3).text(),
             "action": self._buttons[component].text(),
             "enabled": self._buttons[component].isEnabled(),
+            "progress": self.progress_bar.value(),
         }
 
 
-__all__ = ["ComponentUpdatesDialog", "DISPLAY_NAMES"]
+def state_for_component(installed, latest):
+    if latest is None:
+        return "Latest version unavailable", "Install", False
+    if installed is None:
+        return "Not installed", "Install", True
+    comparison = compare_component_versions(latest, installed)
+    if comparison > 0:
+        return "Update available", "Update", True
+    if comparison == 0:
+        return "Up to date", "Up to date", False
+    return "Installed version is newer", "Installed", False
+
+
+__all__ = [
+    "ComponentUpdateCoordinator",
+    "ComponentUpdatesDialog",
+    "DISPLAY_NAMES",
+]

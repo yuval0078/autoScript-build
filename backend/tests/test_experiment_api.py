@@ -960,10 +960,26 @@ class ExperimentApiTests(unittest.TestCase):
             self.client.get(revision.json()["download_url"]).content,
             first_bytes,
         )
-        self.client.delete(f"/api/v1/blocks/{first.json()['id']}")
-        self.upload_block(experiment["id"], "second")
-        second_revision = self.client.post(f"/api/v1/experiments/{experiment['id']}/revisions")
-        self.assertEqual(second_revision.json()["revision_number"], 2)
+        objects_before = dict(self.storage.objects)
+        blocked = [
+            self.client.delete(f"/api/v1/blocks/{first.json()['id']}"),
+            self.upload_block(experiment["id"], "second"),
+            self.client.put(f"/api/v1/experiments/{experiment['id']}/blocks/order",
+                json={"block_ids": [first.json()["id"]], "same_page_block_ids": []}),
+            self.client.post(f"/api/v1/experiments/{experiment['id']}/versions",
+                content=block_package("second"), headers={"X-Filename": "second.zip", "Content-Type": "application/zip"}),
+        ]
+        for response in blocked:
+            self.assertEqual(response.status_code, 409, response.text)
+        self.assertEqual(self.storage.objects, objects_before)
+        staged = self.stage_block("second")
+        second_revision = self.client.post(f"/api/v1/experiments/{experiment['id']}/publish", json={
+            "request_id": str(uuid.uuid4()), "name": "Revision Study",
+            "expected_current_revision_id": revision.json()["id"],
+            "blocks": [{"source": "staged", "id": staged.json()["id"], "same_page_as_previous": False}],
+        })
+        self.assertEqual(second_revision.status_code, 200, second_revision.text)
+        self.assertEqual(second_revision.json()["current_revision"]["revision_number"], 2)
         history = self.client.get(
             f"/api/v1/experiments/{experiment['id']}/revisions"
         ).json()

@@ -6,7 +6,8 @@ import sys
 from pathlib import Path
 
 from app_paths import source_script_path
-from component_update_manager import ComponentUpdateManager, InstallStateError
+from component_update_manager import ComponentUpdateManager, InstallStateError, CompatibilityError
+from component_versions import compare_component_versions
 
 
 UPDATE_CATALOG_URL = (
@@ -49,6 +50,7 @@ def component_launch_command(
     manager=None,
     frozen=None,
     executable=None,
+    minimum_version=None,
 ):
     """Return a managed, legacy, or source-mode command without credentials."""
 
@@ -63,6 +65,15 @@ def component_launch_command(
         script = source_script_path(source_script)
         return [str(executable), str(script), *arguments] if script.is_file() else None
 
+    manager = manager or create_update_manager()
+    if minimum_version is not None:
+        installed = manager.get_installed_component(component)
+        if installed is None or compare_component_versions(installed.version, minimum_version) < 0:
+            raise CompatibilityError(
+                f"This Interface requires {component.title()} {minimum_version} or newer. "
+                "Install or update it from the Updates menu before continuing. "
+                "An unversioned legacy executable cannot be used for this operation."
+            )
     entrypoint = installed_component_entrypoint(component, manager=manager)
     if entrypoint is not None:
         return [str(entrypoint), *arguments]

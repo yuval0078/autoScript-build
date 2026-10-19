@@ -1310,6 +1310,19 @@ def duplicate_experiment(
     return _experiment_response(duplicate)
 
 
+def _require_legacy_block_editable(experiment):
+    """Published revisions must change only through the atomic publish API."""
+    if experiment.current_revision_id is not None or experiment.revisions:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This Experiment has a published revision. Use the atomic "
+                "experiment publish endpoint with expected_current_revision_id "
+                "to change its Blocks."
+            ),
+        )
+
+
 @router.post(
     "/experiments/{experiment_id}/blocks",
     response_model=ExperimentBlockResponse,
@@ -1328,6 +1341,7 @@ async def upload_block(
 ):
     experiment = _owned_experiment(database, actor, experiment_id, lock=True)
     filename = _safe_zip_filename(x_filename)
+    _require_legacy_block_editable(experiment)
     block_name = _safe_block_name(x_block_name)
     blocks = sorted(experiment.blocks, key=lambda block: block.position)
     position = len(blocks) if x_position is None else x_position
@@ -1400,6 +1414,7 @@ def reorder_blocks(
 ):
     experiment = _owned_experiment(database, actor, experiment_id, lock=True)
     blocks_by_id = {block.id: block for block in experiment.blocks}
+    _require_legacy_block_editable(experiment)
     if set(payload.block_ids) != set(blocks_by_id):
         raise HTTPException(
             status_code=422,
@@ -1437,6 +1452,7 @@ def delete_block(
     if block is None:
         raise HTTPException(status_code=404, detail="Block was not found.")
     experiment = _owned_experiment(database, actor, block.experiment_id, lock=True)
+    _require_legacy_block_editable(experiment)
     storage_key = block.storage_key
     remaining = [item for item in experiment.blocks if item.id != block.id]
     database.delete(block)
@@ -1662,6 +1678,7 @@ async def publish_experiment_version(
 ):
     """Legacy publish route: retain version history and append one block."""
     experiment = _owned_experiment(database, actor, experiment_id, lock=True)
+    _require_legacy_block_editable(experiment)
     filename = _safe_zip_filename(x_filename, "experiment.zip")
     upload_path, sha256, size_bytes, metadata = await _receive_package(request)
     storage_key = None

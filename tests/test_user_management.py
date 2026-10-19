@@ -1,5 +1,6 @@
 import os
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -91,6 +92,24 @@ class UserManagementTests(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             api.update_user("user-id", password_hash="forbidden")
+
+    def test_api_client_device_token_contract(self):
+        api = AutoScriptAPI(base_url="https://example.invalid", token="token")
+        with patch.object(api, "_json_request", return_value={}) as request:
+            api.create_device_token("Current device", "current-password")
+            request.assert_called_once_with(
+                "POST",
+                "/api/v1/auth/device-tokens",
+                {"label": "Current device", "password": "current-password"},
+            )
+        with patch.object(api, "_json_request", return_value=[]) as request:
+            self.assertEqual(api.list_device_tokens(), [])
+            request.assert_called_once_with("GET", "/api/v1/auth/device-tokens")
+        with patch.object(api, "_json_request", return_value=None) as request:
+            api.revoke_device_token("token-id")
+            request.assert_called_once_with(
+                "DELETE", "/api/v1/auth/device-tokens/token-id"
+            )
 
     def test_dialog_lists_users_and_password_is_optional_for_edit(self):
         api = RecordingAPI()
@@ -186,6 +205,8 @@ class UserManagementTests(unittest.TestCase):
             }
             self.assertIn("Administration", admin_actions)
             self.assertNotIn("Administration", researcher_actions)
+            self.assertIn("Updates", admin_actions)
+            self.assertIn("Updates", researcher_actions)
             administration = next(
                 action.menu()
                 for action in admin.menuBar().actions()
@@ -195,11 +216,93 @@ class UserManagementTests(unittest.TestCase):
                 "User Management…",
                 {action.text() for action in administration.actions()},
             )
+            self.assertNotIn("Research Data", admin_actions)
+            self.assertNotIn("Research Data", researcher_actions)
         finally:
             admin.builder_process_timer.stop()
             researcher.builder_process_timer.stop()
             admin.close()
             researcher.close()
+
+    def test_researcher_can_open_component_updates(self):
+        window = self._main_window("researcher")
+        dialogs = []
+
+        class UpdatesDialog:
+            def __init__(self, parent, *, manager, coordinator):
+                self.parent = parent
+                self.manager = manager
+                self.coordinator = coordinator
+                self.component_installed = MagicMock()
+                self.interface_update_started = MagicMock()
+                self.executed = False
+                dialogs.append(self)
+
+            def exec_(self):
+                self.executed = True
+
+        try:
+            with patch.object(
+                main_interface, "ComponentUpdatesDialog", UpdatesDialog
+            ):
+                window.show_component_updates()
+            dialog = dialogs[0]
+            self.assertTrue(dialog.executed)
+            self.assertIs(dialog.parent, window)
+            self.assertIs(dialog.manager, window.component_manager)
+        finally:
+            window.builder_process_timer.stop()
+            window.close()
+
+    def test_operator_can_open_component_updates(self):
+        window = self._main_window("operator")
+        try:
+            self.assertIn("Updates", {a.text() for a in window.menuBar().actions()})
+            with patch.object(main_interface, "ComponentUpdatesDialog") as dialog:
+                window.show_component_updates()
+                dialog.return_value.exec_.assert_called_once_with()
+            self.assertNotIn("Administration", {a.text() for a in window.menuBar().actions()})
+        finally:
+            window.builder_process_timer.stop()
+            window.close()
+
+    def test_interface_update_restart_launches_active_interface_and_quits(self):
+        window = self._main_window("researcher")
+        application = MagicMock()
+        try:
+            with (
+                patch.object(
+                    main_interface,
+                    "component_launch_command",
+                    return_value=["AutoScriptInterface-0.2.exe"],
+                ) as resolve,
+                patch.object(main_interface.subprocess, "Popen") as popen,
+                patch.object(
+                    main_interface.QApplication,
+                    "instance",
+                    return_value=application,
+                ),
+                patch.object(
+                    main_interface,
+                    "get_session_token",
+                    return_value="memory-token",
+                ),
+            ):
+                window._restart_after_interface_update()
+            self.assertEqual(resolve.call_args.args[0], "interface")
+            self.assertIs(resolve.call_args.kwargs["manager"], window.component_manager)
+            popen.assert_called_once()
+            self.assertEqual(
+                popen.call_args.kwargs["env"]["AUTOSCRIPT_API_TOKEN"],
+                "memory-token",
+            )
+            application.quit.assert_called_once_with()
+        finally:
+            window.builder_process_timer.stop()
+            window.close()
+
+
+
 
 
 if __name__ == "__main__":

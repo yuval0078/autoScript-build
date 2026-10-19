@@ -176,10 +176,10 @@ class ComponentVersionTests(unittest.TestCase):
         self.assertEqual(
             versions,
             {
-                "interface": "0.2",
-                "builder": "0.0",
-                "runner": "0.0",
-                "analyzer": "0.3",
+                "interface": "0.4",
+                "builder": "0.2",
+                "runner": "0.2",
+                "analyzer": "0.5",
             },
         )
 
@@ -477,6 +477,21 @@ class ComponentUpdateManagerTests(unittest.TestCase):
 
         repeated = manager.install_component(catalog, "builder")
         self.assertEqual(repeated, installed)
+
+    def test_install_reports_monotonic_percentage_progress(self):
+        raw, signature, payload, archives = catalog_fixture(self.private_key)
+        self.queue_catalog(raw, signature)
+        manager = self.manager()
+        catalog = manager.load_catalog()
+        self.queue_archive(payload, archives, "builder")
+        progress = []
+
+        manager.install_component(catalog, "builder", progress=progress.append)
+
+        self.assertEqual(progress[0], 0)
+        self.assertEqual(progress[-1], 100)
+        self.assertEqual(progress, sorted(progress))
+        self.assertTrue(any(0 < value < 100 for value in progress))
 
     def test_download_size_content_length_and_hash_are_all_verified(self):
         cases = ("short", "header", "hash")

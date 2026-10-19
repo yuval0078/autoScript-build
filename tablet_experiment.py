@@ -270,6 +270,8 @@ def initialize_cloud_run(configs, participant_number, age, gender, test_mode=Fal
     """Create one server Run before the first Block starts; local files remain a fallback."""
     if not configs:
         return None
+    if not bool(configs[0].get('__save_results__', True)):
+        return None
     existing = next((config.get('__server_run_id__') for config in configs if config.get('__server_run_id__')), None)
     if existing:
         return existing
@@ -285,7 +287,12 @@ def initialize_cloud_run(configs, participant_number, age, gender, test_mode=Fal
         from autoscript_api import AutoScriptAPI
         api = AutoScriptAPI()
         run = api.create_run(
-            revision_id, session_id, participant_number, age, gender
+            revision_id,
+            session_id,
+            participant_number,
+            age,
+            gender,
+            is_test=bool(configs[0].get('__test_run__', test_mode)),
         )
         api.start_run(run['id'])
         for config in configs:
@@ -569,6 +576,8 @@ def apply_session_plan(configs, session_plan=None):
     plan_by_path = {}
     session_recalibrate_between_pages = bool((session_plan or {}).get('recalibrate_between_pages', False))
     save_results_locally = bool((session_plan or {}).get('save_results_locally', True))
+    save_results = bool((session_plan or {}).get('save_results', True))
+    test_run = bool((session_plan or {}).get('test_run', False))
     if session_plan:
         for entry in session_plan.get('experiments', []):
             config_path = entry.get('config_path')
@@ -590,6 +599,8 @@ def apply_session_plan(configs, session_plan=None):
         config['__session_layout__'] = layout
         config['__session_recalibrate_between_pages__'] = session_recalibrate_between_pages
         config['__save_results_locally__'] = save_results_locally
+        config['__save_results__'] = save_results
+        config['__test_run__'] = test_run
 
     return configs
 
@@ -1999,6 +2010,7 @@ class ExperimentCanvas(QWidget):
             'experiment_revision_number': self.config.get('experiment_revision_number'),
             'server_run_id': self.config.get('__server_run_id__'),
             'test_mode': bool(self.test_mode),
+            'test_run': bool(self.config.get('__test_run__', self.test_mode)),
             'block_name': identity['block_name'],
             'block_id': identity['block_id'],
             'block_index': identity['block_index'],
@@ -2180,6 +2192,20 @@ class ExperimentCanvas(QWidget):
         """Return the launcher's fixed local-save choice for this run."""
         return bool(self.config.get('__save_results_locally__', True))
 
+    def _should_save_results(self):
+        """Return whether this run should be retained locally or in the cloud."""
+        return bool(self.config.get('__save_results__', True))
+
+    def _finish_without_saving(self, dialog_parent, title):
+        msg = QMessageBox(dialog_parent)
+        msg.setIcon(QMessageBox.Information)
+        msg.setWindowTitle(title)
+        msg.setText("Test Run finished. Results were not saved.")
+        msg.setWindowModality(Qt.ApplicationModal)
+        msg.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+        msg.exec_()
+        self._cleanup_and_quit()
+
     @staticmethod
     def _available_result_path(path):
         """Avoid overwriting an existing automatic local result file."""
@@ -2198,6 +2224,10 @@ class ExperimentCanvas(QWidget):
         """Upload one result and honor the launcher's automatic local-save choice."""
         from pathlib import Path
         from app_paths import ensure_dir, user_data_dir
+
+        if not self._should_save_results():
+            self._finish_without_saving(dialog_parent, "Experiment Complete")
+            return
         
         results_dir = ensure_dir(user_data_dir() / 'results')
         default_filename = f"{self._result_file_stem()}_p{self.participant_number}_{combined_data['timestamp']}.json"
@@ -2257,6 +2287,10 @@ class ExperimentCanvas(QWidget):
         """Upload a session and optionally save every Block result automatically."""
         from pathlib import Path
         from app_paths import ensure_dir, user_data_dir
+
+        if not self._should_save_results():
+            self._finish_without_saving(dialog_parent, "Session Complete")
+            return
         
         results_dir = ensure_dir(user_data_dir() / 'results')
         experiment_completed = (
@@ -3004,7 +3038,14 @@ class ExperimentWindow(QMainWindow):
             msg = QMessageBox(self)
             msg.setIcon(QMessageBox.Question)
             msg.setWindowTitle('Exit Experiment')
-            msg.setText('Are you sure you want to exit?\nYou can save or discard data next.')
+            msg.setText(
+                'Are you sure you want to exit?\n'
+                + (
+                    'Data collected so far will be saved.'
+                    if self.canvas._should_save_results()
+                    else 'Data collected so far will be discarded.'
+                )
+            )
             msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
             msg.setDefaultButton(QMessageBox.No)
             msg.setWindowModality(Qt.ApplicationModal)
@@ -3030,7 +3071,11 @@ class ExperimentWindow(QMainWindow):
         msg.setWindowTitle('End Experiment')
         msg.setText(
             'End this experiment now?\n\n'
-            'All data collected so far will be preserved in the cloud.'
+            + (
+                'All data collected so far will be preserved in the cloud.'
+                if self.canvas._should_save_results()
+                else 'All data collected so far will be discarded.'
+            )
         )
         msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
         msg.setDefaultButton(QMessageBox.No)
@@ -3047,6 +3092,11 @@ def main():
         "--test-mode",
         action="store_true",
         help="Use mouse input instead of pen/tablet input for calibration and drawing."
+    )
+    parser.add_argument(
+        "--test-run",
+        action="store_true",
+        help="Label saved results as a Test Run without changing the input device."
     )
     parser.add_argument(
         "--session-plan",
@@ -3071,6 +3121,10 @@ def main():
     except Exception as e:
         print(f"⚠ Failed to load session plan: {e}")
         apply_session_plan(configs, None)
+
+    if args.test_run or args.test_mode:
+        for config in configs:
+            config['__test_run__'] = True
 
     original_excepthook = sys.excepthook
 

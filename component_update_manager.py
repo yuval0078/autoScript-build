@@ -960,7 +960,12 @@ class ComponentUpdateManager:
                 handle.close()
             process_lock.release()
 
-    def _download_archive(self, definition: CatalogComponent, destination: Path):
+    def _download_archive(
+        self,
+        definition: CatalogComponent,
+        destination: Path,
+        progress: Callable[[int, int], None] | None = None,
+    ):
         partial = destination.with_suffix(".part")
         digest = hashlib.sha256()
         received = 0
@@ -991,6 +996,8 @@ class ComponentUpdateManager:
                             )
                         output.write(chunk)
                         digest.update(chunk)
+                        if progress is not None:
+                            progress(received, definition.size)
                     output.flush()
                     os.fsync(output.fileno())
             if received != definition.size:
@@ -1076,13 +1083,23 @@ class ComponentUpdateManager:
             validated.append((info, relative, is_directory))
         return validated
 
-    def _safe_extract_component(self, archive_path: Path, destination: Path):
+    def _safe_extract_component(
+        self,
+        archive_path: Path,
+        destination: Path,
+        progress: Callable[[int, int], None] | None = None,
+    ):
         destination.mkdir(parents=True, exist_ok=False)
         root = destination.resolve()
         try:
             with zipfile.ZipFile(archive_path, "r") as archive:
                 validated = self._validated_archive_entries(archive)
                 expanded = 0
+                total_expanded = sum(
+                    info.file_size
+                    for info, _relative, is_directory in validated
+                    if not is_directory
+                )
                 for info, relative, is_directory in validated:
                     target = destination.joinpath(*PurePosixPath(relative).parts)
                     resolved = target.resolve(strict=False)
@@ -1113,6 +1130,8 @@ class ComponentUpdateManager:
                                     "Archive expanded beyond its declared limits."
                                 )
                             output.write(chunk)
+                            if progress is not None:
+                                progress(expanded, total_expanded)
                     if member_size != info.file_size:
                         raise UnsafeComponentArchiveError(
                             "Archive member size does not match its declaration."
@@ -1251,11 +1270,19 @@ class ComponentUpdateManager:
         return updates
 
     def install_component(
-        self, catalog: UpdateCatalog, component: str
+        self,
+        catalog: UpdateCatalog,
+        component: str,
+        progress: Callable[[int], None] | None = None,
     ) -> InstalledComponent:
         """Install and atomically activate one catalog component."""
 
+        def report(value: int):
+            if progress is not None:
+                progress(max(0, min(100, int(value))))
+
         self._require_component_name(component)
+        report(0)
         definition = catalog.components[component]
         if compare_component_versions(
             self.bootstrap_version, definition.min_bootstrap
@@ -1283,6 +1310,7 @@ class ComponentUpdateManager:
                         raise RollbackProtectionError(
                             "A component version cannot be replaced with different bytes."
                         )
+                    report(100)
                     return self._entry_to_installed(component, old_entry)
 
             transaction = self.staging_dir / f"{component}-{uuid.uuid4().hex}"
@@ -1291,8 +1319,23 @@ class ComponentUpdateManager:
             extracted = transaction / "extracted"
             target = self.components_dir / component / definition.version
             try:
-                self._download_archive(definition, archive_path)
-                self._safe_extract_component(archive_path, extracted)
+                report(5)
+                self._download_archive(
+                    definition,
+                    archive_path,
+                    lambda received, total: report(
+                        5 + (65 * received // total if total else 65)
+                    ),
+                )
+                report(72)
+                self._safe_extract_component(
+                    archive_path,
+                    extracted,
+                    lambda expanded, total: report(
+                        72 + (20 * expanded // total if total else 20)
+                    ),
+                )
+                report(93)
                 self._verify_component_descriptor(extracted, component, definition)
                 entrypoint = extracted.joinpath(
                     *PurePosixPath(definition.entrypoint).parts
@@ -1338,6 +1381,7 @@ class ComponentUpdateManager:
                 else:
                     os.replace(extracted, target)
 
+                report(97)
                 activated_at = self.clock().astimezone(timezone.utc).isoformat().replace(
                     "+00:00", "Z"
                 )
@@ -1367,7 +1411,9 @@ class ComponentUpdateManager:
                     else:
                         self._atomic_write_json(pointer_path, old_pointer)
                     raise
-                return self._entry_to_installed(component, current)
+                installed = self._entry_to_installed(component, current)
+                report(100)
+                return installed
             finally:
                 resolved_transaction = transaction.resolve()
                 try:
