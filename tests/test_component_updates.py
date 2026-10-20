@@ -179,7 +179,7 @@ class ComponentVersionTests(unittest.TestCase):
                 "interface": "0.4",
                 "builder": "0.2",
                 "runner": "0.2",
-                "analyzer": "0.5",
+                "analyzer": "0.6",
             },
         )
 

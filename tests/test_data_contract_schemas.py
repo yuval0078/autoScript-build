@@ -192,6 +192,9 @@ class CurrentDataContractTests(unittest.TestCase):
                 "Writing End",
                 "Strokes",
                 "Avg Interval",
+                "Total writing time",
+                "Total air time",
+                "Total Stroke time",
             ],
         )
 
