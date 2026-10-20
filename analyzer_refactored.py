@@ -77,6 +77,35 @@ def format_time(seconds: float) -> str:
     secs = seconds % 60
     return f"{minutes:02d}:{secs:06.3f}"
 
+def raw_writing_times_ms(pen_events: List[dict]) -> Tuple[float, float, float]:
+    """Return elapsed, airborne and contact milliseconds from raw events only.
+
+    Ignore leading/trailing hover and Analyzer letter/slice metadata. An
+    unfinished final stroke ends at its last recorded sample.
+    """
+    first = last = contact_start = None
+    contact_seconds = 0.0
+    for event in pen_events:
+        timestamp = float(event['absolute_time'])
+        kind = event.get('type')
+        if kind == 'press' and contact_start is None:
+            contact_start = timestamp
+            if first is None:
+                first = timestamp
+        if contact_start is not None:
+            last = timestamp
+            if kind == 'release':
+                contact_seconds += max(0.0, timestamp - contact_start)
+                contact_start = None
+    if first is None or last is None:
+        return 0.0, 0.0, 0.0
+    if contact_start is not None:
+        contact_seconds += max(0.0, last - contact_start)
+    total = max(0.0, last - first) * 1000
+    contact = min(total, contact_seconds * 1000)
+    return total, max(0.0, total - contact), contact
+
+
 def map_to_hebrew(char: str) -> str:
     """Convert English keyboard char to Hebrew"""
     return HEBREW_KEYBOARD_MAP.get(char.lower(), char)
@@ -795,7 +824,7 @@ def write_analysis_csv(
             'Block Index', 'Block Count', 'Session ID', 'Participant', 'Age',
             'Gender', 'Word', 'Group', 'Cell', 'Correct', 'Written Word',
             'Reading End', 'Writing Start', 'Writing End', 'Strokes',
-            'Avg Interval',
+            'Avg Interval', 'Total writing time', 'Total air time', 'Total Stroke time',
         ]
         for letter_index in range(1, max_word_letters + 1):
             header.extend(
@@ -904,7 +933,7 @@ def write_analysis_csv(
                     len(stroke_starts),
                     f'{average_interval:.1f}',
                 ]
-                writer.writerow(row + letter_columns + [''])
+                writer.writerow(row + [f'{value:.3f}' for value in raw_writing_times_ms(pen_events)] + letter_columns + [''])
 
 # =============================================================================
 # CANVAS
@@ -2935,7 +2964,8 @@ class PenDataPlayer(QMainWindow):
                 header = [
                     'Exp Step', 'Experiment', 'Experiment ID', 'Block', 'Block ID', 'Block Index', 'Block Count', 'Session ID',
                     'Participant', 'Age', 'Gender', 'Word', 'Group', 'Cell', 'Correct', 'Written Word',
-                    'Reading End', 'Writing Start', 'Writing End', 'Strokes', 'Avg Interval'
+                    'Reading End', 'Writing Start', 'Writing End', 'Strokes', 'Avg Interval',
+                    'Total writing time', 'Total air time', 'Total Stroke time'
                 ]
 
                 for i in range(1, max_word_letters + 1):
@@ -3052,7 +3082,7 @@ class PenDataPlayer(QMainWindow):
                             f"{avg_interval:.1f}"
                         ]
 
-                        writer.writerow(row + letter_columns + [screenshot_name])
+                        writer.writerow(row + [f'{value:.3f}' for value in raw_writing_times_ms(pen_events)] + letter_columns + [screenshot_name])
                         flat_idx += 1
             
             if save_screenshots:

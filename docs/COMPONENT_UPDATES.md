@@ -132,3 +132,14 @@ Authoritative references:
 - [GitHub release integrity](https://docs.github.com/en/code-security/how-tos/secure-your-supply-chain/secure-your-dependencies/verify-release-integrity)
 - [Microsoft App Installer automatic updates](https://learn.microsoft.com/en-us/windows/msix/app-installer/auto-update-and-repair--overview)
 - [Microsoft MSIX overview](https://learn.microsoft.com/en-us/windows/msix/overview)
+
+## Analyzer 0.6 CSV timing fields
+
+Both manual and finalized analysis CSV exports include `Total writing time`,
+`Total air time`, and `Total Stroke time`, in milliseconds with three decimal
+places. They use only raw pen-event timestamps and press/release events,
+independently of letter assignments, correctness, audio timing and virtual splits.
+Elapsed time runs from the first press to the last release; air time includes
+all intervening pen lifts (including lifts within a letter); contact time sums
+physical strokes. Leading/trailing hover is excluded. An unfinished final stroke
+ends at its last recorded sample. Words without a press have zero totals.
