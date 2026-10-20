@@ -532,6 +532,29 @@ class ParticipantData:
         return self._bounds_cache[word_idx]
 
 
+def bind_cloud_result_identity(participant, run, source):
+    """Use verified server metadata for legacy raw files without cloud identity."""
+    digest = _file_sha256(participant.file_path)
+    if not source.get('sha256') or digest != source['sha256']:
+        raise ValueError("Raw result checksum does not match the cloud result.")
+    if not run.get('session_id'):
+        raise ValueError("Cloud Run has no session ID.")
+    participant.server_run_id = str(run['id'])
+    participant.source_result_id = source['id']
+    participant.source_sha256 = digest
+    participant.session_id = run['session_id']
+    for attribute, key in (
+        ('experiment_id', 'experiment_id'), ('experiment_name', 'source_experiment_name'),
+        ('participant_number', 'participant_number'), ('age', 'participant_age'),
+        ('gender', 'participant_gender'), ('block_count', 'block_count'),
+    ):
+        if run.get(key) is not None:
+            setattr(participant, attribute, run[key])
+    for key in ('block_id', 'block_index', 'block_name'):
+        if source.get(key) is not None:
+            setattr(participant, key, source[key])
+
+
 def _participant_offsets(participants: List[ParticipantData]) -> List[int]:
     offsets = []
     cursor = 0
@@ -1624,9 +1647,7 @@ class PenDataPlayer(QMainWindow):
                 'results': [],
             }
             for participant, digest, match in zip(self.participants, hashes, selected):
-                participant.server_run_id = run_id
-                participant.source_result_id = match.get('id')
-                participant.source_sha256 = digest
+                bind_cloud_result_identity(participant, run, match)
                 context_run['results'].append({
                     **match,
                     'path': participant.file_path,
@@ -2549,6 +2570,11 @@ class PenDataPlayer(QMainWindow):
                 participant.server_run_id = source.get('run_id') or participant.server_run_id
                 participant.source_result_id = source.get('id')
                 participant.source_sha256 = source_sha256
+                if source.get('run_id') and not participant.session_id:
+                    from autoscript_api import AutoScriptAPI
+                    api = AutoScriptAPI(base_url=(self.analysis_context or {}).get('api_url'), timeout=30)
+                    run = api.get_experiment_run(source['run_id'])
+                    bind_cloud_result_identity(participant, run, source)
                 self.participants.append(participant)
                 newly_added += 1
                 print(f"Loaded: {file_path} (Participant {participant.participant_number})")

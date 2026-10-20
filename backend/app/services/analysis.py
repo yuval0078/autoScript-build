@@ -50,6 +50,10 @@ ANALYSIS_CSV_IDENTITY_COLUMNS = [
 ]
 
 
+ANALYSIS_CSV_TIMING_COLUMNS = [
+    "Total writing time", "Total air time", "Total Stroke time",
+]
+
 class AnalysisValidationError(ValueError):
     pass
 
@@ -281,7 +285,12 @@ def _validate_csv(csv_path: Path, run: Any) -> None:
         )
     if header[-1:] != ["Screenshot File"]:
         raise AnalysisValidationError("analysis.csv must end with Screenshot File.")
-    letter_columns = header[len(ANALYSIS_CSV_IDENTITY_COLUMNS) : -1]
+    # Analyzer 0.6 adds raw timing totals before the existing letter triplets.
+    # Older Analyzer exports remain valid without those optional columns.
+    letter_start = len(ANALYSIS_CSV_IDENTITY_COLUMNS)
+    if header[letter_start : letter_start + 3] == ANALYSIS_CSV_TIMING_COLUMNS:
+        letter_start += 3
+    letter_columns = header[letter_start : -1]
     if len(letter_columns) % 3:
         raise AnalysisValidationError("analysis.csv letter columns must be complete triplets.")
     for offset in range(0, len(letter_columns), 3):

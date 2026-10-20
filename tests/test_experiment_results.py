@@ -608,7 +608,7 @@ class AnalyzerArtifactTests(unittest.TestCase):
                 def get_experiment_run(self, run_id):
                     return {
                         "id": run_id, "experiment_id": "experiment-1",
-                        "session_id": None, "source_experiment_name": "Legacy",
+                        "session_id": "historical-session-1", "source_experiment_name": "Legacy",
                     }
 
                 def get_run_analysis_state(self, run_id):
@@ -621,6 +621,11 @@ class AnalyzerArtifactTests(unittest.TestCase):
         self.assertEqual(restored, 1)
         self.assertTrue(associated)
         self.assertEqual(player.written_words[0], "edited")
+        self.assertEqual(player.participants[0].session_id, "historical-session-1")
+        saved = build_analysis_state(player.participants, [0], player.written_words,
+                                     player.word_correctness, player.train_mode, run_id="run-1")
+        self.assertEqual(saved["session_id"], "historical-session-1")
+        self.assertEqual(saved["sources"][0]["session_id"], "historical-session-1")
 
     def test_same_session_cloud_runs_are_partitioned_by_server_run_id(self):
         first = self.participant()

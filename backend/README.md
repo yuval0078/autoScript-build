@@ -271,3 +271,7 @@ Unit tests do not require Docker:
 python -m pip install -r requirements-dev.txt
 python -m unittest discover -s tests -v
 ```
+
+Analyzer 0.6+ CSV timing totals (`Total writing time`, `Total air time`,
+`Total Stroke time`) are accepted before letter triplets. Older CSV headers
+remain supported; source identity validation is unchanged.

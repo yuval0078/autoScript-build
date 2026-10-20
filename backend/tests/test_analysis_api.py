@@ -181,6 +181,7 @@ class AnalysisApiTests(unittest.TestCase):
         *,
         completed=True,
         csv_header_only=False,
+        raw_timing_columns=False,
         omit_csv_experiment_id=False,
         omit_csv_block_id=False,
         omit_trainable_experiment_id=False,
@@ -195,6 +196,9 @@ class AnalysisApiTests(unittest.TestCase):
             "Reading End", "Writing Start", "Writing End", "Strokes",
             "Avg Interval", "Screenshot File",
         ]
+        if raw_timing_columns:
+            header[-1:-1] = ["Total writing time", "Total air time", "Total Stroke time",
+                              "Written Letter 1", "Letter 1 Start", "Letter 1 End"]
         writer.writerow(header)
         if not csv_header_only:
             writer.writerow([
@@ -205,8 +209,8 @@ class AnalysisApiTests(unittest.TestCase):
                 self.run["session_id"], self.run["participant_number"],
                 self.run["participant_age"], self.run["participant_gender"], "test",
                 "group-a", 0, "True", "test", "0.0", "0.0", "0.0", 0,
-                "0.0", "",
-            ])
+                "0.0",
+            ] + (["1000.000", "500.000", "500.000", "a", "0", "500"] if raw_timing_columns else []) + [""])
         files = {
             "analysis_state.json": json.dumps(state, ensure_ascii=False).encode("utf-8"),
             "analysis.csv": output.getvalue().encode("utf-8-sig"),
@@ -299,6 +303,15 @@ class AnalysisApiTests(unittest.TestCase):
         self.assertEqual(resolved.status_code, 200, resolved.text)
         self.assertEqual(resolved.json()["results"][0]["id"], self.result["id"])
         self.assertEqual(resolved.json()["missing_sha256"], [missing])
+
+    def test_finalize_accepts_analyzer_06_timing_columns_before_letters(self):
+        response = self.client.post(
+            f"/api/v1/runs/{self.run['id']}/analysis/finalize",
+            content=self.bundle_bytes(self.state(), raw_timing_columns=True),
+            headers={"Content-Type": "application/zip", "If-None-Match": "*",
+                     "X-Idempotency-Key": str(uuid.uuid4())},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
 
     def test_finalize_is_atomic_permanent_and_strictly_validated(self):
         saved = self.put_state(self.state())
